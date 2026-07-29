@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<!-- ballcam 触摸屏 UI。单文件：内联 CSS/JS，无外部依赖、无 CDN（现场无网）。
+     设计说明见 ../UI_DESIGN.md。主设计 1024x600，用 clamp/flex 自适应 800x480~1280x800。 -->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>ballcam 图传</title>
+<style>
+:root{
+  --bg:#0E1116; --panel:#1A2028; --panel2:#232B36; --line:#2E3846;
+  --fg:#E6EDF3; --dim:#8B98A9; --cy:#22D3EE; --red:#EF4444; --grn:#22C55E; --ylw:#F59E0B;
+  --btn:clamp(56px,9vh,96px); --btn2:clamp(44px,7vh,64px);
+}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;
+  user-select:none;font-family:"Noto Sans CJK SC","Source Han Sans SC",sans-serif}
+html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--fg)}
+body{display:flex;flex-direction:column;font-size:clamp(14px,1.7vh,18px)}
+.mono{font-family:"DejaVu Sans Mono",monospace;font-variant-numeric:tabular-nums}
+
+/* ---- 顶栏 ---- */
+#top{height:clamp(40px,8vh,48px);flex:0 0 auto;display:flex;align-items:center;gap:14px;
+     padding:0 12px;background:var(--panel);border-bottom:1px solid var(--line);font-size:.95em}
+.dot{width:12px;height:12px;border-radius:50%;display:inline-block;margin-right:6px;vertical-align:middle}
+.dot.g{background:var(--grn)} .dot.y{background:var(--ylw)}
+.dot.r{background:var(--red);animation:bl 1s infinite} .dot.k{background:#5A6472}
+@keyframes bl{50%{opacity:.25}}
+#top .sp{flex:1}
+#recTop{color:var(--red);font-weight:700;display:none}
+
+/* ---- 页 ---- */
+#main{flex:1;min-height:0;position:relative}
+.page{position:absolute;inset:0;display:none}
+.page.on{display:flex}
+
+/* ---- 页签 ---- */
+#tabs{height:clamp(52px,10vh,72px);flex:0 0 auto;display:flex;background:var(--panel);
+      border-top:1px solid var(--line)}
+#tabs button{flex:1;background:none;border:0;color:var(--dim);font-size:1.15em;font-weight:600}
+#tabs button.on{color:var(--cy);box-shadow:inset 0 4px 0 var(--cy);background:var(--panel2)}
+
+/* ---- 通用按钮 ---- */
+button{font-family:inherit;color:var(--fg);background:var(--panel2);border:1px solid var(--line);
+       border-radius:12px;font-size:1em}
+button:active{transform:scale(.97)}
+button[disabled]{opacity:.4}
+.b2{height:var(--btn2)}
+.chip{background:var(--panel2);border:1px solid var(--line);border-radius:10px;height:var(--btn2);
+      font-weight:600}
+.chip.on{background:var(--cy);color:#04131A;border-color:var(--cy)}
+
+/* ---- LIVE ---- */
+#live{padding:10px;gap:10px}
+#vwrap{flex:1;min-width:0;display:flex;flex-direction:column;gap:8px}
+#vbox{flex:1;position:relative;background:#000;border-radius:12px;overflow:hidden;
+      display:flex;align-items:center;justify-content:center}
+#vbox img{max-width:100%;max-height:100%;object-fit:contain;display:block}
+#scaleOv{position:absolute;inset:0;pointer-events:none;display:none}
+#mask{position:absolute;inset:0;background:#000000C0;display:none;
+      flex-direction:column;align-items:center;justify-content:center;gap:10px;font-size:1.3em}
+#osd{position:absolute;left:10px;top:10px;background:#000000A6;padding:6px 10px;border-radius:8px;
+     font-size:.95em}
+#vtools{display:flex;gap:8px}
+#vtools button{flex:1}
+#side{width:clamp(180px,22vw,240px);display:flex;flex-direction:column;gap:8px}
+#items{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+#recBtn{height:var(--btn);font-size:1.3em;font-weight:800;background:var(--panel2);
+        border:2px solid var(--red);color:var(--red)}
+#recBtn.rec{background:var(--red);color:#fff;border-color:var(--red);animation:br 1.6s infinite}
+@keyframes br{50%{filter:brightness(.8)}}
+#toast{position:absolute;left:50%;bottom:12px;transform:translateX(-50%);min-width:60%;
+       background:var(--grn);color:#04131A;font-weight:700;padding:12px 16px;border-radius:12px;
+       display:none;align-items:center;gap:14px;z-index:9}
+#toast.warn{background:var(--ylw)} #toast.err{background:var(--red);color:#fff}
+#toast button{background:#04131A;color:#fff;height:44px;padding:0 14px}
+
+/* ---- PLAY ---- */
+#play{gap:0}
+#plist{width:clamp(220px,27vw,300px);border-right:1px solid var(--line);display:flex;
+       flex-direction:column;background:var(--panel)}
+#pfilter{display:flex;flex-wrap:wrap;gap:6px;padding:8px}
+#pfilter .chip{flex:1;min-width:52px;height:40px;font-size:.9em}
+#pitems{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch}
+.card{padding:10px 12px;border-bottom:1px solid var(--line);border-left:4px solid transparent}
+.card.on{border-left-color:var(--cy);background:var(--panel2)}
+.card b{color:var(--cy)} .card small{color:var(--dim)}
+#pmain{flex:1;display:flex;flex-direction:column;padding:10px;gap:8px;min-width:0}
+#pvbox{flex:1;position:relative;background:#000;border-radius:12px;overflow:hidden;
+       display:flex;align-items:center;justify-content:center}
+#pvbox video{max-width:100%;max-height:100%}
+#pOsd{position:absolute;left:10px;top:10px;background:#000000A6;padding:6px 10px;border-radius:8px}
+#seekWrap{position:relative;height:34px;display:flex;align-items:center}
+#seek{width:100%;height:14px}
+.markPin{position:absolute;top:0;width:0;height:0;border-left:6px solid transparent;
+         border-right:6px solid transparent;border-top:10px solid var(--ylw);margin-left:-6px}
+#pctl{display:flex;gap:8px}
+#pctl button{flex:1;height:var(--btn2)}
+#pctl #pp{flex:2;background:var(--cy);color:#04131A;font-weight:800;font-size:1.1em}
+#speeds{display:flex;gap:8px}
+#speeds .chip{flex:1}
+#pfoot{display:flex;gap:8px}
+#pfoot button{flex:1;height:var(--btn2)}
+.hold{position:relative;overflow:hidden}
+.hold .fill{position:absolute;left:0;top:0;bottom:0;width:0;background:#EF444455}
+
+/* ---- SET ---- */
+#set{padding:10px;gap:10px;overflow:hidden}
+.col{flex:1;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px;
+     display:flex;flex-direction:column;gap:10px;overflow-y:auto}
+.col h3{font-size:1.05em;color:var(--cy);border-bottom:1px solid var(--line);padding-bottom:6px}
+.row{display:flex;gap:6px;align-items:center}
+.row>span{color:var(--dim);min-width:56px}
+.row button{flex:1;height:44px}
+input[type=range]{flex:1;height:12px}
+#latClock{font-size:2.4em;font-weight:800;text-align:center;background:#000;border-radius:10px;
+          padding:6px;letter-spacing:2px}
+.kv{display:flex;justify-content:space-between;color:var(--dim)}
+.kv b{color:var(--fg)}
+.bar{height:12px;background:var(--panel2);border-radius:6px;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--cy)}
+</style>
+</head>
+<body>
+
+<div id="top">
+  <span><i id="camDot" class="dot k"></i><span id="camTxt">启动中…</span></span>
+  <span id="recTop" class="mono">● REC 00:00.0</span>
+  <span class="sp"></span>
+  <span id="apTxt" class="mono"></span>
+  <span id="diskTxt" class="mono"></span>
+  <span id="clock" class="mono"></span>
+</div>
+
+<div id="main">
+
+  <!-- ============ LIVE ============ -->
+  <div id="live" class="page on">
+    <div id="vwrap">
+      <div id="vbox">
+        <img id="cam" alt="">
+        <svg id="scaleOv" viewBox="0 0 100 100" preserveAspectRatio="none"></svg>
+        <div id="osd" class="mono">--</div>
+        <div id="mask"><div>相机离线</div><div id="maskSub" style="font-size:.7em"></div></div>
+      </div>
+      <div id="vtools">
+        <button class="b2" id="btnScale">⊹ 刻度线</button>
+        <button class="b2" id="btnFull">⛶ 全屏</button>
+        <button class="b2" id="btnShot">◉ 截图</button>
+      </div>
+    </div>
+    <div id="side">
+      <div style="color:var(--dim)">测试项</div>
+      <div id="items"></div>
+      <div style="flex:1"></div>
+      <button id="recBtn">● 开始录制</button>
+      <button class="b2" id="markBtn" disabled>⚑ 标记</button>
+    </div>
+    <div id="toast"><span id="toastMsg"></span><button id="toastAct" style="display:none"></button></div>
+  </div>
+
+  <!-- ============ PLAY ============ -->
+  <div id="play" class="page">
+    <div id="plist">
+      <div id="pfilter"></div>
+      <div id="pitems"></div>
+    </div>
+    <div id="pmain">
+      <div id="pvbox">
+        <video id="vid" preload="auto"></video>
+        <div id="pOsd" class="mono">--</div>
+      </div>
+      <div id="seekWrap"><input id="seek" type="range" min="0" max="1000" value="0"></div>
+      <div id="pctl">
+        <button id="bb">◀◀</button><button id="fp">◀|</button>
+        <button id="pp">▶ 播放</button>
+        <button id="fn">|▶</button><button id="ff">▶▶</button>
+      </div>
+      <div id="speeds"></div>
+      <div id="pfoot">
+        <button id="jmpMark">⚑ 跳标记</button>
+        <button id="delBtn" class="hold"><span class="fill"></span>♻ 删除(长按)</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ SET ============ -->
+  <div id="set" class="page">
+    <div class="col">
+      <h3>网络与链路</h3>
+      <div class="kv">相机 <b id="sCam">--</b></div>
+      <div class="row"><button id="apUp">↻ 重启热点</button><button id="camRe">↻ 重连相机</button></div>
+      <div class="row"><span>信道</span><div id="chips" style="display:flex;gap:6px;flex:1"></div></div>
+      <button class="b2" id="scanBtn">🔍 扫描并推荐空闲信道</button>
+      <div id="scanOut" style="color:var(--dim);font-size:.9em"></div>
+      <h3>延迟自测</h3>
+      <div id="latClock" class="mono">0000</div>
+      <div style="color:var(--dim);font-size:.9em">
+        用车上相机拍这块屏，看画面里的数字和当前数字差多少 ms = 端到端延迟。
+        读数记进设计报告（验收 T1-2，要求 ≤300ms）。
+      </div>
+    </div>
+    <div class="col">
+      <h3>相机参数</h3>
+      <div class="row"><span>分辨率</span><div id="fsChips" style="display:flex;gap:6px;flex:1"></div></div>
+      <div class="row"><span>画质</span><input type="range" id="qy" min="8" max="30" value="12"><b id="qyV">12</b></div>
+      <div class="row"><span>亮度</span><input type="range" id="br" min="-2" max="2" value="0"><b id="brV">0</b></div>
+      <div class="row"><span>曝光</span><button id="aecOn">自动</button><button id="aecOff">固定</button></div>
+      <div class="row"><span>曝光值</span><input type="range" id="ae" min="0" max="1200" value="300"><b id="aeV">300</b></div>
+      <h3>刻度标定</h3>
+      <div style="color:var(--dim);font-size:.9em">两点标定：先在实时页看画面，把下面两个百分比调到摆杆 −10cm 与 +10cm 刻度处。</div>
+      <div class="row"><span>左点%</span><input type="range" id="c1" min="0" max="50" value="10"><b id="c1V">10</b></div>
+      <div class="row"><span>右点%</span><input type="range" id="c2" min="50" max="100" value="90"><b id="c2V">90</b></div>
+      <button class="b2" id="calibSave">保存标定（跨度 20cm）</button>
+    </div>
+    <div class="col">
+      <h3>系统</h3>
+      <div class="kv">存储 <b id="sDisk">--</b></div>
+      <div class="bar"><i id="sBar"></i></div>
+      <button class="b2" id="cleanBtn">♻ 清理 7 天前录像</button>
+      <button class="b2" id="restartBtn">↻ 重启服务</button>
+      <button class="b2" id="rebootBtn">↺ 重启系统</button>
+      <button class="b2 hold" id="offBtn"><span class="fill"></span>⏻ 安全关机（长按）</button>
+      <div style="color:var(--ylw);font-size:.9em">永远不要直接拔电：会烧 SD 卡并损坏正在写的录像。</div>
+      <div class="kv">帧率 <b id="sFps">--</b></div>
+      <div class="kv">已收帧 <b id="sFrames">--</b></div>
+      <div class="kv">日期 <b id="sDate">--</b></div>
+      <div style="color:var(--dim);font-size:.85em">离线无 NTP，时间不对请校时（见 HANDOVER §8）。</div>
+    </div>
+  </div>
+
+</div>
+
+<div id="tabs">
+  <button data-p="live" class="on">● 实时</button>
+  <button data-p="play">▶ 回放</button>
+  <button data-p="set">⚙ 设置</button>
+</div>
+
+<script>
+const $ = s => document.querySelector(s), $$ = s => [...document.querySelectorAll(s)];
+const api = async (p, o) => (await fetch(p, o || {})).json();
+const post = (p) => api(p, {method:'POST'});
+const pad = (n,w=2) => String(n).padStart(w,'0');
+const mmss = s => `${pad(Math.floor(s/60))}:${pad(Math.floor(s%60))}.${Math.floor(s*10)%10}`;
+
+let ST = null, item = '', fpsTarget = 15, calib = null;
+
+/* ---------- 页签 ---------- */
+$$('#tabs button').forEach(b => b.onclick = () => {
+  $$('#tabs button').forEach(x => x.classList.toggle('on', x === b));
+  $$('.page').forEach(p => p.classList.toggle('on', p.id === b.dataset.p));
+  if (b.dataset.p === 'play') loadList();
+});
+
+/* ---------- toast ---------- */
+let tmr;
+function toast(msg, kind, actLabel, actFn) {
+  const t = $('#toast'); t.className = kind || '';
+  $('#toastMsg').textContent = msg;
+  const a = $('#toastAct');
+  if (actLabel) { a.style.display=''; a.textContent = actLabel; a.onclick = () => { t.style.display='none'; actFn(); }; }
+  else a.style.display = 'none';
+  t.style.display = 'flex'; clearTimeout(tmr);
+  tmr = setTimeout(() => t.style.display = 'none', actLabel ? 8000 : 4000);
+}
+
+/* ---------- 测试项。先选项目再录制，文件名天生带语义，回放检索和写报告全靠它 ---------- */
+const ITEMS = [['T3','T3 静止±5'],['T4','T4 A→B'],['T5','T5 整圈30s'],
+               ['T6','T6 任意位'],['T1','T1 图传'],['free','自由']];
+$('#items').innerHTML = ITEMS.map(([k,v]) => `<button class="chip" data-k="${k}">${v}</button>`).join('');
+$$('#items .chip').forEach(b => b.onclick = () => {
+  item = b.dataset.k;
+  $$('#items .chip').forEach(x => x.classList.toggle('on', x === b));
+  syncRec();
+});
+
+/* ---------- 实时画面。src 指向后端中继而非相机：ESP32-CAM 只允许一路 /stream ---------- */
+function attach() { $('#cam').src = '/api/stream?t=' + Date.now(); }
+attach();
+$('#cam').onerror = () => setTimeout(attach, 1500);
+
+/* ---------- 刻度线叠加：评委目视判位用，也是要求 3/4/5/6 的复核利器 ---------- */
+let showScale = false;
+$('#btnScale').onclick = () => { showScale = !showScale; drawScale(); };
+function drawScale() {
+  const sv = $('#scaleOv');
+  if (!showScale || !calib) { sv.style.display = 'none'; return; }
+  const {x1, x2, cm} = calib, half = cm / 2;
+  const px = v => x1 + (x2 - x1) * (v + half) / cm;   // cm → 百分比
+  let h = '';
+  for (const v of [-10,-5,0,5,10]) {
+    if (Math.abs(v) > half) continue;
+    const x = px(v), main = v === 0;
+    h += `<line x1="${x}" y1="18" x2="${x}" y2="82" stroke="${main?'#22D3EE':'#22D3EE88'}"
+            stroke-width="${main?.5:.3}" ${main?'':'stroke-dasharray="2 2"'} vector-effect="non-scaling-stroke"/>
+          <text x="${x}" y="13" fill="#22D3EE" font-size="6" text-anchor="middle">${v>0?'+':''}${v}</text>`;
+  }
+  sv.innerHTML = h; sv.style.display = 'block';
+}
+$('#btnFull').onclick = () => ($('#vbox').requestFullscreen ? $('#vbox').requestFullscreen() : 0);
+$('#btnShot').onclick = async () => { const r = await post('/api/shot'); toast('已截图 ' + (r.file||'')); };
+
+/* ---------- 录制。三态按钮；启动中禁用，防连点产生两个 ffmpeg ---------- */
+let busy = false;
+function syncRec() {
+  const on = ST?.rec?.active;
+  const b = $('#recBtn');
+  b.classList.toggle('rec', !!on);
+  b.disabled = busy || (!on && (!item || !ST?.cam?.online));
+  b.textContent = busy ? '…' : on ? `■ 停止 ${mmss(ST.rec.elapsed)}` : '● 开始录制';
+  $('#markBtn').disabled = !on;
+}
+$('#recBtn').onclick = async () => {
+  busy = true; syncRec();
+  try {
+    if (ST?.rec?.active) {
+      const m = await post('/api/rec/stop');
+      toast(`✔ ${m.id}  ${m.duration_s}s / ${m.frames}帧`, '', '立即回放', () => {
+        $$('#tabs button')[1].click(); setTimeout(() => pick(m.id), 300);
+      });
+    } else {
+      await post('/api/rec/start?item=' + item);
+    }
+  } catch (e) { toast('操作失败', 'err'); }
+  busy = false; await tick();
+};
+$('#markBtn').onclick = async () => { const r = await post('/api/rec/mark'); toast('⚑ 标记 ' + r.t + 's'); };
+
+/* ---------- 状态轮询 ---------- */
+async function tick() {
+  try { ST = await api('/api/status'); } catch {
+    $('#camDot').className = 'dot k'; $('#camTxt').textContent = '服务无响应';
+    return;
+  }
+  const c = ST.cam;
+  $('#camDot').className = 'dot ' + (!c.online ? 'r' : c.fps < 10 ? 'y' : 'g');
+  $('#camTxt').textContent = c.online ? `CAM ${c.ip}  ${c.fps}fps` : '相机离线，重连中…';
+  $('#mask').style.display = c.online ? 'none' : 'flex';
+  $('#maskSub').textContent = c.err || '检查相机供电与热点';
+  $('#osd').textContent = `${c.fps}fps  帧${c.frames}` + (ST.rec.active ? `  ●REC ${mmss(ST.rec.elapsed)}` : '');
+  $('#recTop').style.display = ST.rec.active ? '' : 'none';
+  $('#recTop').textContent = `● REC ${ST.rec.item} ${mmss(ST.rec.elapsed)}` + (ST.rec.parts>1?` 分片${ST.rec.parts}`:'');
+  $('#diskTxt').textContent = ST.disk.free_gb + 'GB';
+  $('#diskTxt').style.color = ST.disk.free_gb < 2 ? 'var(--red)' : '';
+  $('#apTxt').textContent = ST.ap.up ? 'AP✔' : 'AP✖';
+  $('#apTxt').style.color = ST.ap.up ? 'var(--grn)' : 'var(--ylw)';
+  $('#clock').textContent = ST.time;
+  fpsTarget = ST.fps_target || 15;
+  if (JSON.stringify(calib) !== JSON.stringify(ST.calib)) { calib = ST.calib; drawScale(); }
+  $('#sCam').textContent = c.online ? c.ip : '离线';
+  $('#sFps').textContent = c.fps; $('#sFrames').textContent = c.frames;
+  $('#sDisk').textContent = `${ST.disk.free_gb} / ${ST.disk.total_gb} GB`;
+  $('#sBar').style.width = (100 - ST.disk.free_gb / ST.disk.total_gb * 100).toFixed(0) + '%';
+  $('#sDate').textContent = ST.date + ' ' + ST.time;
+  if (ST.disk.free_gb < 2) toast('存储不足 2GB，请清理', 'warn', '清理7天前', () => post('/api/sys/clean?days=7'));
+  syncRec();
+}
+setInterval(tick, 1000); tick();
+
+/* ================= 回放 ================= */
+let recs = [], cur = null, filt = '';
+const FILT = [['','全部'],['T3','T3'],['T4','T4'],['T5','T5'],['T6','T6'],['T1','T1'],['free','自由']];
+$('#pfilter').innerHTML = FILT.map(([k,v]) => `<button class="chip${k===''?' on':''}" data-k="${k}">${v}</button>`).join('');
+$$('#pfilter .chip').forEach(b => b.onclick = () => {
+  filt = b.dataset.k;
+  $$('#pfilter .chip').forEach(x => x.classList.toggle('on', x === b));
+  loadList();
+});
+async function loadList() {
+  recs = await api('/api/recordings' + (filt ? '?item=' + filt : ''));
+  $('#pitems').innerHTML = recs.map(m => `
+    <div class="card" data-id="${m.id}">
+      <div><b>${m.item}</b> ${m.id.slice(-6,-4)}:${m.id.slice(-4,-2)}:${m.id.slice(-2)}</div>
+      <small>${m.duration_s}s · ${m.frames}帧 · ${m.size_mb}MB
+      ${m.marks?.length ? ' · ⚑' + m.marks.length : ''}
+      ${m.parts?.length > 1 ? ' · <span style="color:var(--ylw)">⚠' + m.parts.length + '分片</span>' : ''}</small>
+    </div>`).join('') || '<div style="padding:16px;color:var(--dim)">暂无录像</div>';
+  $$('#pitems .card').forEach(c => c.onclick = () => pick(c.dataset.id));
+  if (recs.length && !cur) pick(recs[0].id);
+}
+/* 多分片对使用者透明：顺序播完所有分片，等效一次连续测试 */
+let partIdx = 0;
+function pick(id) {
+  cur = recs.find(m => m.id === id);
+  if (!cur) { loadList(); return; }
+  $$('#pitems .card').forEach(c => c.classList.toggle('on', c.dataset.id === id));
+  partIdx = 0; playPart(0);
+  $('#seekWrap').querySelectorAll('.markPin').forEach(e => e.remove());
+}
+function playPart(i) {
+  const p = cur.parts[i]; if (!p) return;
+  $('#vid').src = '/rec/' + p.mp4;
+  $('#vid').load();
+}
+const vid = $('#vid');
+vid.onloadedmetadata = () => { addPins(); upOsd(); };
+vid.onended = () => { if (cur && partIdx + 1 < cur.parts.length) { partIdx++; playPart(partIdx); vid.play(); } else $('#pp').textContent = '▶ 播放'; };
+vid.ontimeupdate = upOsd;
+function upOsd() {
+  if (!vid.duration) return;
+  $('#seek').value = vid.currentTime / vid.duration * 1000;
+  $('#pOsd').textContent = `${vid.currentTime.toFixed(2)}s / ${vid.duration.toFixed(2)}s   帧 ${Math.round(vid.currentTime*fpsTarget)}/${Math.round(vid.duration*fpsTarget)}`
+    + (cur?.parts.length > 1 ? `   分片${partIdx+1}/${cur.parts.length}` : '');
+}
+function addPins() {
+  const w = $('#seekWrap');
+  w.querySelectorAll('.markPin').forEach(e => e.remove());
+  (cur?.marks || []).forEach(t => {
+    const d = document.createElement('div');
+    d.className = 'markPin'; d.style.left = (t / vid.duration * 100) + '%';
+    d.onclick = () => vid.currentTime = t; w.appendChild(d);
+  });
+}
+$('#seek').oninput = e => { if (vid.duration) vid.currentTime = e.target.value / 1000 * vid.duration; };
+$('#pp').onclick = () => { if (vid.paused) { vid.play(); $('#pp').textContent = '⏸ 暂停'; } else { vid.pause(); $('#pp').textContent = '▶ 播放'; } };
+/* 逐帧步进：这是"按要求回放"的核心能力。录制时 -g 15（每秒一个 I 帧）保证 seek 精度 */
+$('#fp').onclick = () => { vid.pause(); vid.currentTime = Math.max(0, vid.currentTime - 1/fpsTarget); $('#pp').textContent='▶ 播放'; };
+$('#fn').onclick = () => { vid.pause(); vid.currentTime = Math.min(vid.duration, vid.currentTime + 1/fpsTarget); $('#pp').textContent='▶ 播放'; };
+$('#bb').onclick = () => vid.currentTime = Math.max(0, vid.currentTime - 3);
+$('#ff').onclick = () => vid.currentTime = Math.min(vid.duration, vid.currentTime + 3);
+$('#jmpMark').onclick = () => { const m = (cur?.marks||[]).find(t => t > vid.currentTime + .05); if (m != null) vid.currentTime = m; else toast('没有更多标记','warn'); };
+const SPD = [0.25, 0.5, 1, 2];
+$('#speeds').innerHTML = SPD.map(s => `<button class="chip${s===1?' on':''}" data-s="${s}">${s}x</button>`).join('');
+$$('#speeds .chip').forEach(b => b.onclick = () => {
+  vid.playbackRate = +b.dataset.s;
+  $$('#speeds .chip').forEach(x => x.classList.toggle('on', x === b));
+});
+
+/* ---------- 长按确认：触摸屏上小对话框难点，改成长按 1.5s 走环形/条形进度 ---------- */
+function holdBtn(el, ms, fn) {
+  let t0 = 0, raf = 0;
+  const fill = el.querySelector('.fill');
+  const step = () => {
+    const p = Math.min(1, (performance.now() - t0) / ms);
+    fill.style.width = (p * 100) + '%';
+    if (p >= 1) { fill.style.width = '0'; fn(); return; }
+    raf = requestAnimationFrame(step);
+  };
+  const down = e => { e.preventDefault(); t0 = performance.now(); step(); };
+  const up = () => { cancelAnimationFrame(raf); fill.style.width = '0'; };
+  el.addEventListener('pointerdown', down);
+  el.addEventListener('pointerup', up);
+  el.addEventListener('pointerleave', up);
+}
+holdBtn($('#delBtn'), 1500, async () => {
+  if (!cur) return;
+  await fetch('/api/recordings/' + cur.id, {method:'DELETE'});
+  cur = null; toast('已删除'); loadList();
+});
+holdBtn($('#offBtn'), 1500, async () => { await post('/api/sys/poweroff'); toast('正在关机，等指示灯灭再断电','warn'); });
+
+/* ================= 设置 ================= */
+$('#apUp').onclick = async () => { toast('重启热点中…','warn'); await post('/api/net/ap-up'); tick(); };
+$('#camRe').onclick = async () => { await post('/api/camera/reset'); toast('相机重连中…','warn'); };
+$('#chips').innerHTML = [1,6,11].map(c => `<button class="chip" style="flex:1" data-c="${c}">${c}</button>`).join('');
+$$('#chips .chip').forEach(b => b.onclick = async () => {
+  toast('切换信道中，热点会短暂中断…','warn');
+  await post('/api/net/channel?ch=' + b.dataset.c);
+  $$('#chips .chip').forEach(x => x.classList.toggle('on', x === b));
+  toast('已切到信道 ' + b.dataset.c);
+});
+$('#scanBtn').onclick = async () => {
+  $('#scanOut').textContent = '扫描中（约 5s）…';
+  const r = await api('/api/net/scan');
+  const l = Object.entries(r.load).sort((a,b)=>a[0]-b[0]).map(([c,v])=>`ch${c}:${v}`).join('  ');
+  $('#scanOut').innerHTML = `拥挤度 ${l}<br><b style="color:var(--cy)">推荐信道 ${r.recommend}</b>（数值越小越空）`;
+};
+const FS = [['8','VGA 640'],['9','SVGA 800'],['10','XGA 1024']];
+$('#fsChips').innerHTML = FS.map(([v,t]) => `<button class="chip" style="flex:1;font-size:.85em" data-v="${v}">${t}</button>`).join('');
+$$('#fsChips .chip').forEach(b => b.onclick = async () => {
+  await post(`/api/camera/control?var=framesize&val=${b.dataset.v}`);
+  $$('#fsChips .chip').forEach(x => x.classList.toggle('on', x === b));
+});
+const slide = (id, v, varName) => {
+  const el = $(id); el.oninput = () => $(v).textContent = el.value;
+  el.onchange = () => post(`/api/camera/control?var=${varName}&val=${el.value}`);
+};
+slide('#qy','#qyV','quality'); slide('#br','#brV','brightness'); slide('#ae','#aeV','aec_value');
+$('#aecOn').onclick = () => post('/api/camera/control?var=aec&val=1');
+$('#aecOff').onclick = () => { post('/api/camera/control?var=aec&val=0'); toast('曝光已固定（避免车身抖动导致画面闪烂）'); };
+['#c1','#c2'].forEach(id => { const el=$(id); el.oninput = () => $(id+'V').textContent = el.value; });
+$('#calibSave').onclick = async () => {
+  calib = await api(`/api/calib?x1=${$('#c1').value}&x2=${$('#c2').value}&cm=20`, {method:'POST'});
+  drawScale(); toast('标定已保存，实时页开 ⊹ 刻度线 查看');
+};
+$('#cleanBtn').onclick = async () => { const r = await post('/api/sys/clean?days=7'); toast(`已清理 ${r.deleted} 条`); };
+$('#restartBtn').onclick = async () => { await post('/api/sys/restart-api'); toast('服务重启中…','warn'); };
+$('#rebootBtn').onclick = async () => { await post('/api/sys/reboot'); toast('系统重启中…','warn'); };
+setInterval(() => $('#latClock').textContent = pad(Math.floor(performance.now()) % 10000, 4), 16);
+</script>
+</body>
+</html>

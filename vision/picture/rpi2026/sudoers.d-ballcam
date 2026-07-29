@@ -1,0 +1,6 @@
+# ballcam 需要的免密 sudo。范围刻意收得很窄：只列 UI 按钮真正要调的命令，
+# 不给 ALL，免得以后忘了这条口子。
+# 安装位置 /etc/sudoers.d/ballcam，权限 440。
+@USER@ ALL=(ALL) NOPASSWD: /sbin/poweroff, /sbin/reboot, /usr/sbin/poweroff, /usr/sbin/reboot
+@USER@ ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart ballcam-api
+@USER@ ALL=(ALL) NOPASSWD: /usr/bin/nmcli

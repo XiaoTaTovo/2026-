@@ -1,0 +1,22 @@
+[Unit]
+Description=ballcam 图传接收端后端
+# NetworkManager 起来之后再起，否则自动发现相机时 lease 文件还不存在
+After=network-online.target NetworkManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@APP@
+ExecStart=@PY@ @APP@/app.py
+# 挂了就重起。现场没人看着终端，进程必须自己活过来
+Restart=always
+RestartSec=2
+# 录制中的 ffmpeg 是子进程，停服务时一并收掉，避免残留进程占着相机连接
+KillMode=control-group
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
