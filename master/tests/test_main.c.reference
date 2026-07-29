@@ -1,0 +1,2846 @@
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "app/car_app.h"
+#include "app/h2024_task.h"
+#include "core/line_estimator.h"
+#include "core/odometry.h"
+#include "core/safety_supervisor.h"
+#include "core/scheduler.h"
+#include "core/yaw_estimator.h"
+#include "drivers/button.h"
+#include "drivers/buzzer.h"
+#include "drivers/gray_array.h"
+#include "drivers/motor_board.h"
+#include "firmware.h"
+
+#define TEST_MOTOR_TX_HISTORY (64U)
+
+static uint32_t TestFloatBits(float value)
+{
+    uint32_t bits = 0U;
+
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+typedef struct {
+    uint8_t data[MOTOR_BOARD_MAX_FRAME_SIZE];
+    uint8_t length;
+    uint8_t frames[TEST_MOTOR_TX_HISTORY][MOTOR_BOARD_MAX_FRAME_SIZE];
+    uint8_t lengths[TEST_MOTOR_TX_HISTORY];
+    uint32_t send_count;
+} TestMotorTx;
+
+static bool TestMotorSend(const uint8_t *data, uint8_t length, void *context)
+{
+    TestMotorTx *tx = (TestMotorTx *)context;
+    assert(length <= sizeof(tx->data));
+    assert(tx->send_count < TEST_MOTOR_TX_HISTORY);
+    for (uint8_t i = 0U; i < length; i++) {
+        tx->data[i] = data[i];
+        tx->frames[tx->send_count][i] = data[i];
+    }
+    tx->length = length;
+    tx->lengths[tx->send_count] = length;
+    tx->send_count++;
+    return true;
+}
+
+static void AssertMotorFrame(const uint8_t *actual,
+                             uint8_t actual_length,
+                             const uint8_t *expected,
+                             uint8_t expected_length)
+{
+    assert(actual_length == expected_length);
+    for (uint8_t i = 0U; i < expected_length; i++) {
+        assert(actual[i] == expected[i]);
+    }
+}
+
+static int16_t TestReadS16(const uint8_t *data)
+{
+    return (int16_t)(((uint16_t)data[0] << 8U) | data[1]);
+}
+
+typedef struct {
+    uint8_t selected_channel;
+    uint16_t values[GRAY_ARRAY_CHANNELS];
+} TestGrayPort;
+
+static bool TestGraySelect(uint8_t channel, void *context)
+{
+    TestGrayPort *port = (TestGrayPort *)context;
+    port->selected_channel = channel;
+    return channel < GRAY_ARRAY_CHANNELS;
+}
+
+static bool TestGrayRead(uint16_t *value, void *context)
+{
+    TestGrayPort *port = (TestGrayPort *)context;
+    *value = port->values[port->selected_channel];
+    return true;
+}
+
+static void TestDelayUs(uint32_t delay_us, void *context)
+{
+    (void)delay_us;
+    (void)context;
+}
+
+typedef struct {
+    bool level;
+    bool buzzer_on;
+    uint32_t buzzer_changes;
+} TestIo;
+
+static bool TestButtonRead(void *context)
+{
+    return ((TestIo *)context)->level;
+}
+
+static void TestBuzzerSet(bool enabled, void *context)
+{
+    TestIo *io = (TestIo *)context;
+    io->buzzer_on = enabled;
+    io->buzzer_changes++;
+}
+
+typedef struct {
+    bool active;
+    bool address_received;
+    uint8_t address;
+} TestIcmBus;
+
+static void TestIcmSelect(bool active, void *context)
+{
+    TestIcmBus *bus = (TestIcmBus *)context;
+    bus->active = active;
+    bus->address_received = false;
+}
+
+static uint8_t TestIcmTransfer(uint8_t value, void *context)
+{
+    TestIcmBus *bus = (TestIcmBus *)context;
+
+    assert(bus->active);
+    if (!bus->address_received) {
+        bus->address = value;
+        bus->address_received = true;
+        return 0U;
+    }
+    if (bus->address == (uint8_t)(0x75U | 0x80U)) {
+        return 0x47U;
+    }
+    return 0U;
+}
+
+static void TestDelayMs(uint32_t delay_ms, void *context)
+{
+    (void)delay_ms;
+    (void)context;
+}
+
+static void TestMotorBoard(void)
+{
+    static const uint8_t enable_expected[8] = {
+        0x0A, 0x06, 0x00, 0x08, 0x00, 0x01, 0xC8, 0xB3
+    };
+    static const uint8_t zero_expected[17] = {
+        0x0A, 0x10, 0x00, 0x00, 0x00, 0x04, 0x08,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xFD, 0x7D
+    };
+    TestMotorTx tx = {0};
+    MotorBoard board;
+    MotorBoardConfig config = {
+        TestMotorSend, &tx,
+        MOTOR_BOARD_CHANNEL_B, MOTOR_BOARD_CHANNEL_D,
+        false, true, 10U, 0, 0, 0
+    };
+    uint8_t encoder_frame[13] = {
+        0x0A, 0x03, 0x08,
+        0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0xFF, 0xFC,
+        0x00, 0x00
+    };
+    CarEncoderSample sample;
+    uint8_t feedback_frame[21] = {
+        0x0A, 0x03, 0x10,
+        0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0xFF, 0xFC,
+        0x00, 0x05, 0x00, 0x06, 0x00, 0x07, 0xFF, 0xF8,
+        0x00, 0x00
+    };
+    MotorBoardPid pid[MOTOR_BOARD_CHANNEL_COUNT];
+    int16_t left_speed;
+    int16_t right_speed;
+    uint32_t speed_timestamp;
+    uint16_t crc;
+
+    MotorBoard_Init(&board, &config);
+    assert(MotorBoard_SetClosedLoop(&board, true));
+    AssertMotorFrame(tx.data, tx.length, enable_expected,
+                     sizeof(enable_expected));
+
+    assert(MotorBoard_SetWheelSpeeds(&board, 20, 20));
+    assert(tx.length == 17U);
+    assert(tx.data[9] == 0x00U && tx.data[10] == 0x14U);
+    assert(tx.data[13] == 0xFFU && tx.data[14] == 0xECU);
+
+    assert(MotorBoard_Stop(&board));
+    AssertMotorFrame(tx.data, tx.length, zero_expected,
+                     sizeof(zero_expected));
+
+    for (uint8_t channel = 0U; channel < MOTOR_BOARD_CHANNEL_COUNT; channel++) {
+        pid[channel] = (MotorBoardPid){40.0f, 4.9f, 0.0f};
+    }
+    assert(MotorBoard_SetAllPid(&board, pid));
+    assert(tx.length == 33U);
+    assert(tx.data[2] == 0x00U && tx.data[3] == 0x15U);
+    assert(tx.data[4] == 0x00U && tx.data[5] == 0x0CU);
+    assert(tx.data[6] == 0x18U);
+    for (uint8_t channel = 0U; channel < MOTOR_BOARD_CHANNEL_COUNT; channel++) {
+        uint8_t offset = (uint8_t)(7U + channel * 6U);
+        assert(tx.data[offset] == 0x9CU && tx.data[offset + 1U] == 0x40U);
+        assert(tx.data[offset + 2U] == 0x13U &&
+               tx.data[offset + 3U] == 0x24U);
+        assert(tx.data[offset + 4U] == 0x00U &&
+               tx.data[offset + 5U] == 0x00U);
+    }
+    assert(tx.data[31] == 0xBDU && tx.data[32] == 0x88U);
+
+    crc = MotorBoard_Crc16(encoder_frame, 11U);
+    encoder_frame[11] = (uint8_t)crc;
+    encoder_frame[12] = (uint8_t)(crc >> 8);
+    for (uint8_t i = 0U; i < sizeof(encoder_frame); i++) {
+        MotorBoard_OnRxByte(&board, encoder_frame[i], 100U);
+    }
+    assert(MotorBoard_GetEncoderSample(&board, &sample));
+    assert(sample.left_count == 2);
+    assert(sample.right_count == 4);
+    assert(sample.timestamp_ms == 100U);
+
+    crc = MotorBoard_Crc16(feedback_frame, 19U);
+    feedback_frame[19] = (uint8_t)crc;
+    feedback_frame[20] = (uint8_t)(crc >> 8);
+    for (uint8_t i = 0U; i < sizeof(feedback_frame); i++) {
+        MotorBoard_OnRxByte(&board, feedback_frame[i], 130U);
+    }
+    assert(MotorBoard_GetWheelSpeeds(&board, &left_speed, &right_speed,
+                                     &speed_timestamp));
+    assert(left_speed == 6);
+    assert(right_speed == 8);
+    assert(speed_timestamp == 130U);
+}
+
+static void TestOdometryWrap(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarOdometry odometry;
+    CarEncoderSample sample = {32760, 32760, 0U, true};
+
+    config.wheel_diameter_mm = 318.3099f;
+    config.encoder_counts_per_wheel_rev = 1000.0f;
+    CarOdometry_Init(&odometry);
+    assert(CarOdometry_Update(&odometry, &config, &sample) == CAR_OK);
+    sample.left_count = -32766;
+    sample.right_count = -32766;
+    sample.timestamp_ms = 10U;
+    assert(CarOdometry_Update(&odometry, &config, &sample) == CAR_OK);
+    assert(odometry.center_distance_mm > 9.9f);
+    assert(odometry.center_distance_mm < 10.1f);
+}
+
+static void TestSchedulerAndYaw(void)
+{
+    CarPeriodicTask task;
+    CarYawEstimator yaw;
+    CarImuSample sample;
+    float yaw_before_reject;
+
+    CarPeriodicTask_Init(&task, 10U, 0U);
+    assert(!CarPeriodicTask_Due(&task, 9U));
+    assert(CarPeriodicTask_Due(&task, 10U));
+    assert(CarPeriodicTask_Due(&task, 35U));
+    assert(task.missed_count == 1U);
+
+    CarYawEstimator_Init(&yaw, 2U, 50U, 0.0f, false);
+    assert(!CarYawEstimator_Update(&yaw, 10.0f, 0U));
+    assert(CarYawEstimator_Update(&yaw, 10.0f, 5U));
+    assert(CarYawEstimator_Update(&yaw, 110.0f, 15U));
+    assert(CarYawEstimator_GetSample(&yaw, &sample));
+    assert(sample.yaw_deg > 0.99f && sample.yaw_deg < 1.01f);
+
+    /* A UI/telemetry delay must not erase real rotation. */
+    CarYawEstimator_Init(&yaw, 0U, 20U, 0.0f, true);
+    assert(CarYawEstimator_Update(&yaw, 100.0f, 1000U));
+    assert(CarYawEstimator_Update(&yaw, 100.0f, 1025U));
+    assert(yaw.yaw_deg > 2.49f && yaw.yaw_deg < 2.51f);
+    assert(yaw.delayed_step_count == 1U);
+    assert(yaw.rejected_step_count == 0U);
+
+    /* A true long outage is still rejected instead of integrating stale rate. */
+    yaw_before_reject = yaw.yaw_deg;
+    assert(!CarYawEstimator_Update(&yaw, 100.0f, 1226U));
+    assert(yaw.yaw_deg == yaw_before_reject);
+    assert(yaw.delayed_step_count == 2U);
+    assert(yaw.rejected_step_count == 1U);
+}
+
+static void TestGrayButtonAndBuzzer(void)
+{
+    TestGrayPort gray_port = {0};
+    GrayArrayPort port = {
+        TestGraySelect, TestGrayRead, TestDelayUs, &gray_port, 10U, 2U
+    };
+    GrayArray gray;
+    CarGraySample sample;
+    uint16_t black[8];
+    uint16_t white[8];
+    TestIo io = {true, false, 0U};
+    Button button;
+    Buzzer buzzer;
+
+    for (uint8_t i = 0U; i < 8U; i++) {
+        black[i] = 100U;
+        white[i] = 1000U;
+        gray_port.values[i] = (i == 3U) ? 100U : 1000U;
+    }
+    GrayArray_Init(&gray, &port);
+    assert(GrayArray_SetCalibration(&gray, black, white));
+    assert(GrayArray_Read(&gray, 10U));
+    assert(GrayArray_GetLatest(&gray, &sample));
+    assert(sample.normalized[3] == 1000U);
+    assert(sample.normalized[2] == 0U);
+
+    Button_Init(&button, TestButtonRead, &io, true, 5U);
+    Button_Update(&button, 0U);
+    io.level = false;
+    Button_Update(&button, 1U);
+    Button_Update(&button, 6U);
+    assert(Button_TakePressedEvent(&button));
+    assert(!Button_TakePressedEvent(&button));
+
+    Buzzer_Init(&buzzer, TestBuzzerSet, &io);
+    Buzzer_PlayCue(&buzzer, CAR_CUE_CHECKPOINT, 0U);
+    assert(io.buzzer_on);
+    Buzzer_Update(&buzzer, 80U);
+    assert(!io.buzzer_on);
+}
+
+static void TestFirmwareChain(void)
+{
+    static const uint8_t enable_expected[8] = {
+        0x0A, 0x06, 0x00, 0x08, 0x00, 0x01, 0xC8, 0xB3
+    };
+    static const uint8_t zero_expected[17] = {
+        0x0A, 0x10, 0x00, 0x00, 0x00, 0x04, 0x08,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xFD, 0x7D
+    };
+    TestMotorTx motor_tx = {0};
+    TestGrayPort gray_port = {0};
+    TestIcmBus icm_bus = {0};
+    TestIo io = {true, false, 0U};
+    TestIo gray_cal_io = {true, false, 0U};
+    CarFirmwareConfig config = {0};
+    CarFirmware firmware;
+    uint32_t buzzer_changes_before_fault;
+    uint32_t stop_send_count;
+    uint8_t feedback_frame[21] = {
+        0x0A, 0x03, 0x10,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0
+    };
+    uint16_t crc;
+
+    config.car = CarConfig_MakeDefault();
+    config.mode = H2024_MODE_ITEM_1;
+    config.motor = (MotorBoardConfig){
+        TestMotorSend, &motor_tx,
+        MOTOR_BOARD_CHANNEL_B, MOTOR_BOARD_CHANNEL_D,
+        false, true, 10U, 0, 0, 0
+    };
+    config.imu = (Icm42688Port){
+        TestIcmTransfer, TestIcmSelect, TestDelayMs, &icm_bus
+    };
+    config.gray = (GrayArrayPort){
+        TestGraySelect, TestGrayRead, TestDelayUs, &gray_port, 1U, 1U
+    };
+    config.button_read = TestButtonRead;
+    config.button_context = &io;
+    config.gray_cal_button_read = TestButtonRead;
+    config.gray_cal_button_context = &gray_cal_io;
+    config.require_runtime_gray_calibration = true;
+    config.buzzer_set = TestBuzzerSet;
+    config.buzzer_context = &io;
+    config.motor_units_per_mm_s = 1.0f;
+    config.yaw_axis = CAR_IMU_AXIS_Z;
+    config.yaw_sign = 1;
+    config.imu_calibration_samples = 1U;
+    config.imu_max_step_ms = 20U;
+    config.button_debounce_ms = 2U;
+    config.button_active_low = true;
+    config.gray_calibration_valid = true;
+    config.motor_command_spacing_ms = 50U;
+    config.set_encoder_polarity_on_arm = true;
+    config.set_speed_pid_on_arm = true;
+    for (uint8_t channel = 0U; channel < MOTOR_BOARD_CHANNEL_COUNT; channel++) {
+        config.encoder_polarity[channel] = true;
+        config.speed_pid[channel] = (MotorBoardPid){40.0f, 4.9f, 0.0f};
+    }
+    for (uint8_t i = 0U; i < 8U; i++) {
+        config.gray_black[i] = 100U;
+        config.gray_white[i] = 1000U;
+        gray_port.values[i] = 1000U;
+    }
+
+    assert(CarFirmware_Init(&firmware, &config, 0U) == CAR_OK);
+    assert(firmware.gray_cal_state == CAR_GRAY_CAL_WAIT_WHITE);
+    assert(motor_tx.send_count == 1U);
+    AssertMotorFrame(motor_tx.frames[0], motor_tx.lengths[0], zero_expected,
+                     sizeof(zero_expected));
+
+    CarFirmware_Tick(&firmware, 0U);
+    gray_cal_io.level = false;
+    for (uint32_t now = 1U; now <= 5U; now++) {
+        CarFirmware_Tick(&firmware, now);
+    }
+    gray_cal_io.level = true;
+    for (uint32_t now = 6U; now <= 180U; now++) {
+        CarFirmware_Tick(&firmware, now);
+    }
+    assert(firmware.gray_cal_state == CAR_GRAY_CAL_WAIT_BLACK);
+    for (uint8_t i = 0U; i < GRAY_ARRAY_CHANNELS; i++) {
+        assert(firmware.gray_cal_white[i] == 1000U);
+        gray_port.values[i] = 100U;
+    }
+
+    gray_cal_io.level = false;
+    for (uint32_t now = 181U; now <= 185U; now++) {
+        CarFirmware_Tick(&firmware, now);
+    }
+    gray_cal_io.level = true;
+    for (uint32_t now = 186U; now <= 350U; now++) {
+        CarFirmware_Tick(&firmware, now);
+    }
+    assert(firmware.gray_cal_state == CAR_GRAY_CAL_READY);
+    for (uint8_t i = 0U; i < GRAY_ARRAY_CHANNELS; i++) {
+        assert(firmware.gray.black[i] == 100U);
+        assert(firmware.gray.white[i] == 1000U);
+        gray_port.values[i] = 1000U;
+    }
+    assert(motor_tx.send_count == 8U);
+    for (uint8_t channel = 0U; channel < MOTOR_BOARD_CHANNEL_COUNT; channel++) {
+        const uint8_t *frame = motor_tx.frames[channel + 1U];
+        uint16_t frame_crc;
+
+        assert(motor_tx.lengths[channel + 1U] == 8U);
+        assert(frame[0] == 0x0AU && frame[1] == 0x06U);
+        assert(frame[2] == 0x00U && frame[3] == (uint8_t)(0x09U + channel));
+        assert(frame[4] == 0x00U && frame[5] == 0x01U);
+        frame_crc = MotorBoard_Crc16(frame, 6U);
+        assert(frame[6] == (uint8_t)frame_crc);
+        assert(frame[7] == (uint8_t)(frame_crc >> 8U));
+    }
+    assert(motor_tx.lengths[5] == 33U);
+    assert(motor_tx.frames[5][1] == 0x10U);
+    assert(motor_tx.frames[5][2] == 0x00U &&
+           motor_tx.frames[5][3] == 0x15U);
+    AssertMotorFrame(motor_tx.frames[6], motor_tx.lengths[6],
+                     enable_expected, sizeof(enable_expected));
+    AssertMotorFrame(motor_tx.frames[7], motor_tx.lengths[7], zero_expected,
+                     sizeof(zero_expected));
+    assert(firmware.motor_armed);
+    assert(firmware.motor.closed_loop_enabled);
+
+    crc = MotorBoard_Crc16(feedback_frame, 19U);
+    feedback_frame[19] = (uint8_t)crc;
+    feedback_frame[20] = (uint8_t)(crc >> 8);
+    for (uint8_t i = 0U; i < sizeof(feedback_frame); i++) {
+        CarFirmware_OnMotorRxByte(&firmware, feedback_frame[i], 351U);
+    }
+
+    io.level = false;
+    for (uint32_t now = 351U; now <= 400U; now++) {
+        CarFirmware_Tick(&firmware, now);
+    }
+    assert(firmware.app.executor.running);
+    assert(firmware.output.motor.enable);
+    assert(firmware.motor_armed);
+    assert(motor_tx.send_count > 8U);
+    assert(TestReadS16(&motor_tx.data[9]) > 0);
+    assert(TestReadS16(&motor_tx.data[13]) < 0);
+
+    buzzer_changes_before_fault = io.buzzer_changes;
+    CarFirmware_ForceStop(&firmware, CAR_FAULT_MOTOR_IO);
+    assert(firmware.output.faults == CAR_FAULT_MOTOR_IO);
+    assert(firmware.output.run_time_ms == 40U);
+    assert(firmware.output.route_index == firmware.app.executor.index);
+    AssertMotorFrame(motor_tx.data, motor_tx.length, zero_expected,
+                     sizeof(zero_expected));
+    assert(firmware.motor.closed_loop_enabled);
+    stop_send_count = motor_tx.send_count;
+    for (uint32_t now = 401U; now <= 460U; now++) {
+        CarFirmware_Tick(&firmware, now);
+    }
+    assert(motor_tx.send_count > stop_send_count);
+    AssertMotorFrame(motor_tx.data, motor_tx.length, zero_expected,
+                     sizeof(zero_expected));
+    assert(io.buzzer_changes == buzzer_changes_before_fault + 1U);
+}
+
+static void TestLineEstimator(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarGraySample sample = {{0}, 10U, true};
+    CarLineEstimate estimate;
+
+    sample.normalized[3] = 1000U;
+    sample.normalized[4] = 1000U;
+    assert(CarLineEstimator_Update(&config, &sample, &estimate) == CAR_OK);
+    assert(estimate.valid);
+    assert(estimate.position == 0);
+    assert(estimate.active_mask == 0x18U);
+    assert(estimate.left_confidence == 1000U);
+    assert(estimate.right_confidence == 1000U);
+    assert(estimate.right_ratio_permille == 500U);
+    assert(estimate.active_span == 2U);
+
+    sample = (CarGraySample){{0}, 20U, true};
+    sample.normalized[0] = 1000U;
+    assert(CarLineEstimator_Update(&config, &sample, &estimate) == CAR_OK);
+    assert(estimate.position < 0);
+
+    /* A broad center-to-right corner has position only +1500, but its
+     * right-energy ratio and active span clearly differ from a normal line. */
+    sample = (CarGraySample){{0}, 30U, true};
+    for (uint8_t i = 3U; i < 8U; i++) {
+        sample.normalized[i] = 1000U;
+    }
+    assert(CarLineEstimator_Update(&config, &sample, &estimate) == CAR_OK);
+    assert(estimate.position == 1500);
+    assert(estimate.right_ratio_permille == 800U);
+    assert(estimate.active_count == 5U);
+    assert(estimate.active_span == 5U);
+
+    /* A low raised background can trip the legacy absolute mask on all eight
+     * channels. A coherent relative peak is still the real narrow track. */
+    for (uint8_t peak_width = 1U; peak_width <= 4U; peak_width++) {
+        uint8_t first_peak = (uint8_t)((8U - peak_width) / 2U);
+
+        sample = (CarGraySample){{0}, (uint32_t)(39U + peak_width), true};
+        for (uint8_t i = 0U; i < 8U; i++) {
+            sample.normalized[i] = 200U;
+        }
+        for (uint8_t i = first_peak;
+             i < (uint8_t)(first_peak + peak_width); i++) {
+            sample.normalized[i] = 900U;
+        }
+        assert(CarLineEstimator_Update(&config, &sample, &estimate) == CAR_OK);
+        assert(estimate.active_mask == 0xFFU);
+        assert(estimate.active_count == 8U);
+        assert(estimate.adaptive_background == 200U);
+        assert(estimate.adaptive_contrast == 700U);
+        assert(estimate.track_active_count == peak_width);
+        assert(estimate.track_cluster_count == 1U);
+        assert(estimate.pattern == CAR_LINE_PATTERN_NARROW_TRACK);
+    }
+
+    /* In a genuinely black area even the two darkest channels stay high. A
+     * local highlight there must not masquerade as a narrow outgoing line. */
+    for (uint8_t peak_width = 1U; peak_width <= 4U; peak_width++) {
+        uint8_t first_peak = (uint8_t)((8U - peak_width) / 2U);
+
+        sample = (CarGraySample){{0}, (uint32_t)(44U + peak_width), true};
+        for (uint8_t i = 0U; i < 8U; i++) {
+            sample.normalized[i] = 700U;
+        }
+        for (uint8_t i = first_peak;
+             i < (uint8_t)(first_peak + peak_width); i++) {
+            sample.normalized[i] = 1000U;
+        }
+        assert(CarLineEstimator_Update(&config, &sample, &estimate) == CAR_OK);
+        assert(estimate.active_mask == 0xFFU);
+        assert(estimate.adaptive_background == 700U);
+        assert(estimate.track_active_count == peak_width);
+        assert(estimate.pattern == CAR_LINE_PATTERN_WIDE_AREA);
+    }
+
+    /* Uniform broad black is intentionally ambiguous, not a centered line. */
+    sample = (CarGraySample){{0}, 50U, true};
+    for (uint8_t i = 0U; i < 8U; i++) {
+        sample.normalized[i] = 600U;
+    }
+    assert(CarLineEstimator_Update(&config, &sample, &estimate) == CAR_OK);
+    assert(estimate.valid);
+    assert(estimate.pattern == CAR_LINE_PATTERN_WIDE_AREA);
+    assert(estimate.track_active_count == 0U);
+
+    /* Two separated peaks are split noise and cannot drive line PID. */
+    sample = (CarGraySample){{0}, 60U, true};
+    sample.normalized[1] = 900U;
+    sample.normalized[6] = 900U;
+    assert(CarLineEstimator_Update(&config, &sample, &estimate) == CAR_OK);
+    assert(estimate.pattern == CAR_LINE_PATTERN_SPLIT_NOISE);
+    assert(estimate.track_cluster_count == 2U);
+
+    sample = (CarGraySample){{0}, 70U, true};
+    for (uint8_t i = 0U; i < 8U; i++) {
+        sample.normalized[i] = 40U;
+    }
+    assert(CarLineEstimator_Update(&config, &sample, &estimate) == CAR_OK);
+    assert(!estimate.valid);
+    assert(estimate.pattern == CAR_LINE_PATTERN_NONE);
+}
+
+static void TestRoutes(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route;
+
+    assert(H2024_BuildRoute(H2024_MODE_ITEM_1, &config, &route) == CAR_OK);
+    assert(route.count == 4U);
+    assert(H2024_BuildRoute(H2024_MODE_ITEM_2, &config, &route) == CAR_OK);
+    assert(route.count == 10U);
+    assert(H2024_BuildRoute(H2024_MODE_ITEM_3, &config, &route) == CAR_OK);
+    assert(route.count == 13U);
+    assert(H2024_BuildRoute(H2024_MODE_ITEM_4, &config, &route) == CAR_OK);
+    assert(route.count <= CAR_ROUTE_MAX_SEGMENTS);
+
+    /* 2026 任务1：START、A-B、B点提示、STOP。 */
+    assert(H2024_BuildRoute(H2026_MODE_ITEM_1, &config, &route) == CAR_OK);
+    assert(route.count == 4U);
+    assert(route.segments[1].type == CAR_SEGMENT_STRAIGHT);
+    assert(route.segments[1].value == 1000.0f);
+    assert(route.segments[1].use_line);
+    assert(route.segments[1].line_follow_exit ==
+           CAR_LINE_FOLLOW_EXIT_DISTANCE);
+    assert(route.segments[3].type == CAR_SEGMENT_STOP);
+
+    /* 2026 任务2：真实地图的半圆和矩形回程。 */
+    assert(H2024_BuildRoute(H2026_MODE_ITEM_2, &config, &route) == CAR_OK);
+    assert(route.count == 13U);
+    assert(route.segments[1].type == CAR_SEGMENT_STRAIGHT);
+    assert(route.segments[1].value == 1000.0f);
+    assert(route.segments[1].use_line);
+    assert(route.segments[1].line_follow_exit ==
+           CAR_LINE_FOLLOW_EXIT_SENSOR_AXLE);
+    assert(route.segments[3].type == CAR_SEGMENT_ARC);
+    assert(route.segments[3].value == -400.0f);
+    assert(route.segments[3].arc_angle_deg == 180.0f);
+    assert(route.segments[3].use_line);
+    assert(route.segments[3].handoff_arc_heading);
+    assert(route.segments[5].type == CAR_SEGMENT_STRAIGHT);
+    assert(route.segments[5].value == 1000.0f);
+    assert(route.segments[5].use_line);
+    assert(route.segments[5].line_follow_exit ==
+           CAR_LINE_FOLLOW_EXIT_SENSOR_AXLE);
+    assert(route.segments[7].type == CAR_SEGMENT_LINE_FOLLOW);
+    assert(route.segments[7].value == 400.0f);
+    assert(route.segments[7].use_line);
+    assert(route.segments[7].line_follow_exit ==
+           CAR_LINE_FOLLOW_EXIT_RIGHT_CORNER);
+    assert(route.segments[7].line_event_arm_ratio == 0.75f);
+    assert(route.segments[8].type == CAR_SEGMENT_TURN);
+    assert(route.segments[8].value == -90.0f);
+    assert(route.segments[8].use_line);
+    assert(route.segments[9].type == CAR_SEGMENT_LINE_FOLLOW);
+    assert(route.segments[9].value == 800.0f);
+    assert(route.segments[9].use_line);
+    assert(route.segments[9].line_follow_exit ==
+           CAR_LINE_FOLLOW_EXIT_RIGHT_CORNER);
+    assert(route.segments[10].type == CAR_SEGMENT_TURN);
+    assert(route.segments[10].value == -90.0f);
+    assert(route.segments[10].use_line);
+    assert(route.segments[11].type == CAR_SEGMENT_LINE_FOLLOW);
+    assert(route.segments[11].value == 400.0f);
+    assert(route.segments[11].use_line);
+    assert(route.segments[11].line_follow_exit ==
+           CAR_LINE_FOLLOW_EXIT_LOST);
+    assert(route.segments[12].type == CAR_SEGMENT_STOP);
+
+    /* 2026 任务3：A-C、C-B半圆、B-D、矩形回A。 */
+    assert(H2024_BuildRoute(H2026_MODE_ITEM_3, &config, &route) == CAR_OK);
+    assert(route.count == 17U);
+    assert(route.segments[1].type == CAR_SEGMENT_TURN);
+    assert(route.segments[1].value == -38.6598f);
+    assert(route.segments[2].type == CAR_SEGMENT_STRAIGHT);
+    assert(route.segments[2].value == 1280.6248f);
+    assert(route.segments[2].use_line);
+    assert(route.segments[2].line_follow_exit ==
+           CAR_LINE_FOLLOW_EXIT_DIAGONAL_AXLE);
+    assert(route.segments[4].type == CAR_SEGMENT_TURN);
+    assert(route.segments[4].value == 38.6598f);
+    assert(route.segments[5].type == CAR_SEGMENT_ARC);
+    assert(route.segments[5].value == 400.0f);
+    assert(route.segments[5].arc_angle_deg == 180.0f);
+    assert(!route.segments[5].handoff_arc_heading);
+    assert(route.segments[7].type == CAR_SEGMENT_TURN);
+    assert(route.segments[7].value == 38.6598f);
+    assert(route.segments[8].type == CAR_SEGMENT_STRAIGHT);
+    assert(route.segments[8].value == 1280.6248f);
+    assert(route.segments[8].line_follow_exit ==
+           CAR_LINE_FOLLOW_EXIT_DIAGONAL_AXLE);
+    assert(route.segments[10].type == CAR_SEGMENT_TURN);
+    assert(route.segments[10].value == -38.6598f);
+    assert(route.segments[11].type == CAR_SEGMENT_LINE_FOLLOW);
+    assert(route.segments[11].value == 400.0f);
+    assert(route.segments[12].type == CAR_SEGMENT_TURN);
+    assert(route.segments[12].value == -90.0f);
+    assert(route.segments[13].type == CAR_SEGMENT_LINE_FOLLOW);
+    assert(route.segments[13].value == 800.0f);
+    assert(route.segments[14].type == CAR_SEGMENT_TURN);
+    assert(route.segments[14].value == -90.0f);
+    assert(route.segments[15].type == CAR_SEGMENT_LINE_FOLLOW);
+    assert(route.segments[15].line_follow_exit ==
+           CAR_LINE_FOLLOW_EXIT_LOST);
+    assert(route.segments[16].type == CAR_SEGMENT_STOP);
+
+    /* 2026 任务4：固定正向起步的任务3路线连续三圈，中间不停车。 */
+    assert(H2024_BuildRoute(H2026_MODE_ITEM_4, &config, &route) == CAR_OK);
+    assert(route.count == 50U);
+    assert(route.segments[1].type == CAR_SEGMENT_TURN);
+    assert(route.segments[1].value == -38.6598f);
+    assert(route.segments[17].type == CAR_SEGMENT_TURN);
+    assert(route.segments[17].value == -38.6598f);
+    assert(route.segments[33].type == CAR_SEGMENT_TURN);
+    assert(route.segments[33].value == -38.6598f);
+    assert(route.segments[16].type == CAR_SEGMENT_CUE);
+    assert(route.segments[32].type == CAR_SEGMENT_CUE);
+    assert(route.segments[48].type == CAR_SEGMENT_CUE);
+    for (uint8_t i = 0U; i < 49U; i++) {
+        assert(route.segments[i].type != CAR_SEGMENT_STOP);
+    }
+    assert(route.segments[49].type == CAR_SEGMENT_STOP);
+
+    /* Official H2026 B2 is one continuous 1500/R500/1500/R500 lap. */
+    config.finish_sensor_to_test_point_mm = 150.0f;
+    config.required_line_search_mm = 80.0f;
+    assert(H2024_BuildRoute(H2026_MODE_B2, &config, &route) == CAR_OK);
+    assert(route.count == 6U);
+    assert(route.segments[0].type == CAR_SEGMENT_CUE);
+    assert(route.segments[1].type == CAR_SEGMENT_TRACK);
+    assert(route.segments[1].value == 1500.0f);
+    assert(route.segments[1].arc_angle_deg == 0.0f);
+    assert(route.segments[2].type == CAR_SEGMENT_TRACK);
+    assert(route.segments[2].value > 1570.7f &&
+           route.segments[2].value < 1570.9f);
+    assert(route.segments[2].arc_angle_deg == -0.002f);
+    assert(route.segments[3].type == CAR_SEGMENT_TRACK);
+    assert(route.segments[3].value == 1500.0f);
+    assert(route.segments[4].type == CAR_SEGMENT_TRACK);
+    assert(route.segments[4].arc_angle_deg == -0.002f);
+    assert(route.segments[4].line_follow_exit ==
+           CAR_LINE_FOLLOW_EXIT_WIDE_MARKER);
+    assert(route.segments[4].line_event_arm_ratio > 0.8535f);
+    assert(route.segments[4].line_event_arm_ratio < 0.8537f);
+    assert(route.segments[5].type == CAR_SEGMENT_STOP);
+
+    assert(H2024_BuildRoute(H2026_MODE_B3, &config, &route) ==
+           CAR_ERROR_STATE);
+    assert(H2024_BuildRoute(H2026_MODE_B4, &config, &route) ==
+           CAR_ERROR_STATE);
+    assert(H2024_BuildRoute(H2026_MODE_B5, &config, &route) ==
+           CAR_ERROR_STATE);
+    assert(H2024_BuildRoute(H2026_MODE_B6, &config, &route) ==
+           CAR_ERROR_STATE);
+}
+
+static void TestSafety(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarInputSnapshot input = {0};
+    uint32_t faults;
+
+    input.encoder.valid = true;
+    input.imu.valid = true;
+    input.encoder.timestamp_ms = 100U;
+    input.imu.timestamp_ms = 100U;
+    faults = CarSafety_Evaluate(&config, 120U, &input, true, false);
+    assert(faults == CAR_FAULT_NONE);
+
+    input.encoder.timestamp_ms = 121U;
+    input.imu.timestamp_ms = 121U;
+    faults = CarSafety_Evaluate(&config, 120U, &input, true, false);
+    assert(faults == CAR_FAULT_NONE);
+
+    input.encoder.timestamp_ms = 100U;
+    input.imu.timestamp_ms = 100U;
+    faults = CarSafety_Evaluate(&config, 500U, &input, true, false);
+    assert((faults & CAR_FAULT_ENCODER_STALE) != 0U);
+    assert((faults & CAR_FAULT_IMU_STALE) != 0U);
+}
+
+static void TestRouteExitReasons(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route = {0};
+    CarRouteExecutor executor;
+    CarOdometry odometry = {0};
+    CarLineEstimate line = {0};
+    CarMotorCommand motor;
+    CarCue cue;
+    uint32_t faults = 0U;
+
+    route.count = 1U;
+    route.segments[0] = (CarRouteSegment){
+        CAR_SEGMENT_STRAIGHT, 1000.0f, 100.0f, 5000U,
+        true, CAR_CUE_NONE, 0.0f,
+        CAR_LINE_FOLLOW_EXIT_DISTANCE, 0.0f, false
+    };
+    CarRouteExecutor_Init(&executor);
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+    odometry.center_distance_mm = 600.0f;
+    /* 普通单路黑线不能被误当成终点横线。 */
+    line.valid = true;
+    line.confidence = 1000U;
+    line.active_count = 1U;
+    line.active_mask = 0x08U;
+    assert(CarRouteExecutor_Update(&executor, &config, 100U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.running);
+    assert(executor.last_motion_exit_reason == CAR_ROUTE_EXIT_NONE);
+
+    /* 两个不相邻的黑点即使黑度足够，也不能误判成1cm终点细线。 */
+    line.confidence = config.gray_finish_min_confidence;
+    line.active_count = config.gray_finish_min_active;
+    line.active_mask = 0x11U;
+    assert(CarRouteExecutor_Update(&executor, &config, 120U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.running);
+
+    /* 两个相邻探头也必须先进入目标距离最后20%的布防区。 */
+    line.active_mask = 0x18U;
+    assert(CarRouteExecutor_Update(&executor, &config, 140U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.running);
+
+    /* 进入布防区后连续2帧命中，才确认细终点线。 */
+    odometry.center_distance_mm = 850.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 160U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.running);
+    assert(CarRouteExecutor_Update(&executor, &config, 180U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.finished);
+    assert(executor.last_motion_exit_reason == CAR_ROUTE_EXIT_LINE);
+    assert(executor.last_line_exit_confidence ==
+           config.gray_finish_min_confidence);
+    assert(executor.last_line_exit_active_count ==
+           config.gray_finish_min_active);
+    assert(executor.last_line_exit_active_mask == 0x18U);
+    assert(executor.last_line_exit_progress_mm == 850.0f);
+
+    odometry = (CarOdometry){0};
+    line = (CarLineEstimate){0};
+    faults = 0U;
+    CarRouteExecutor_Init(&executor);
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+    odometry.center_distance_mm = 1000.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 100U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.finished);
+    assert(executor.last_motion_exit_reason == CAR_ROUTE_EXIT_DISTANCE);
+}
+
+static void TestH2026FilteredStraightFinish(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route = {0};
+    CarRouteExecutor executor;
+    CarOdometry odometry = {0};
+    CarLineEstimate line = {0};
+    CarMotorCommand motor;
+    CarCue cue;
+    uint32_t faults = 0U;
+
+    config.gray_shape_filter_enable = true;
+    config.gray_finish_arm_ratio = 0.8f;
+    config.gray_finish_consecutive_frames = 2U;
+    route.count = 1U;
+    route.segments[0] = (CarRouteSegment){
+        CAR_SEGMENT_STRAIGHT, 1000.0f, 100.0f, 5000U,
+        true, CAR_CUE_NONE, 0.0f,
+        CAR_LINE_FOLLOW_EXIT_DISTANCE, 0.0f, false
+    };
+
+    CarRouteExecutor_Init(&executor);
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+    odometry.center_distance_mm = 850.0f;
+
+    /* A wide 0xFF frame satisfies every legacy finish-line field, but H2026
+     * shape filtering must reject it before the consecutive-frame counter. */
+    line.valid = true;
+    line.confidence = 8000U;
+    line.active_count = 8U;
+    line.active_mask = 0xFFU;
+    line.pattern = CAR_LINE_PATTERN_WIDE_AREA;
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.running);
+    assert(executor.finish_line_streak == 0U);
+    assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.running);
+    assert(executor.finish_line_streak == 0U);
+
+    /* Two consecutive narrow observations at the same armed location are a
+     * valid task-1 finish line and must still exit by LINE. */
+    line.confidence = 1400U;
+    line.active_count = 2U;
+    line.active_mask = 0x18U;
+    line.pattern = CAR_LINE_PATTERN_NARROW_TRACK;
+    line.track_position = 0;
+    line.track_confidence = 1400U;
+    line.track_active_count = 2U;
+    line.track_active_mask = 0x18U;
+    assert(CarRouteExecutor_Update(&executor, &config, 60U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.running);
+    assert(executor.finish_line_streak == 1U);
+    assert(CarRouteExecutor_Update(&executor, &config, 80U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.finished);
+    assert(executor.last_motion_exit_reason == CAR_ROUTE_EXIT_LINE);
+}
+
+static void TestLineFollowEvents(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route = {0};
+    CarRouteExecutor executor;
+    CarOdometry odometry = {0};
+    CarLineEstimate line = {0};
+    CarMotorCommand motor;
+    CarCue cue;
+    uint32_t faults = 0U;
+
+    config.line_follow_kp = 0.02f;
+    config.line_sensor_to_axle_mm = 222.0f;
+    config.line_corner_pivot_approach_mm = 150.0f;
+    route.count = 1U;
+    route.segments[0] = (CarRouteSegment){
+        CAR_SEGMENT_LINE_FOLLOW, 400.0f, 100.0f, 5000U,
+        true, CAR_CUE_NONE, 0.0f,
+        CAR_LINE_FOLLOW_EXIT_DISTANCE, 0.0f, false
+    };
+    route.segments[0].line_follow_exit =
+        CAR_LINE_FOLLOW_EXIT_RIGHT_CORNER;
+    route.segments[0].line_event_arm_ratio = 0.75f;
+    line.valid = true;
+    line.confidence = 5000U;
+    line.active_count = 5U;
+    line.active_mask = 0xF8U;
+    line.right_ratio_permille = 800U;
+    line.active_span = 5U;
+
+    CarRouteExecutor_Init(&executor);
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+    odometry.center_distance_mm = 250.0f;
+    /* Broad center-to-right shape triggers even though centroid is <2000. */
+    line.position = 1500;
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.running);
+    assert(executor.line_event_streak == 0U);
+    assert(motor.left_mm_s > motor.right_mm_s);
+
+    /* The same right-edge pattern becomes a corner only after 75% distance. */
+    odometry.center_distance_mm = 320.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.running);
+    assert(CarRouteExecutor_Update(&executor, &config, 60U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.running);
+    assert(executor.line_follow_phase ==
+           CAR_LINE_FOLLOW_PHASE_AXLE_APPROACH);
+    assert(executor.last_line_exit_progress_mm == 320.0f);
+    assert(motor.left_mm_s == config.line_corner_approach_speed_mm_s);
+    assert(motor.right_mm_s == config.line_corner_approach_speed_mm_s);
+
+    /* The independent corner approach is 150mm for this test. The unrelated
+     * ARC sensor-to-axle value above is deliberately 222mm. */
+    odometry.center_distance_mm = 466.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 80U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.running);
+    assert(executor.line_corner_approach_mm == 146.0f);
+    odometry.center_distance_mm = 467.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 100U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.finished);
+    assert(executor.last_motion_exit_reason == CAR_ROUTE_EXIT_LINE);
+    assert(executor.line_corner_approach_mm == 0.0f);
+
+    /* With no gray corner evidence, 400mm alone must no longer turn. The
+     * fallback includes the independent 150mm corner approach. */
+    odometry = (CarOdometry){0};
+    line = (CarLineEstimate){0};
+    faults = 0U;
+    CarRouteExecutor_Init(&executor);
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+    odometry.center_distance_mm = 400.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.running);
+    odometry.center_distance_mm = 547.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.finished);
+    assert(executor.last_motion_exit_reason == CAR_ROUTE_EXIT_DISTANCE);
+
+    /* At A, the line must first be seen, then remain lost for three frames. */
+    odometry = (CarOdometry){0};
+    faults = 0U;
+    route.segments[0].line_follow_exit = CAR_LINE_FOLLOW_EXIT_LOST;
+    CarRouteExecutor_Init(&executor);
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+    odometry.center_distance_mm = 100.0f;
+    line.valid = true;
+    line.position = 0;
+    line.confidence = 1000U;
+    line.active_count = 2U;
+    line.active_mask = 0x18U;
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_seen);
+    odometry.center_distance_mm = 320.0f;
+    line = (CarLineEstimate){0};
+    for (uint32_t now_ms = 40U; now_ms <= 80U; now_ms += 20U) {
+        assert(CarRouteExecutor_Update(&executor, &config, now_ms,
+                                       &odometry, 0.0f, &line,
+                                       &motor, &cue, &faults) == CAR_OK);
+    }
+    assert(executor.finished);
+    assert(executor.last_motion_exit_reason == CAR_ROUTE_EXIT_LINE);
+    assert(executor.last_line_exit_active_mask == 0U);
+}
+
+static void TestTurnLineReacquire(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route = {0};
+    CarRouteExecutor executor;
+    CarOdometry odometry = {0};
+    CarLineEstimate line = {0};
+    CarMotorCommand motor;
+    CarCue cue;
+    uint32_t faults = 0U;
+
+    route.count = 1U;
+    route.segments[0] = (CarRouteSegment){
+        CAR_SEGMENT_TURN, -90.0f, 90.0f, 5000U,
+        true, CAR_CUE_NONE, 0.0f,
+        CAR_LINE_FOLLOW_EXIT_DISTANCE, 0.0f, false
+    };
+    line.valid = true;
+    line.position = 0;
+    line.confidence = 1000U;
+    line.active_count = 2U;
+    line.active_mask = 0x18U;
+
+    CarRouteExecutor_Init(&executor);
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, -79.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.turn_line_reacquire_streak == 0U);
+    assert(executor.running);
+    assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                   &odometry, -82.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.turn_line_reacquire_streak == 1U);
+    assert(executor.running);
+    assert(CarRouteExecutor_Update(&executor, &config, 60U,
+                                   &odometry, -83.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.finished);
+    assert(executor.last_motion_exit_reason == CAR_ROUTE_EXIT_REACQUIRE);
+}
+
+static void TestH2026WideAreaCannotReacquireTurn(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route = {0};
+    CarRouteExecutor executor;
+    CarOdometry odometry = {0};
+    CarLineEstimate line = {0};
+    CarMotorCommand motor;
+    CarCue cue;
+    uint32_t faults = 0U;
+
+    config.gray_shape_filter_enable = true;
+    config.turn_line_reacquire_frames = 1U;
+    route.count = 1U;
+    route.segments[0] = (CarRouteSegment){
+        CAR_SEGMENT_TURN, -90.0f, 90.0f, 5000U,
+        true, CAR_CUE_NONE, 0.0f,
+        CAR_LINE_FOLLOW_EXIT_DISTANCE, 0.0f, false
+    };
+
+    CarRouteExecutor_Init(&executor);
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+
+    /* A broad black area can have a centered legacy centroid, but it is not
+     * evidence of the outgoing narrow line and must not end the turn. */
+    line.valid = true;
+    line.position = 0;
+    line.confidence = 8000U;
+    line.active_count = 8U;
+    line.active_mask = 0xFFU;
+    line.pattern = CAR_LINE_PATTERN_WIDE_AREA;
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, -85.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.running);
+    assert(executor.turn_line_reacquire_streak == 0U);
+    assert(executor.last_motion_exit_reason == CAR_ROUTE_EXIT_NONE);
+
+    line.pattern = CAR_LINE_PATTERN_NARROW_TRACK;
+    line.track_position = 0;
+    line.track_confidence = 1200U;
+    line.track_active_count = 2U;
+    line.track_active_mask = 0x18U;
+    assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                   &odometry, -86.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.finished);
+    assert(executor.last_motion_exit_reason == CAR_ROUTE_EXIT_REACQUIRE);
+}
+
+static void TestH2026CaptureGrayGuidanceCompatibility(void)
+{
+    const float disabled_limits[3] = {0.0f, -1.0f, 20.0f};
+    const bool shape_filters[3] = {true, true, false};
+
+    /* A non-positive guide limit is the compatibility switch.  Exercise both
+     * zero and a negative value, and compare the wheel-speed float bit patterns
+     * with the legacy yaw-only formula rather than using an epsilon. */
+    for (uint8_t i = 0U; i < 3U; i++) {
+        CarConfig config = CarConfig_MakeDefault();
+        CarRoute route = {0};
+        CarRouteExecutor executor;
+        CarOdometry odometry = {0};
+        CarLineEstimate line = {0};
+        CarMotorCommand motor;
+        CarCue cue;
+        uint32_t faults = 0U;
+
+        config.gray_shape_filter_enable = shape_filters[i];
+        config.gray_finish_arm_ratio = 0.8f;
+        config.line_cross_center_position = 0;
+        config.line_cross_capture_window_mm = 300.0f;
+        config.line_cross_capture_speed_mm_s = 80.0f;
+        config.line_cross_capture_kp = 0.01f;
+        config.line_cross_capture_max_correction_mm_s = disabled_limits[i];
+        config.straight_heading_kp = 2.0f;
+        config.straight_heading_max_correction_mm_s = 100.0f;
+        config.distance_tolerance_mm = 0.0f;
+        route.count = 1U;
+        route.segments[0] = (CarRouteSegment){
+            CAR_SEGMENT_STRAIGHT, 1000.0f, 180.0f, 5000U,
+            true, CAR_CUE_NONE, 0.0f,
+            CAR_LINE_FOLLOW_EXIT_DIAGONAL_AXLE, 0.0f, false
+        };
+        line.pattern = CAR_LINE_PATTERN_NARROW_TRACK;
+        line.valid = true;
+        line.position = 3500;
+        line.track_position = 3500;
+        line.track_confidence = 1200U;
+        line.track_active_count = 2U;
+        line.track_active_mask = 0xC0U;
+
+        odometry.center_distance_mm = 1000.0f;
+        CarRouteExecutor_Init(&executor);
+        assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                      &odometry, 5.0f) == CAR_OK);
+        odometry.center_distance_mm = 1805.0f;
+        assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                       &odometry, 5.0f, &line,
+                                       &motor, &cue, &faults) == CAR_OK);
+        assert(executor.line_follow_phase ==
+               CAR_LINE_FOLLOW_PHASE_CROSSING_CAPTURE);
+        assert(TestFloatBits(motor.left_mm_s) == TestFloatBits(80.0f));
+        assert(TestFloatBits(motor.right_mm_s) == TestFloatBits(80.0f));
+
+        odometry.center_distance_mm = 1815.0f;
+        assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                       &odometry, 7.0f, &line,
+                                       &motor, &cue, &faults) == CAR_OK);
+        assert(executor.line_follow_phase ==
+               CAR_LINE_FOLLOW_PHASE_CROSSING_CAPTURE);
+        assert(TestFloatBits(motor.left_mm_s) == TestFloatBits(84.0f));
+        assert(TestFloatBits(motor.right_mm_s) == TestFloatBits(76.0f));
+        assert(motor.enable);
+    }
+
+    {
+        CarConfig config = CarConfig_MakeDefault();
+        CarRoute route = {0};
+        CarRouteExecutor executor;
+        CarOdometry odometry = {0};
+        CarLineEstimate line = {0};
+        CarMotorCommand motor;
+        CarCue cue;
+        uint32_t faults = 0U;
+        float simulated_position = 3500.0f;
+        float previous_split = 1000.0f;
+        bool split_decreased = false;
+
+        config.gray_shape_filter_enable = true;
+        config.gray_finish_arm_ratio = 0.8f;
+        config.line_cross_center_position = 0;
+        config.line_cross_capture_window_mm = 300.0f;
+        config.line_cross_capture_speed_mm_s = 80.0f;
+        config.line_cross_capture_kp = 0.01f;
+        config.line_cross_capture_max_correction_mm_s = 20.0f;
+        config.straight_heading_kp = 2.0f;
+        config.straight_heading_max_correction_mm_s = 100.0f;
+        config.distance_tolerance_mm = 0.0f;
+        route.count = 1U;
+        route.segments[0] = (CarRouteSegment){
+            CAR_SEGMENT_STRAIGHT, 1000.0f, 180.0f, 5000U,
+            true, CAR_CUE_NONE, 0.0f,
+            CAR_LINE_FOLLOW_EXIT_DIAGONAL_AXLE, 0.0f, false
+        };
+        line.pattern = CAR_LINE_PATTERN_NARROW_TRACK;
+        line.track_confidence = 1200U;
+        line.track_active_count = 2U;
+        line.track_active_mask = 0xC0U;
+
+        odometry.center_distance_mm = 1000.0f;
+        CarRouteExecutor_Init(&executor);
+        assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                      &odometry, 0.0f) == CAR_OK);
+        for (uint8_t step = 0U; step < 9U; step++) {
+            float split;
+            float next_position;
+
+            line.track_position = (int16_t)simulated_position;
+            odometry.center_distance_mm = 1805.0f + (float)step * 5.0f;
+            assert(CarRouteExecutor_Update(
+                       &executor, &config, (uint32_t)(20U + step * 20U),
+                       &odometry, 0.0f, &line,
+                       &motor, &cue, &faults) == CAR_OK);
+            assert(executor.line_follow_phase ==
+                   CAR_LINE_FOLLOW_PHASE_CROSSING_CAPTURE);
+            assert(motor.enable);
+            assert(motor.left_mm_s > motor.right_mm_s);
+            assert(motor.left_mm_s >= 0.0f);
+            assert(motor.right_mm_s >= 0.0f);
+            split = motor.left_mm_s - motor.right_mm_s;
+            assert(split <= 40.0f);
+            assert(split <= previous_split);
+            if (split < previous_split) {
+                split_decreased = true;
+            }
+            next_position = simulated_position - split * 8.0f;
+            assert(next_position < simulated_position);
+            simulated_position = next_position;
+            previous_split = split;
+        }
+        assert(split_decreased);
+        assert(simulated_position < 1200.0f);
+    }
+}
+
+static void TestH2026CaptureTimeoutUsesExistingSearchBudget(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route = {0};
+    CarRouteExecutor executor;
+    CarOdometry odometry = {0};
+    CarLineEstimate line = {0};
+    CarMotorCommand motor;
+    CarCue cue;
+    uint32_t faults = 0U;
+
+    config.gray_shape_filter_enable = true;
+    config.gray_finish_arm_ratio = 0.8f;
+    config.line_cross_center_position = 0;
+    config.line_cross_capture_window_mm = 80.0f;
+    config.line_cross_capture_speed_mm_s = 80.0f;
+    config.line_cross_capture_max_correction_mm_s = 0.0f;
+    config.required_line_search_mm = 100.0f;
+    config.required_line_search_speed_mm_s = 60.0f;
+    config.distance_tolerance_mm = 0.0f;
+    route.count = 1U;
+    route.segments[0] = (CarRouteSegment){
+        CAR_SEGMENT_STRAIGHT, 1000.0f, 180.0f, 5000U,
+        true, CAR_CUE_NONE, 0.0f,
+        CAR_LINE_FOLLOW_EXIT_SENSOR_AXLE, 0.0f, false
+    };
+    line.pattern = CAR_LINE_PATTERN_NARROW_TRACK;
+    line.track_position = 3500;
+    line.track_confidence = 1200U;
+    line.track_active_count = 1U;
+    line.track_active_mask = 0x80U;
+
+    odometry.center_distance_mm = 1000.0f;
+    CarRouteExecutor_Init(&executor);
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+    odometry.center_distance_mm = 1805.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_phase ==
+           CAR_LINE_FOLLOW_PHASE_CROSSING_CAPTURE);
+
+    odometry.center_distance_mm = 1884.0f;
+    line.pattern = CAR_LINE_PATTERN_WIDE_AREA;
+    line.track_position = 2500;
+    line.track_confidence = 1200U;
+    line.track_active_count = 6U;
+    line.track_active_mask = 0xFCU;
+    assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_phase ==
+           CAR_LINE_FOLLOW_PHASE_CROSSING_CAPTURE);
+
+    /* CROSSWIN is part of the one existing SEARCH budget.  At 80mm the
+     * capture fails into SEARCH, whose origin remains the 805mm capture edge;
+     * it does not receive a second 100mm allowance. */
+    odometry.center_distance_mm = 1885.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 60U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_phase == CAR_LINE_FOLLOW_PHASE_SEARCH);
+    assert(executor.line_search_start_progress_mm == 805.0f);
+    assert(motor.enable);
+    assert(motor.left_mm_s == 60.0f);
+    assert(motor.right_mm_s == 60.0f);
+    assert(faults == 0U);
+
+    line = (CarLineEstimate){0};
+    odometry.center_distance_mm = 1904.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 80U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.running);
+    assert(executor.line_search_start_progress_mm == 805.0f);
+    odometry.center_distance_mm = 1905.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 100U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) ==
+           CAR_ERROR_STATE);
+    assert(!executor.running);
+    assert(!executor.finished);
+    assert(!motor.enable);
+    assert((faults & CAR_FAULT_LINE_MISSED) != 0U);
+    assert(executor.last_motion_exit_reason == CAR_ROUTE_EXIT_LINE_MISS);
+    assert(executor.semantic_line_miss_count == 1U);
+
+    /* A stopped executor cannot count the same miss again. */
+    assert(CarRouteExecutor_Update(&executor, &config, 120U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.semantic_line_miss_count == 1U);
+    /* A fresh narrow edge found inside the remaining SEARCH budget may start
+     * another capture, but its budget origin must stay at the first edge. */
+    faults = 0U;
+    line = (CarLineEstimate){0};
+    line.pattern = CAR_LINE_PATTERN_NARROW_TRACK;
+    line.track_position = 3500;
+    line.track_confidence = 1200U;
+    line.track_active_count = 1U;
+    line.track_active_mask = 0x80U;
+    odometry.center_distance_mm = 1000.0f;
+    CarRouteExecutor_Init(&executor);
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+    odometry.center_distance_mm = 1805.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    line.pattern = CAR_LINE_PATTERN_WIDE_AREA;
+    line.track_position = 2500;
+    line.track_active_count = 6U;
+    line.track_active_mask = 0xFCU;
+    odometry.center_distance_mm = 1885.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_phase == CAR_LINE_FOLLOW_PHASE_SEARCH);
+    line.pattern = CAR_LINE_PATTERN_NARROW_TRACK;
+    line.track_position = 2000;
+    line.track_active_count = 1U;
+    line.track_active_mask = 0x40U;
+    odometry.center_distance_mm = 1886.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 60U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_phase ==
+           CAR_LINE_FOLLOW_PHASE_CROSSING_CAPTURE);
+    assert(executor.line_search_start_progress_mm == 805.0f);
+    line.pattern = CAR_LINE_PATTERN_WIDE_AREA;
+    line.track_position = 0;
+    line.track_active_count = 6U;
+    line.track_active_mask = 0x3FU;
+    odometry.center_distance_mm = 1887.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 80U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_phase ==
+           CAR_LINE_FOLLOW_PHASE_AXLE_APPROACH);
+    assert(executor.line_search_start_progress_mm == 805.0f);
+    assert(faults == 0U);
+}
+
+static void TestH2026CaptureCenterWinsBoundaryFrame(void)
+{
+    {
+        CarConfig config = CarConfig_MakeDefault();
+        CarRoute route = {0};
+        CarRouteExecutor executor;
+        CarOdometry odometry = {0};
+        CarLineEstimate line = {0};
+        CarMotorCommand motor;
+        CarCue cue;
+        uint32_t faults = 0U;
+
+        config.gray_shape_filter_enable = true;
+        config.gray_finish_arm_ratio = 0.8f;
+        config.line_cross_center_position = 0;
+        config.line_cross_capture_window_mm = 80.0f;
+        config.line_cross_capture_speed_mm_s = 80.0f;
+        config.required_line_search_mm = 100.0f;
+        config.required_line_search_speed_mm_s = 60.0f;
+        config.distance_tolerance_mm = 0.0f;
+        route.count = 1U;
+        route.segments[0] = (CarRouteSegment){
+            CAR_SEGMENT_STRAIGHT, 1000.0f, 180.0f, 5000U,
+            true, CAR_CUE_NONE, 0.0f,
+            CAR_LINE_FOLLOW_EXIT_SENSOR_AXLE, 0.0f, false
+        };
+        line.pattern = CAR_LINE_PATTERN_NARROW_TRACK;
+        line.track_position = 3500;
+        line.track_confidence = 1200U;
+        line.track_active_count = 1U;
+        line.track_active_mask = 0x80U;
+
+        odometry.center_distance_mm = 1000.0f;
+        CarRouteExecutor_Init(&executor);
+        assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                      &odometry, 0.0f) == CAR_OK);
+        odometry.center_distance_mm = 1805.0f;
+        assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                       &odometry, 0.0f, &line,
+                                       &motor, &cue, &faults) == CAR_OK);
+        assert(executor.line_follow_phase ==
+               CAR_LINE_FOLLOW_PHASE_CROSSING_CAPTURE);
+
+        /* A center sample exactly at CROSSWIN is real evidence; only an
+         * exhausted window that is still off-center may enter SEARCH. */
+        odometry.center_distance_mm = 1885.0f;
+        line.track_position = 0;
+        line.track_active_count = 2U;
+        line.track_active_mask = 0x18U;
+        assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                       &odometry, 0.0f, &line,
+                                       &motor, &cue, &faults) == CAR_OK);
+        assert(executor.line_follow_phase ==
+               CAR_LINE_FOLLOW_PHASE_AXLE_APPROACH);
+        assert(motor.enable);
+        assert(motor.left_mm_s == 80.0f);
+        assert(motor.right_mm_s == 80.0f);
+        assert(faults == 0U);
+    }
+
+    {
+        CarConfig config = CarConfig_MakeDefault();
+        CarRoute route = {0};
+        CarRouteExecutor executor;
+        CarOdometry odometry = {0};
+        CarLineEstimate line = {0};
+        CarMotorCommand motor;
+        CarCue cue;
+        uint32_t faults = 0U;
+
+        config.gray_shape_filter_enable = true;
+        config.gray_finish_arm_ratio = 0.8f;
+        config.line_cross_center_position = 0;
+        config.line_cross_capture_window_mm = 80.0f;
+        config.line_cross_capture_speed_mm_s = 80.0f;
+        config.required_line_search_mm = 100.0f;
+        config.required_line_search_speed_mm_s = 60.0f;
+        config.distance_tolerance_mm = 0.0f;
+        route.count = 1U;
+        route.segments[0] = (CarRouteSegment){
+            CAR_SEGMENT_STRAIGHT, 1000.0f, 180.0f, 5000U,
+            true, CAR_CUE_NONE, 0.0f,
+            CAR_LINE_FOLLOW_EXIT_SENSOR_AXLE, 0.0f, false
+        };
+        line.pattern = CAR_LINE_PATTERN_NARROW_TRACK;
+        line.track_position = 3500;
+        line.track_confidence = 1200U;
+        line.track_active_count = 1U;
+        line.track_active_mask = 0x80U;
+
+        odometry.center_distance_mm = 1000.0f;
+        CarRouteExecutor_Init(&executor);
+        assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                      &odometry, 0.0f) == CAR_OK);
+        odometry.center_distance_mm = 1805.0f;
+        assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                       &odometry, 0.0f, &line,
+                                       &motor, &cue, &faults) == CAR_OK);
+
+        line.pattern = CAR_LINE_PATTERN_WIDE_AREA;
+        line.track_position = 2500;
+        line.track_active_count = 6U;
+        line.track_active_mask = 0xFCU;
+        odometry.center_distance_mm = 1885.0f;
+        assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                       &odometry, 0.0f, &line,
+                                       &motor, &cue, &faults) == CAR_OK);
+        assert(executor.line_follow_phase == CAR_LINE_FOLLOW_PHASE_SEARCH);
+        assert(executor.line_search_start_progress_mm == 805.0f);
+
+        line.pattern = CAR_LINE_PATTERN_NARROW_TRACK;
+        line.track_position = 3500;
+        line.track_active_count = 1U;
+        line.track_active_mask = 0x80U;
+        odometry.center_distance_mm = 1886.0f;
+        assert(CarRouteExecutor_Update(&executor, &config, 60U,
+                                       &odometry, 0.0f, &line,
+                                       &motor, &cue, &faults) == CAR_OK);
+        assert(executor.line_follow_phase ==
+               CAR_LINE_FOLLOW_PHASE_CROSSING_CAPTURE);
+        assert(executor.line_search_start_progress_mm == 805.0f);
+
+        /* Re-capture at the retained SEARCH boundary is also a real center
+         * hit, so it must hand off instead of reporting a false miss. */
+        line.track_position = 0;
+        line.track_active_count = 2U;
+        line.track_active_mask = 0x18U;
+        odometry.center_distance_mm = 1905.0f;
+        assert(CarRouteExecutor_Update(&executor, &config, 80U,
+                                       &odometry, 0.0f, &line,
+                                       &motor, &cue, &faults) == CAR_OK);
+        assert(executor.running);
+        assert(executor.line_follow_phase ==
+               CAR_LINE_FOLLOW_PHASE_AXLE_APPROACH);
+        assert(motor.enable);
+        assert(faults == 0U);
+        assert(executor.semantic_line_miss_count == 0U);
+    }
+}
+
+static void TestH2026LineFollowSeekConverges(void)
+{
+    const float disabled_limits[3] = {0.0f, -1.0f, 15.0f};
+    const bool shape_filters[3] = {true, true, false};
+
+    for (uint8_t i = 0U; i < 3U; i++) {
+        CarConfig config = CarConfig_MakeDefault();
+        CarRoute route = {0};
+        CarRouteExecutor executor;
+        CarOdometry odometry = {0};
+        CarLineEstimate line = {0};
+        CarMotorCommand motor;
+        CarCue cue;
+        uint32_t faults = 0U;
+
+        config.gray_shape_filter_enable = shape_filters[i];
+        config.line_follow_kp = 0.01f;
+        config.line_follow_ki = 0.0f;
+        config.line_follow_kd = 0.0f;
+        config.line_seek_max_correction_mm_s = disabled_limits[i];
+        config.straight_heading_kp = 1.0f;
+        config.straight_heading_max_correction_mm_s = 15.0f;
+        route.count = 1U;
+        route.segments[0] = (CarRouteSegment){
+            CAR_SEGMENT_LINE_FOLLOW, 1000.0f, 100.0f, 5000U,
+            true, CAR_CUE_NONE, 0.0f,
+            CAR_LINE_FOLLOW_EXIT_RIGHT_CORNER, 0.8f, false
+        };
+        line.pattern = CAR_LINE_PATTERN_SPLIT_NOISE;
+        line.track_position = 3000;
+        line.track_confidence = 1200U;
+        line.track_active_count = 2U;
+        line.track_active_mask = 0x81U;
+        line.track_cluster_count = 2U;
+
+        CarRouteExecutor_Init(&executor);
+        assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                      &odometry, 0.0f) == CAR_OK);
+        odometry.center_distance_mm = 100.0f;
+        assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                       &odometry, 0.0f, &line,
+                                       &motor, &cue, &faults) == CAR_OK);
+        assert(TestFloatBits(motor.left_mm_s) == TestFloatBits(100.0f));
+        assert(TestFloatBits(motor.right_mm_s) == TestFloatBits(100.0f));
+    }
+
+    {
+        CarConfig config = CarConfig_MakeDefault();
+        CarRoute route = {0};
+        CarRouteExecutor executor;
+        CarOdometry odometry = {0};
+        CarLineEstimate line = {0};
+        CarMotorCommand motor;
+        CarCue cue;
+        uint32_t faults = 0U;
+        float simulated_position = 3000.0f;
+
+        config.gray_shape_filter_enable = true;
+        config.line_follow_kp = 0.01f;
+        config.line_follow_ki = 0.0f;
+        config.line_follow_kd = 0.0f;
+        config.line_seek_max_correction_mm_s = 15.0f;
+        config.straight_heading_kp = 1.0f;
+        config.straight_heading_max_correction_mm_s = 15.0f;
+        route.count = 1U;
+        route.segments[0] = (CarRouteSegment){
+            CAR_SEGMENT_LINE_FOLLOW, 1000.0f, 100.0f, 5000U,
+            true, CAR_CUE_NONE, 0.0f,
+            CAR_LINE_FOLLOW_EXIT_RIGHT_CORNER, 0.8f, false
+        };
+        line.pattern = CAR_LINE_PATTERN_SPLIT_NOISE;
+        line.track_confidence = 1200U;
+        line.track_active_count = 2U;
+        line.track_active_mask = 0x81U;
+        line.track_cluster_count = 2U;
+
+        CarRouteExecutor_Init(&executor);
+        assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                      &odometry, 0.0f) == CAR_OK);
+        for (uint8_t step = 0U; step < 10U; step++) {
+            float split;
+            float next_position;
+
+            line.track_position = (int16_t)simulated_position;
+            odometry.center_distance_mm = 100.0f + (float)step * 5.0f;
+            assert(CarRouteExecutor_Update(
+                       &executor, &config, (uint32_t)(20U + step * 20U),
+                       &odometry, 0.0f, &line,
+                       &motor, &cue, &faults) == CAR_OK);
+            assert(executor.line_follow_phase ==
+                   CAR_LINE_FOLLOW_PHASE_TRACK);
+            /* Weak evidence remains steerable inside the old capture-center
+             * band; the correction naturally shrinks with position. */
+            assert(motor.left_mm_s > motor.right_mm_s);
+            split = motor.left_mm_s - motor.right_mm_s;
+            assert(split <= 30.0f);
+            next_position = simulated_position - split * 8.0f;
+            assert(next_position < simulated_position);
+            simulated_position = next_position;
+        }
+        assert(simulated_position < 1200.0f);
+    }
+}
+
+static void TestH2026ArmedAnyProbeStartsCapture(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route = {0};
+    CarRouteExecutor executor;
+    CarOdometry odometry = {0};
+    CarLineEstimate line = {0};
+    CarMotorCommand motor;
+    CarCue cue;
+    uint32_t faults = 0U;
+
+    config.gray_shape_filter_enable = true;
+    config.gray_finish_arm_ratio = 0.8f;
+    config.diagonal_line_arm_ratio = 0.2f;
+    config.line_cross_center_position = 1200;
+    config.line_cross_capture_window_mm = 80.0f;
+    config.line_cross_capture_speed_mm_s = 80.0f;
+    config.line_cross_capture_kp = 0.025f;
+    config.line_cross_capture_max_correction_mm_s = 20.0f;
+    config.distance_tolerance_mm = 0.0f;
+    route.count = 1U;
+    route.segments[0] = (CarRouteSegment){
+        CAR_SEGMENT_STRAIGHT, 1000.0f, 180.0f, 5000U,
+        true, CAR_CUE_NONE, 0.0f,
+        CAR_LINE_FOLLOW_EXIT_DIAGONAL_AXLE, 0.0f, false
+    };
+
+    /* The 32-column legacy footprint can see one edge probe before the
+     * adaptive shape filter publishes a track footprint. */
+    line.valid = true;
+    line.position = 3500;
+    line.confidence = 500U;
+    line.active_count = 1U;
+    line.active_mask = 0x80U;
+
+    CarRouteExecutor_Init(&executor);
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+    odometry.center_distance_mm = 190.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_phase == CAR_LINE_FOLLOW_PHASE_TRACK);
+
+    odometry.center_distance_mm = 205.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_phase ==
+           CAR_LINE_FOLLOW_PHASE_CROSSING_CAPTURE);
+    assert(motor.left_mm_s > motor.right_mm_s);
+
+    /* The same fallback must accept the two center probes immediately; it
+     * must not wait for an adaptive NARROW classification that may arrive
+     * after a 1cm line has already passed. */
+    line.position = 0;
+    line.confidence = 1200U;
+    line.active_count = 2U;
+    line.active_mask = 0x18U;
+    odometry.center_distance_mm = 210.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 60U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_phase ==
+           CAR_LINE_FOLLOW_PHASE_AXLE_APPROACH);
+}
+
+static void TestH2026DiagonalCaptureTimeoutSearchesThenFails(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route = {0};
+    CarRouteExecutor executor;
+    CarOdometry odometry = {0};
+    CarLineEstimate line = {0};
+    CarMotorCommand motor;
+    CarCue cue;
+    uint32_t faults = 0U;
+
+    config.gray_shape_filter_enable = true;
+    config.gray_finish_arm_ratio = 0.8f;
+    config.diagonal_line_arm_ratio = 0.8f;
+    config.diagonal_line_approach_mm = 130.0f;
+    config.line_cross_center_position = 1200;
+    config.line_cross_capture_window_mm = 80.0f;
+    config.line_cross_capture_speed_mm_s = 80.0f;
+    config.required_line_search_mm = 100.0f;
+    config.required_line_search_speed_mm_s = 60.0f;
+    config.distance_tolerance_mm = 0.0f;
+    route.count = 1U;
+    route.segments[0] = (CarRouteSegment){
+        CAR_SEGMENT_STRAIGHT, 1000.0f, 180.0f, 5000U,
+        true, CAR_CUE_NONE, 0.0f,
+        CAR_LINE_FOLLOW_EXIT_DIAGONAL_AXLE, 0.0f, false
+    };
+    line.pattern = CAR_LINE_PATTERN_NARROW_TRACK;
+    line.track_position = 3500;
+    line.track_confidence = 1200U;
+    line.track_active_count = 1U;
+    line.track_active_mask = 0x80U;
+
+    odometry.center_distance_mm = 1000.0f;
+    CarRouteExecutor_Init(&executor);
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+    odometry.center_distance_mm = 1805.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_phase ==
+           CAR_LINE_FOLLOW_PHASE_CROSSING_CAPTURE);
+
+    line = (CarLineEstimate){0};
+    odometry.center_distance_mm = 1885.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_phase == CAR_LINE_FOLLOW_PHASE_SEARCH);
+    assert(executor.line_corner_trigger_progress_mm == 805.0f);
+    assert(executor.line_search_start_progress_mm == 805.0f);
+    assert(executor.line_corner_approach_mm == 0.0f);
+    assert(motor.enable);
+    assert(motor.left_mm_s == 60.0f);
+    assert(motor.right_mm_s == 60.0f);
+    assert(faults == 0U);
+
+    odometry.center_distance_mm = 1904.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 60U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.running);
+    assert(executor.line_follow_phase == CAR_LINE_FOLLOW_PHASE_SEARCH);
+    odometry.center_distance_mm = 1905.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 80U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_ERROR_STATE);
+    assert(!executor.running);
+    assert(!executor.finished);
+    assert(!motor.enable);
+    assert((faults & CAR_FAULT_LINE_MISSED) != 0U);
+    assert(executor.last_motion_exit_reason == CAR_ROUTE_EXIT_LINE_MISS);
+    assert(executor.semantic_line_miss_count == 1U);
+}
+
+static void TestH2026FalseCornerRejected(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route = {0};
+    CarRouteExecutor executor;
+    CarOdometry odometry = {0};
+    CarLineEstimate line = {0};
+    CarMotorCommand motor;
+    CarCue cue;
+    uint32_t faults = 0U;
+
+    config.gray_shape_filter_enable = true;
+    config.gray_track_enter_frames = 1U;
+    config.line_corner_consecutive_frames = 2U;
+    config.line_corner_min_right_ratio_permille = 650U;
+    config.required_line_search_mm = 80.0f;
+    route.count = 1U;
+    route.segments[0] = (CarRouteSegment){
+        CAR_SEGMENT_LINE_FOLLOW, 400.0f, 100.0f, 5000U,
+        true, CAR_CUE_NONE, 0.0f,
+        CAR_LINE_FOLLOW_EXIT_RIGHT_CORNER, 0.75f, false
+    };
+    line.pattern = CAR_LINE_PATTERN_NARROW_TRACK;
+    line.track_position = 0;
+    line.track_confidence = 1200U;
+    line.track_active_count = 2U;
+    line.track_active_mask = 0x18U;
+
+    CarRouteExecutor_Init(&executor);
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+    odometry.center_distance_mm = 100.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_seen);
+
+    /* A centered broad patch has no right-corner direction evidence. */
+    line.pattern = CAR_LINE_PATTERN_WIDE_AREA;
+    line.right_ratio_permille = 500U;
+    line.valid = true;
+    line.active_count = 8U;
+    line.active_mask = 0xFFU;
+    line.track_active_count = 0U;
+    odometry.center_distance_mm = 320.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(CarRouteExecutor_Update(&executor, &config, 60U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_phase == CAR_LINE_FOLLOW_PHASE_TRACK);
+    assert(!executor.line_corner_candidate);
+    assert(executor.line_event_streak == 0U);
+    assert(executor.running);
+}
+
+static void TestH2026ObliqueStraightHandoff(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route = {0};
+    CarRouteExecutor executor;
+    CarOdometry odometry = {0};
+    CarLineEstimate line = {0};
+    CarMotorCommand motor;
+    CarCue cue;
+    uint32_t faults = 0U;
+
+    config.gray_shape_filter_enable = true;
+    config.gray_finish_arm_ratio = 0.8f;
+    config.diagonal_line_approach_mm = 130.0f;
+    config.line_cross_center_position = 1200;
+    config.line_cross_capture_window_mm = 80.0f;
+    config.line_cross_capture_speed_mm_s = 80.0f;
+    config.distance_tolerance_mm = 0.0f;
+    route.count = 1U;
+    route.segments[0] = (CarRouteSegment){
+        CAR_SEGMENT_STRAIGHT, 1000.0f, 180.0f, 5000U,
+        true, CAR_CUE_NONE, 0.0f,
+        CAR_LINE_FOLLOW_EXIT_DIAGONAL_AXLE, 0.0f, false
+    };
+
+    line.pattern = CAR_LINE_PATTERN_SPLIT_NOISE;
+    line.track_position = 0;
+    line.track_confidence = 1200U;
+    line.track_active_count = 2U;
+    line.track_active_mask = 0x81U;
+    line.track_cluster_count = 2U;
+
+    CarRouteExecutor_Init(&executor);
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+
+    /* A narrow line before the final 20 percent is ignored. */
+    odometry.center_distance_mm = 790.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_phase == CAR_LINE_FOLLOW_PHASE_TRACK);
+
+    /* Once the diagonal distance guard is open, even a centered SPLIT is a
+     * real black intercept; its zero correction is still safe. */
+    odometry.center_distance_mm = 805.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_phase ==
+           CAR_LINE_FOLLOW_PHASE_CROSSING_CAPTURE);
+
+    /* The same capture remains active as the oblique footprint moves aside. */
+    line.track_position = -2500;
+    line.track_active_mask = 0x05U;
+    odometry.center_distance_mm = 810.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 60U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_phase ==
+           CAR_LINE_FOLLOW_PHASE_CROSSING_CAPTURE);
+    assert(motor.left_mm_s == 80.0f);
+    assert(motor.right_mm_s == 80.0f);
+
+    /* Reaching the center band captures the marker location. Axle travel is
+     * measured from this frame, not from the first oblique edge hit. */
+    line.pattern = CAR_LINE_PATTERN_WIDE_AREA;
+    line.track_position = -1000;
+    line.track_confidence = 1200U;
+    line.track_active_count = 6U;
+    line.track_active_mask = 0x7EU;
+    odometry.center_distance_mm = 825.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 80U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_phase ==
+           CAR_LINE_FOLLOW_PHASE_AXLE_APPROACH);
+    assert(executor.line_corner_trigger_progress_mm == 825.0f);
+
+    odometry.center_distance_mm = 954.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 100U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.running);
+    assert(executor.line_corner_approach_mm == 129.0f);
+    odometry.center_distance_mm = 955.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 120U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.finished);
+    assert(executor.last_motion_exit_reason == CAR_ROUTE_EXIT_LINE);
+    assert(executor.line_corner_approach_mm == 0.0f);
+}
+
+static void TestH2026ArcAxleApproachPrecedesAngleExit(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route = {0};
+    CarRouteExecutor executor;
+    CarOdometry odometry = {0};
+    CarLineEstimate line = {0};
+    CarMotorCommand motor;
+    CarCue cue;
+    uint32_t faults = 0U;
+
+    config.gray_shape_filter_enable = true;
+    config.gray_track_enter_frames = 1U;
+    config.arc_line_entry_min_angle_deg = 8.0f;
+    config.arc_line_entry_frames = 1U;
+    config.arc_line_exit_min_angle_deg = 110.0f;
+    config.arc_line_exit_lost_frames = 2U;
+    config.line_sensor_to_axle_mm = 150.0f;
+    config.distance_tolerance_mm = 0.0f;
+    config.angle_tolerance_deg = 1.0f;
+    route.count = 1U;
+    route.segments[0] = (CarRouteSegment){
+        CAR_SEGMENT_ARC, -400.0f, 140.0f, 5000U,
+        true, CAR_CUE_NONE, 180.0f,
+        CAR_LINE_FOLLOW_EXIT_DISTANCE, 0.0f, true
+    };
+
+    CarRouteExecutor_Init(&executor);
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+
+    line.pattern = CAR_LINE_PATTERN_NARROW_TRACK;
+    line.track_position = 0;
+    line.track_confidence = 1200U;
+    line.track_active_count = 2U;
+    line.track_active_mask = 0x18U;
+    odometry.center_distance_mm = 900.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, -111.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_seen);
+
+    /* WIDE_AREA is ambiguous, so it neither drives the arc PID nor proves
+     * that the narrow arc ended. */
+    line.pattern = CAR_LINE_PATTERN_WIDE_AREA;
+    line.valid = true;
+    line.active_count = 8U;
+    line.active_mask = 0xFFU;
+    assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                   &odometry, -150.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_phase == CAR_LINE_FOLLOW_PHASE_TRACK);
+    assert(executor.line_event_streak == 0U);
+
+    line = (CarLineEstimate){0};
+    odometry.center_distance_mm = 980.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 60U,
+                                   &odometry, -170.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    odometry.center_distance_mm = 1000.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 80U,
+                                   &odometry, -179.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_phase ==
+           CAR_LINE_FOLLOW_PHASE_AXLE_APPROACH);
+    assert(executor.index == 0U);
+
+    /* Even after yaw reaches 180 degrees, the arc must retain precedence and
+     * finish the full physical 150 mm sensor-to-axle handoff. */
+    odometry.center_distance_mm = 1149.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 100U,
+                                   &odometry, -180.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.running);
+    assert(executor.index == 0U);
+    assert(executor.line_corner_approach_mm == 149.0f);
+    odometry.center_distance_mm = 1150.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 120U,
+                                   &odometry, -181.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.finished);
+    assert(executor.last_motion_exit_reason == CAR_ROUTE_EXIT_LINE);
+    assert(executor.line_corner_approach_mm == 0.0f);
+}
+
+static void TestH2026RequiredLineSearchStopsSafely(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route = {0};
+    CarRouteExecutor executor;
+    CarOdometry odometry = {0};
+    CarLineEstimate line = {0};
+    CarMotorCommand motor;
+    CarCue cue;
+    uint32_t faults = 0U;
+
+    config.gray_shape_filter_enable = true;
+    config.required_line_search_mm = 80.0f;
+    config.required_line_search_speed_mm_s = 60.0f;
+    config.distance_tolerance_mm = 0.0f;
+    route.count = 1U;
+    route.segments[0] = (CarRouteSegment){
+        CAR_SEGMENT_LINE_FOLLOW, 400.0f, 140.0f, 5000U,
+        true, CAR_CUE_NONE, 0.0f,
+        CAR_LINE_FOLLOW_EXIT_RIGHT_CORNER, 0.75f, false
+    };
+
+    CarRouteExecutor_Init(&executor);
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+
+    /* A segment that starts on a wide patch has not established a narrow
+     * track, so WIDE cannot immediately masquerade as the next corner. */
+    line.pattern = CAR_LINE_PATTERN_WIDE_AREA;
+    line.valid = true;
+    line.active_count = 8U;
+    line.active_mask = 0xFFU;
+    odometry.center_distance_mm = 320.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(!executor.line_follow_seen);
+    assert(executor.line_event_streak == 0U);
+    assert(executor.line_follow_phase == CAR_LINE_FOLLOW_PHASE_TRACK);
+
+    /* Reaching map distance opens a bounded low-speed search, not a turn. */
+    line = (CarLineEstimate){0};
+    odometry.center_distance_mm = 400.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 60U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_phase == CAR_LINE_FOLLOW_PHASE_SEARCH);
+    assert(motor.enable);
+    assert(motor.left_mm_s == 60.0f);
+    assert(motor.right_mm_s == 60.0f);
+
+    odometry.center_distance_mm = 479.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 80U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.running);
+    odometry.center_distance_mm = 480.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 100U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_ERROR_STATE);
+    assert(!executor.running);
+    assert(!motor.enable);
+    assert((faults & CAR_FAULT_LINE_MISSED) != 0U);
+    assert(executor.last_motion_exit_reason == CAR_ROUTE_EXIT_LINE_MISS);
+    assert(executor.semantic_line_miss_count == 1U);
+}
+
+static void TestArcHeadingHandoff(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route = {0};
+    CarRouteExecutor executor;
+    CarOdometry odometry = {0};
+    CarLineEstimate line = {0};
+    CarMotorCommand motor;
+    CarCue cue;
+    uint32_t faults = 0U;
+
+    config.angle_tolerance_deg = 2.0f;
+    config.straight_heading_kp = 1.0f;
+    route.count = 3U;
+    route.segments[0] = (CarRouteSegment){
+        CAR_SEGMENT_ARC, -400.0f, 100.0f, 5000U,
+        false, CAR_CUE_NONE, 180.0f,
+        CAR_LINE_FOLLOW_EXIT_DISTANCE, 0.0f, true
+    };
+    route.segments[1] = (CarRouteSegment){
+        CAR_SEGMENT_CUE, 0.0f, 0.0f, 0U,
+        false, CAR_CUE_CHECKPOINT, 0.0f,
+        CAR_LINE_FOLLOW_EXIT_DISTANCE, 0.0f, false
+    };
+    route.segments[2] = (CarRouteSegment){
+        CAR_SEGMENT_STRAIGHT, 100.0f, 100.0f, 5000U,
+        false, CAR_CUE_NONE, 0.0f,
+        CAR_LINE_FOLLOW_EXIT_DISTANCE, 0.0f, false
+    };
+
+    CarRouteExecutor_Init(&executor);
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+
+    /* The right arc exits near -180deg and stores its theoretical tangent. */
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, -179.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.index == 1U);
+    assert(executor.pending_straight_yaw_valid);
+    assert(executor.pending_straight_yaw_deg == -180.0f);
+
+    /* Residual rotation during the cue must not redefine the straight target. */
+    assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                   &odometry, -175.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.index == 2U);
+    assert(executor.pending_straight_yaw_valid);
+    assert(CarRouteExecutor_Update(&executor, &config, 60U,
+                                   &odometry, -175.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(motor.left_mm_s > motor.right_mm_s);
+
+    odometry.center_distance_mm = 100.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 80U,
+                                   &odometry, -180.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.finished);
+    assert(!executor.pending_straight_yaw_valid);
+}
+
+static void TestH2026ArcAndHeadingLimits(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route = {0};
+    CarRouteExecutor executor;
+    CarOdometry odometry = {0};
+    CarLineEstimate line = {0};
+    CarMotorCommand motor;
+    CarCue cue;
+    uint32_t faults = 0U;
+
+    config.track_width_mm = 115.0f;
+    config.arc_effective_track_width_mm = 160.0f;
+    config.arc_line_kp = 0.025f;
+    config.arc_line_max_correction_mm_s = 20.0f;
+    route.count = 1U;
+    route.segments[0] = (CarRouteSegment){
+        CAR_SEGMENT_ARC, -400.0f, 140.0f, 5000U,
+        true, CAR_CUE_NONE, 180.0f,
+        CAR_LINE_FOLLOW_EXIT_DISTANCE, 0.0f, true
+    };
+
+    CarRouteExecutor_Init(&executor);
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(motor.left_mm_s == 140.0f);
+    assert(motor.right_mm_s > 93.0f);
+    assert(motor.right_mm_s < 94.0f);
+
+    /* A full-scale edge error is clamped and cannot reverse arc curvature. */
+    line.valid = true;
+    line.position = 3500;
+    assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(motor.left_mm_s == 160.0f);
+    assert(motor.right_mm_s > 73.0f);
+    assert(motor.right_mm_s < 74.0f);
+
+    /* The straight outer loop is capped independently from wheel max speed. */
+    config.straight_heading_kp = 4.0f;
+    config.straight_heading_max_correction_mm_s = 25.0f;
+    route.segments[0] = (CarRouteSegment){
+        CAR_SEGMENT_STRAIGHT, 1000.0f, 180.0f, 5000U,
+        false, CAR_CUE_NONE, 0.0f,
+        CAR_LINE_FOLLOW_EXIT_DISTANCE, 0.0f, false
+    };
+    CarRouteExecutor_Init(&executor);
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, 10.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(motor.left_mm_s == 205.0f);
+    assert(motor.right_mm_s == 155.0f);
+}
+
+static void TestH2026ArcLineTailHandoff(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route = {0};
+    CarRouteExecutor executor;
+    CarOdometry odometry = {0};
+    CarLineEstimate line = {0};
+    CarMotorCommand motor;
+    CarCue cue;
+    uint32_t faults = 0U;
+
+    config.angle_tolerance_deg = 1.0f;
+    config.arc_line_exit_min_angle_deg = 110.0f;
+    config.arc_line_exit_lost_frames = 5U;
+    config.line_sensor_to_axle_mm = 150.0f;
+    config.line_corner_pivot_approach_mm = 90.0f;
+    route.count = 3U;
+    route.segments[0] = (CarRouteSegment){
+        CAR_SEGMENT_ARC, -400.0f, 140.0f, 5000U,
+        true, CAR_CUE_NONE, 180.0f,
+        CAR_LINE_FOLLOW_EXIT_DISTANCE, 0.0f, true
+    };
+    route.segments[1] = (CarRouteSegment){
+        CAR_SEGMENT_CUE, 0.0f, 0.0f, 0U,
+        false, CAR_CUE_CHECKPOINT, 0.0f,
+        CAR_LINE_FOLLOW_EXIT_DISTANCE, 0.0f, false
+    };
+    route.segments[2] = (CarRouteSegment){
+        CAR_SEGMENT_STRAIGHT, 100.0f, 100.0f, 5000U,
+        false, CAR_CUE_NONE, 0.0f,
+        CAR_LINE_FOLLOW_EXIT_DISTANCE, 0.0f, false
+    };
+
+    CarRouteExecutor_Init(&executor);
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+
+    /* An invalid sample before the 110deg guard cannot arm the handoff. */
+    odometry.center_distance_mm = 1000.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, -109.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(!executor.line_follow_seen);
+
+    /* A real arc sample after the guard arms line-tail detection. */
+    line.valid = true;
+    assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                   &odometry, -111.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_seen);
+
+    line = (CarLineEstimate){0};
+    for (uint32_t now_ms = 60U; now_ms <= 120U; now_ms += 20U) {
+        assert(CarRouteExecutor_Update(&executor, &config, now_ms,
+                                       &odometry, -115.0f, &line,
+                                       &motor, &cue, &faults) == CAR_OK);
+    }
+    assert(executor.line_follow_phase == CAR_LINE_FOLLOW_PHASE_TRACK);
+    odometry.center_distance_mm = 1020.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 140U,
+                                   &odometry, -116.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_phase ==
+           CAR_LINE_FOLLOW_PHASE_AXLE_APPROACH);
+    assert(executor.index == 0U);
+    assert(executor.last_line_exit_progress_mm == 1020.0f);
+
+    /* Keep the base arc until the axle has covered the 150mm sensor offset. */
+    odometry.center_distance_mm = 1166.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 160U,
+                                   &odometry, -130.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.index == 0U);
+    odometry.center_distance_mm = 1167.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 180U,
+                                   &odometry, -131.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.index == 1U);
+    assert(executor.last_motion_exit_reason == CAR_ROUTE_EXIT_LINE);
+    assert(executor.pending_straight_yaw_valid);
+    assert(executor.pending_straight_yaw_deg == -131.0f);
+
+    /* CUE must preserve the measured tangent for the following straight. */
+    assert(CarRouteExecutor_Update(&executor, &config, 200U,
+                                   &odometry, -131.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.index == 2U);
+    assert(CarRouteExecutor_Update(&executor, &config, 220U,
+                                   &odometry, -131.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(motor.left_mm_s == motor.right_mm_s);
+}
+
+static CarLineEstimate TestNarrowLine(int16_t position)
+{
+    CarLineEstimate line = {0};
+
+    line.position = position;
+    line.track_position = position;
+    line.confidence = 1600U;
+    line.track_confidence = 1600U;
+    line.active_count = 2U;
+    line.active_mask = 0x18U;
+    line.active_span = 2U;
+    line.track_active_count = 2U;
+    line.track_active_mask = 0x18U;
+    line.track_active_span = 2U;
+    line.track_cluster_count = 1U;
+    line.pattern = CAR_LINE_PATTERN_NARROW_TRACK;
+    line.valid = true;
+    return line;
+}
+
+static CarLineEstimate TestWideMarker(bool classified_wide)
+{
+    CarLineEstimate line = {0};
+
+    line.confidence = 6000U;
+    line.active_count = 6U;
+    line.active_mask = 0x3FU;
+    line.active_span = 6U;
+    line.pattern = classified_wide ? CAR_LINE_PATTERN_WIDE_AREA :
+                                     CAR_LINE_PATTERN_SPLIT_NOISE;
+    line.valid = true;
+    return line;
+}
+
+static void TestOfficialTrackControl(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route = {0};
+    CarRouteExecutor executor;
+    CarOdometry odometry = {0};
+    CarLineEstimate line = TestNarrowLine(1000);
+    CarMotorCommand motor;
+    CarCue cue;
+    uint32_t faults = 0U;
+
+    config.gray_shape_filter_enable = true;
+    config.gray_track_enter_frames = 1U;
+    config.arc_effective_track_width_mm = 100.0f;
+    config.line_follow_kp = 0.025f;
+    config.track_wheel_accel_limit_mm_s2 = 0.0f;
+    route.count = 2U;
+    route.segments[0] = (CarRouteSegment){
+        .type = CAR_SEGMENT_TRACK,
+        .value = 50.0f,
+        .speed = 100.0f,
+        .timeout_ms = 5000U,
+        .use_line = true,
+        .cue = CAR_CUE_NONE,
+        .arc_angle_deg = 0.0f,
+        .line_follow_exit = CAR_LINE_FOLLOW_EXIT_DISTANCE
+    };
+    route.segments[1] = (CarRouteSegment){
+        .type = CAR_SEGMENT_TRACK,
+        .value = 100.0f,
+        .speed = 100.0f,
+        .timeout_ms = 5000U,
+        .use_line = true,
+        .cue = CAR_CUE_NONE,
+        .arc_angle_deg = -0.002f,
+        .line_follow_exit = CAR_LINE_FOLLOW_EXIT_DISTANCE
+    };
+
+    CarRouteExecutor_Init(&executor);
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(motor.left_mm_s == 125.0f);
+    assert(motor.right_mm_s == 75.0f);
+
+    /* A distance transition keeps a live command; no one-frame zero pulse. */
+    line = TestNarrowLine(0);
+    odometry.center_distance_mm = 47.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.index == 1U);
+    assert(motor.enable);
+    assert(motor.left_mm_s == 100.0f);
+    assert(motor.right_mm_s == 100.0f);
+    assert(CarRouteExecutor_Update(&executor, &config, 60U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(motor.left_mm_s == 110.0f);
+    assert(motor.right_mm_s == 90.0f);
+
+    /* The configured wheel slew bounds target changes deterministically. */
+    config.track_wheel_accel_limit_mm_s2 = 1000.0f;
+    route.count = 1U;
+    route.segments[0].value = 500.0f;
+    route.segments[0].arc_angle_deg = 0.0f;
+    CarRouteExecutor_Init(&executor);
+    odometry.center_distance_mm = 0.0f;
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(motor.left_mm_s == 20.0f);
+    assert(motor.right_mm_s == 20.0f);
+    assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(motor.left_mm_s == 40.0f);
+    assert(motor.right_mm_s == 40.0f);
+}
+
+static void TestOfficialFinishMarker(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route = {0};
+    CarRouteExecutor executor;
+    CarOdometry odometry = {0};
+    CarLineEstimate line = TestWideMarker(true);
+    CarMotorCommand motor;
+    CarCue cue;
+    uint32_t faults = 0U;
+    const float arc_length_mm = 1570.7963f;
+    const float expected_trigger_mm = arc_length_mm - 150.0f;
+    const float earliest_trigger_mm = expected_trigger_mm - 80.0f;
+    const float latest_trigger_mm = expected_trigger_mm + 80.0f;
+
+    config.gray_shape_filter_enable = true;
+    config.gray_track_enter_frames = 1U;
+    config.gray_finish_min_confidence = 1200U;
+    config.gray_finish_min_active = 6U;
+    config.gray_finish_consecutive_frames = 2U;
+    config.gray_wide_min_active = 6U;
+    config.finish_sensor_to_test_point_mm = 150.0f;
+    config.finish_approach_speed_mm_s = 100.0f;
+    config.required_line_search_mm = 80.0f;
+    config.track_wheel_accel_limit_mm_s2 = 0.0f;
+    route.count = 2U;
+    route.segments[0] = (CarRouteSegment){
+        .type = CAR_SEGMENT_TRACK,
+        .value = arc_length_mm,
+        .speed = 100.0f,
+        .timeout_ms = 5000U,
+        .use_line = true,
+        .cue = CAR_CUE_NONE,
+        .arc_angle_deg = -0.002f,
+        .line_follow_exit = CAR_LINE_FOLLOW_EXIT_WIDE_MARKER,
+        .line_event_arm_ratio = earliest_trigger_mm / arc_length_mm
+    };
+    route.segments[1] = (CarRouteSegment){
+        .type = CAR_SEGMENT_STOP,
+        .cue = CAR_CUE_FINISH
+    };
+
+    CarRouteExecutor_Init(&executor);
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+    /* The A marker under the sensor at startup is outside the arm window. */
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_event_streak == 0U);
+    assert(executor.line_follow_phase == CAR_LINE_FOLLOW_PHASE_TRACK);
+
+    line = TestNarrowLine(0);
+    odometry.center_distance_mm = 1000.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.track_locked);
+
+    /* Two consecutive wide frames before the lower bound are both rejected. */
+    line = TestNarrowLine(0);
+    odometry.center_distance_mm = earliest_trigger_mm - 30.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 50U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    line = TestWideMarker(false);
+    odometry.center_distance_mm = earliest_trigger_mm - 20.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 60U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_event_streak == 0U);
+    odometry.center_distance_mm = earliest_trigger_mm - 10.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 80U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_event_streak == 0U);
+
+    line = TestNarrowLine(0);
+    odometry.center_distance_mm = expected_trigger_mm - 10.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 100U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_event_streak == 0U);
+
+    /* Two marker frames at the nominal trigger enter the offset approach. */
+    line = TestWideMarker(false);
+    odometry.center_distance_mm = expected_trigger_mm;
+    assert(CarRouteExecutor_Update(&executor, &config, 120U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_event_streak == 1U);
+    odometry.center_distance_mm = expected_trigger_mm + 6.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 140U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_phase ==
+           CAR_LINE_FOLLOW_PHASE_AXLE_APPROACH);
+
+    odometry.center_distance_mm = expected_trigger_mm + 156.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 160U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.index == 1U);
+    assert(!motor.enable);
+    assert(executor.last_motion_exit_reason == CAR_ROUTE_EXIT_LINE);
+
+    /* Missing the armed A marker stops with a latched line fault. */
+    CarRouteExecutor_Init(&executor);
+    odometry.center_distance_mm = 0.0f;
+    faults = 0U;
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+    line = TestNarrowLine(0);
+    odometry.center_distance_mm = 1000.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    odometry.center_distance_mm = latest_trigger_mm - 1.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(faults == CAR_FAULT_NONE);
+    odometry.center_distance_mm = latest_trigger_mm;
+    assert(CarRouteExecutor_Update(&executor, &config, 60U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_ERROR_STATE);
+    assert((faults & CAR_FAULT_LINE_MISSED) != 0U);
+    assert(!motor.enable);
+
+    /* A first marker frame exactly at the upper bound may use one more frame
+     * for the configured consecutive confirmation. */
+    CarRouteExecutor_Init(&executor);
+    odometry.center_distance_mm = 0.0f;
+    faults = 0U;
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+    line = TestNarrowLine(0);
+    odometry.center_distance_mm = 1000.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    odometry.center_distance_mm = latest_trigger_mm - 10.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 30U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    line = TestWideMarker(false);
+    odometry.center_distance_mm = latest_trigger_mm;
+    assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_event_streak == 1U);
+    assert(faults == CAR_FAULT_NONE);
+    odometry.center_distance_mm = latest_trigger_mm + 6.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 60U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.line_follow_phase ==
+           CAR_LINE_FOLLOW_PHASE_AXLE_APPROACH);
+    assert(faults == CAR_FAULT_NONE);
+}
+
+static void TestOfficialTrackLossStops(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route = {0};
+    CarRouteExecutor executor;
+    CarOdometry odometry = {0};
+    CarLineEstimate line = TestNarrowLine(0);
+    CarMotorCommand motor;
+    CarCue cue;
+    uint32_t faults = 0U;
+
+    config.gray_shape_filter_enable = true;
+    config.gray_track_enter_frames = 1U;
+    config.required_line_search_mm = 80.0f;
+    config.required_line_search_speed_mm_s = 60.0f;
+    config.track_wheel_accel_limit_mm_s2 = 0.0f;
+    route.count = 1U;
+    route.segments[0] = (CarRouteSegment){
+        .type = CAR_SEGMENT_TRACK,
+        .value = 500.0f,
+        .speed = 200.0f,
+        .timeout_ms = 5000U,
+        .use_line = true,
+        .line_follow_exit = CAR_LINE_FOLLOW_EXIT_DISTANCE
+    };
+
+    CarRouteExecutor_Init(&executor);
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.track_has_seen_line);
+
+    line = (CarLineEstimate){0};
+    odometry.center_distance_mm = 50.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 40U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(motor.enable);
+    assert(motor.left_mm_s == 60.0f);
+    assert(motor.right_mm_s == 60.0f);
+    assert(executor.track_line_gap_mm == 50.0f);
+
+    odometry.center_distance_mm = 80.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 60U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) ==
+           CAR_ERROR_STATE);
+    assert((faults & CAR_FAULT_LINE_MISSED) != 0U);
+    assert(!motor.enable);
+}
+
+static void TestAdaptiveLineDistanceExit(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route = {0};
+    CarRouteExecutor executor;
+    CarOdometry odometry = {0};
+    CarLineEstimate line = TestNarrowLine(0);
+    CarMotorCommand motor;
+    CarCue cue;
+    uint32_t faults = 0U;
+
+    config.gray_shape_filter_enable = true;
+    config.gray_track_enter_frames = 1U;
+    route.count = 1U;
+    route.segments[0] = (CarRouteSegment){
+        .type = CAR_SEGMENT_LINE_FOLLOW,
+        .value = 100.0f,
+        .speed = 100.0f,
+        .timeout_ms = 5000U,
+        .use_line = true,
+        .line_follow_exit = CAR_LINE_FOLLOW_EXIT_DISTANCE
+    };
+    CarRouteExecutor_Init(&executor);
+    assert(CarRouteExecutor_Start(&executor, &route, 0U,
+                                  &odometry, 0.0f) == CAR_OK);
+    odometry.center_distance_mm = 97.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 20U,
+                                   &odometry, 0.0f, &line,
+                                   &motor, &cue, &faults) == CAR_OK);
+    assert(executor.finished);
+    assert(executor.last_motion_exit_reason == CAR_ROUTE_EXIT_DISTANCE);
+    assert(faults == CAR_FAULT_NONE);
+}
+
+static void TestSetOfficialGray(CarInputSnapshot *input,
+                                uint32_t now_ms,
+                                bool wide)
+{
+    for (uint8_t i = 0U; i < 8U; i++) {
+        input->gray.normalized[i] = wide ? 1000U : 0U;
+    }
+    if (!wide) {
+        input->gray.normalized[3] = 1000U;
+        input->gray.normalized[4] = 1000U;
+    }
+    input->gray.timestamp_ms = now_ms;
+    input->gray.valid = true;
+}
+
+static void TestOfficialResultTimingWrap(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarApp app;
+    CarInputSnapshot input = {0};
+    CarOutputSnapshot output;
+    uint32_t start_ms = UINT32_MAX - 100U;
+    uint32_t now_ms;
+
+    /* One encoder count is approximately 1 mm, which keeps this end-to-end
+     * route timing test readable while exercising uint32_t time wrap. */
+    config.wheel_diameter_mm = 318.309886f;
+    config.encoder_counts_per_wheel_rev = 1000.0f;
+    config.gray_shape_filter_enable = true;
+    config.gray_track_enter_frames = 1U;
+    config.line_follow_kp = 0.025f;
+    config.arc_effective_track_width_mm = 100.0f;
+    config.finish_sensor_to_test_point_mm = 150.0f;
+    config.finish_approach_speed_mm_s = 100.0f;
+    config.required_line_search_mm = 80.0f;
+    config.track_wheel_accel_limit_mm_s2 = 0.0f;
+
+    input.encoder.valid = true;
+    input.encoder.timestamp_ms = start_ms;
+    input.imu.valid = true;
+    input.imu.timestamp_ms = start_ms;
+    TestSetOfficialGray(&input, start_ms, false);
+    assert(CarApp_Init(&app, &config) == CAR_OK);
+    assert(CarApp_Arm(&app, H2026_MODE_B2, start_ms, &input) == CAR_OK);
+
+#define TEST_OFFICIAL_STEP(ms_offset, count, wide_line)                     \
+    do {                                                                    \
+        now_ms = start_ms + (ms_offset);                                    \
+        input.encoder.left_count = (int16_t)(count);                        \
+        input.encoder.right_count = (int16_t)(count);                       \
+        input.encoder.timestamp_ms = now_ms;                                \
+        input.imu.timestamp_ms = now_ms;                                    \
+        TestSetOfficialGray(&input, now_ms, (wide_line));                   \
+        assert(CarApp_Update(&app, now_ms, &input, &output) == CAR_OK);      \
+    } while (0)
+
+    TEST_OFFICIAL_STEP(20U, 0, false);       /* START -> first straight */
+    TEST_OFFICIAL_STEP(40U, 1498, false);    /* first straight -> arc */
+    TEST_OFFICIAL_STEP(60U, 3066, false);    /* first arc -> straight */
+    TEST_OFFICIAL_STEP(80U, 4564, false);    /* second straight -> arc */
+    TEST_OFFICIAL_STEP(100U, 5564, false);   /* establish track lock */
+    TEST_OFFICIAL_STEP(110U, 5970, false);   /* continuous narrow track */
+    TEST_OFFICIAL_STEP(120U, 5982, true);    /* marker about 150 mm early */
+    TEST_OFFICIAL_STEP(140U, 5988, true);    /* confirmed marker */
+    TEST_OFFICIAL_STEP(150U, 6050, false);   /* offset keeps final arc */
+    assert(output.motor.enable);
+    assert(output.motor.left_mm_s > output.motor.right_mm_s);
+    TEST_OFFICIAL_STEP(160U, 6135, true);    /* test point reaches A */
+
+#undef TEST_OFFICIAL_STEP
+
+    assert(output.result_valid);
+    assert(output.result_time_ms == 160U);
+    assert(output.run_time_ms == 160U);
+    assert(app.executor.index == 5U);
+    assert(!output.motor.enable);
+}
+
+static void TestFaultTimingRetention(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarApp app;
+    CarInputSnapshot input = {0};
+    CarOutputSnapshot output;
+
+    config.gray_shape_filter_enable = true;
+    config.gray_track_enter_frames = 1U;
+    input.encoder.valid = true;
+    input.encoder.timestamp_ms = 1000U;
+    input.imu.valid = true;
+    input.imu.timestamp_ms = 1000U;
+    TestSetOfficialGray(&input, 1000U, false);
+    assert(CarApp_Init(&app, &config) == CAR_OK);
+    assert(CarApp_Arm(&app, H2026_MODE_B2, 1000U, &input) == CAR_OK);
+
+    input.encoder.timestamp_ms = 1020U;
+    input.imu.timestamp_ms = 1020U;
+    TestSetOfficialGray(&input, 1020U, false);
+    assert(CarApp_Update(&app, 1020U, &input, &output) == CAR_OK);
+
+    input.emergency_stop = true;
+    input.encoder.timestamp_ms = 1040U;
+    input.imu.timestamp_ms = 1040U;
+    TestSetOfficialGray(&input, 1040U, false);
+    assert(CarApp_Update(&app, 1040U, &input, &output) ==
+           CAR_ERROR_STATE);
+    assert(output.run_time_ms == 40U);
+
+    input.emergency_stop = false;
+    input.encoder.timestamp_ms = 1060U;
+    input.imu.timestamp_ms = 1060U;
+    TestSetOfficialGray(&input, 1060U, false);
+    assert(CarApp_Update(&app, 1060U, &input, &output) ==
+           CAR_ERROR_STATE);
+    assert(output.run_time_ms == 40U);
+}
+
+int main(void)
+{
+    TestMotorBoard();
+    TestOdometryWrap();
+    TestSchedulerAndYaw();
+    TestGrayButtonAndBuzzer();
+    TestLineEstimator();
+    TestRoutes();
+    TestSafety();
+    TestRouteExitReasons();
+    TestH2026FilteredStraightFinish();
+    TestLineFollowEvents();
+    TestTurnLineReacquire();
+    TestH2026WideAreaCannotReacquireTurn();
+    TestH2026CaptureGrayGuidanceCompatibility();
+    TestH2026CaptureTimeoutUsesExistingSearchBudget();
+    TestH2026CaptureCenterWinsBoundaryFrame();
+    TestH2026LineFollowSeekConverges();
+    TestH2026ArmedAnyProbeStartsCapture();
+    TestH2026DiagonalCaptureTimeoutSearchesThenFails();
+    TestH2026FalseCornerRejected();
+    TestH2026ObliqueStraightHandoff();
+    TestH2026ArcAxleApproachPrecedesAngleExit();
+    TestH2026RequiredLineSearchStopsSafely();
+    TestArcHeadingHandoff();
+    TestH2026ArcAndHeadingLimits();
+    TestH2026ArcLineTailHandoff();
+    TestOfficialTrackControl();
+    TestOfficialFinishMarker();
+    TestOfficialTrackLossStops();
+    TestAdaptiveLineDistanceExit();
+    TestOfficialResultTimingWrap();
+    TestFaultTimingRetention();
+    TestFirmwareChain();
+    puts("2024 legacy and 2026 H master firmware tests passed");
+    return 0;
+}

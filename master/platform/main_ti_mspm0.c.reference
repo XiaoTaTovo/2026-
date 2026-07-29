@@ -1,0 +1,30 @@
+#include "firmware.h"
+#include "platform/ti_mspm0_platform.h"
+#include "ti_msp_dl_config.h"
+
+static CarFirmware g_firmware;
+
+int main(void)
+{
+    CarFirmwareConfig config;
+    CarStatus status;
+
+    SYSCFG_DL_init();
+    TiMspm0Platform_Init();
+    status = TiMspm0Platform_BuildConfig(&config, H2024_MODE_ITEM_1);
+    if (status == CAR_OK) {
+        status = CarFirmware_Init(&g_firmware, &config,
+                                  TiMspm0Platform_Millis());
+    }
+    if (status != CAR_OK) {
+        while (1) {
+            __WFI();
+        }
+    }
+
+    while (1) {
+        TiMspm0Platform_PollMotorRx(&g_firmware);
+        CarFirmware_Tick(&g_firmware, TiMspm0Platform_Millis());
+        __WFI();
+    }
+}

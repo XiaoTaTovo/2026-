@@ -1,0 +1,126 @@
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "core/motion_watchdog.h"
+
+static CarMotionWatchdog TestWatchdog(void)
+{
+    const CarMotionWatchdogConfig config = {10U, 600U};
+    CarMotionWatchdog watchdog;
+
+    assert(CarMotionWatchdog_Init(&watchdog, &config));
+    return watchdog;
+}
+
+static void TestZeroTargetAndArming(void)
+{
+    CarMotionWatchdog watchdog = TestWatchdog();
+    CarMotionWatchdogResult result;
+
+    result = CarMotionWatchdog_Update(&watchdog, 0, 9, 0, 0, 0U);
+    assert(result.left_valid && result.right_valid);
+    assert(!watchdog.left.armed && !watchdog.right.armed);
+    result = CarMotionWatchdog_Update(&watchdog, 0, -9, 0, 0, 1000U);
+    assert(result.left_valid && result.right_valid);
+    assert(!watchdog.left.timed_out && !watchdog.right.timed_out);
+
+    result = CarMotionWatchdog_Update(&watchdog, 10, -10, 0, 0, 1010U);
+    assert(result.left_valid && result.right_valid);
+    assert(watchdog.left.armed && watchdog.right.armed);
+    assert(watchdog.left.target_direction == 1);
+    assert(watchdog.right.target_direction == -1);
+}
+
+static void TestMotionRefreshAndIndependentWheels(void)
+{
+    CarMotionWatchdog watchdog = TestWatchdog();
+    CarMotionWatchdogResult result;
+
+    result = CarMotionWatchdog_Update(&watchdog, 20, 20, 0, 0, 100U);
+    assert(result.left_valid && result.right_valid);
+    result = CarMotionWatchdog_Update(&watchdog, 20, 20, 0, 1, 500U);
+    assert(result.left_valid && result.right_valid);
+    assert(watchdog.right.last_motion_ms == 500U);
+
+    result = CarMotionWatchdog_Update(&watchdog, 20, 20, 0, 1, 699U);
+    assert(result.left_valid && result.right_valid);
+    result = CarMotionWatchdog_Update(&watchdog, 20, 20, 0, 2, 700U);
+    assert(!result.left_valid && result.right_valid);
+    assert(watchdog.left.timed_out && !watchdog.right.timed_out);
+}
+
+static void TestTimeoutLatchAndReset(void)
+{
+    CarMotionWatchdog watchdog = TestWatchdog();
+    CarMotionWatchdogResult result;
+
+    result = CarMotionWatchdog_Update(&watchdog, 20, 0, 0, 0, 0U);
+    assert(result.left_valid);
+    result = CarMotionWatchdog_Update(&watchdog, 20, 0, 0, 0, 600U);
+    assert(!result.left_valid && watchdog.left.timed_out);
+
+    /* A late pulse cannot hide a fault that already crossed the deadline. */
+    result = CarMotionWatchdog_Update(&watchdog, 20, 0, 1, 0, 610U);
+    assert(!result.left_valid && watchdog.left.timed_out);
+
+    result = CarMotionWatchdog_Update(&watchdog, 0, 0, 1, 0, 620U);
+    assert(result.left_valid && !watchdog.left.armed &&
+           !watchdog.left.timed_out);
+    result = CarMotionWatchdog_Update(&watchdog, 20, 0, 1, 0, 630U);
+    assert(result.left_valid && watchdog.left.armed);
+    result = CarMotionWatchdog_Update(&watchdog, 20, 0, 1, 0, 1229U);
+    assert(result.left_valid);
+    result = CarMotionWatchdog_Update(&watchdog, 20, 0, 1, 0, 1230U);
+    assert(!result.left_valid);
+
+    /* A commanded reversal starts a new bounded observation window. */
+    result = CarMotionWatchdog_Update(&watchdog, -20, 0, 1, 0, 1240U);
+    assert(result.left_valid && watchdog.left.armed &&
+           !watchdog.left.timed_out);
+    assert(watchdog.left.target_direction == -1);
+}
+
+static void TestDirectionChangeResetsDeadline(void)
+{
+    CarMotionWatchdog watchdog = TestWatchdog();
+    CarMotionWatchdogResult result;
+
+    result = CarMotionWatchdog_Update(&watchdog, 20, 0, 0, 0, 0U);
+    assert(result.left_valid);
+    result = CarMotionWatchdog_Update(&watchdog, 20, 0, 0, 0, 590U);
+    assert(result.left_valid);
+    result = CarMotionWatchdog_Update(&watchdog, -20, 0, 0, 0, 590U);
+    assert(result.left_valid);
+    result = CarMotionWatchdog_Update(&watchdog, -20, 0, 0, 0, 1189U);
+    assert(result.left_valid);
+    result = CarMotionWatchdog_Update(&watchdog, -20, 0, 0, 0, 1190U);
+    assert(!result.left_valid);
+}
+
+static void TestTimeWrap(void)
+{
+    CarMotionWatchdog watchdog = TestWatchdog();
+    CarMotionWatchdogResult result;
+    uint32_t start_ms = UINT32_MAX - 300U;
+
+    result = CarMotionWatchdog_Update(&watchdog, 20, 0, 0, 0, start_ms);
+    assert(result.left_valid);
+    result = CarMotionWatchdog_Update(&watchdog, 20, 0, 0, 0,
+                                      start_ms + 599U);
+    assert(result.left_valid);
+    result = CarMotionWatchdog_Update(&watchdog, 20, 0, 0, 0,
+                                      start_ms + 600U);
+    assert(!result.left_valid);
+}
+
+int main(void)
+{
+    TestZeroTargetAndArming();
+    TestMotionRefreshAndIndependentWheels();
+    TestTimeoutLatchAndReset();
+    TestDirectionChangeResetsDeadline();
+    TestTimeWrap();
+    puts("motion watchdog tests passed");
+    return 0;
+}
