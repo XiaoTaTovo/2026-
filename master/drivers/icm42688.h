@@ -1,5 +1,5 @@
-#ifndef H2024_ICM42688_H
-#define H2024_ICM42688_H
+#ifndef ICM42688_H
+#define ICM42688_H
 
 #include <stdbool.h>
 #include <stdint.h>

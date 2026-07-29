@@ -1,5 +1,5 @@
-#ifndef H2024_BUZZER_H
-#define H2024_BUZZER_H
+#ifndef BUZZER_H
+#define BUZZER_H
 
 #include <stdbool.h>
 #include <stdint.h>

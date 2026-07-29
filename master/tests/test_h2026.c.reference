@@ -1,0 +1,429 @@
+#include <assert.h>
+#include <limits.h>
+#include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "app/car_app.h"
+#include "app/h2026_task.h"
+#include "car_config.h"
+#include "core/line_estimator.h"
+#include "core/route_executor.h"
+#include "firmware.h"
+
+typedef struct {
+    uint32_t now_ms;
+    uint32_t stop_count;
+    uint32_t service_count;
+} FakeDrive;
+
+static bool FakeDriveReadEncoder(CarEncoderSample *sample, void *context)
+{
+    FakeDrive *drive = (FakeDrive *)context;
+
+    *sample = (CarEncoderSample){
+        .timestamp_ms = drive->now_ms,
+        .valid = true
+    };
+    return true;
+}
+
+static void FakeDriveStop(void *context)
+{
+    FakeDrive *drive = (FakeDrive *)context;
+
+    drive->stop_count++;
+}
+
+static void FakeDriveService(void *context)
+{
+    FakeDrive *drive = (FakeDrive *)context;
+
+    drive->service_count++;
+}
+
+static bool Near(float actual, float expected, float tolerance)
+{
+    return fabsf(actual - expected) <= tolerance;
+}
+
+static CarLineEstimate NarrowLine(int16_t position)
+{
+    CarLineEstimate line = {0};
+
+    line.position = position;
+    line.confidence = 1800U;
+    line.active_count = 2U;
+    line.active_mask = 0x18U;
+    line.track_position = position;
+    line.track_confidence = 1600U;
+    line.track_active_count = 2U;
+    line.track_active_mask = 0x18U;
+    line.track_active_span = 2U;
+    line.track_cluster_count = 1U;
+    line.pattern = CAR_LINE_PATTERN_NARROW_TRACK;
+    line.valid = true;
+    return line;
+}
+
+static CarLineEstimate WideMarker(void)
+{
+    CarLineEstimate line = {0};
+
+    line.confidence = 7200U;
+    line.active_count = 8U;
+    line.active_mask = 0xFFU;
+    line.active_span = 8U;
+    line.adaptive_background = 900U;
+    line.pattern = CAR_LINE_PATTERN_WIDE_AREA;
+    line.valid = true;
+    return line;
+}
+
+static CarLineEstimate NoLine(void)
+{
+    CarLineEstimate line = {0};
+
+    line.pattern = CAR_LINE_PATTERN_NONE;
+    return line;
+}
+
+static void StartRoute(CarRouteExecutor *executor,
+                       const CarRoute *route,
+                       CarOdometry *odometry)
+{
+    CarMotorCommand motor;
+    CarCue cue;
+    CarLineEstimate line = NarrowLine(0);
+    CarConfig config = CarConfig_MakeDefault();
+    uint32_t faults = 0U;
+
+    CarRouteExecutor_Init(executor);
+    *odometry = (CarOdometry){0};
+    odometry->initialized = true;
+    assert(CarRouteExecutor_Start(executor, route, 0U, odometry) ==
+           CAR_OK);
+    assert(CarRouteExecutor_Update(executor, &config, 0U, odometry,
+                                   &line, &motor, &cue, &faults) ==
+           CAR_OK);
+    assert(cue == CAR_CUE_START);
+    assert(executor->index == 1U);
+    assert(faults == 0U);
+}
+
+static void EnterFinalArc(CarRouteExecutor *executor,
+                          const CarRoute *route,
+                          float progress_mm)
+{
+    *executor = (CarRouteExecutor){0};
+    executor->route = route;
+    executor->index = 4U;
+    executor->running = true;
+    executor->segment_start_ms = 0U;
+    executor->segment_start_distance_mm = 0.0f;
+    executor->line_previous_ms = 0U;
+    executor->track_locked = true;
+    executor->track_has_seen_line = true;
+    executor->track_last_line_distance_mm = progress_mm;
+}
+
+static void TestModeAndRouteContract(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route;
+    float arc_length = 3.14159265358979323846f *
+                       H2026_TRACK_ARC_RADIUS_MM;
+    float expected_earliest = arc_length -
+        config.finish_sensor_to_test_point_mm -
+        config.required_line_search_mm;
+
+    assert(H2026_ModeIsOfficial(H2026_MODE_B2));
+    assert(H2026_ModeUsesLine(H2026_MODE_B2));
+    assert(!H2026_ModeRequiresBallControl(H2026_MODE_B2));
+    assert(H2026_ModeRequiresBallControl(H2026_MODE_B3));
+    assert(H2026_BuildRoute(H2026_MODE_B2, &config, &route) == CAR_OK);
+    assert(route.count == 6U);
+    assert(route.segments[0].type == CAR_SEGMENT_CUE);
+    assert(route.segments[0].cue == CAR_CUE_START);
+    assert(route.segments[1].type == CAR_SEGMENT_TRACK);
+    assert(Near(route.segments[1].distance_mm, 1500.0f, 0.01f));
+    assert(Near(route.segments[1].curvature_inv_mm, 0.0f, 0.000001f));
+    assert(route.segments[1].track_exit == CAR_TRACK_EXIT_DISTANCE);
+    assert(Near(route.segments[2].distance_mm, arc_length, 0.01f));
+    assert(Near(route.segments[2].curvature_inv_mm, -0.002f,
+                0.000001f));
+    assert(route.segments[4].track_exit ==
+           CAR_TRACK_EXIT_FINISH_MARKER);
+    assert(Near(route.segments[4].marker_arm_ratio,
+                expected_earliest / arc_length, 0.000001f));
+    assert(route.segments[5].type == CAR_SEGMENT_STOP);
+    assert(route.segments[5].cue == CAR_CUE_FINISH);
+    assert(H2026_BuildRoute(H2026_MODE_B3, &config, &route) ==
+           CAR_ERROR_STATE);
+    assert(H2026_BuildRoute(H2026_MODE_B4, &config, &route) ==
+           CAR_ERROR_STATE);
+    assert(H2026_BuildRoute(H2026_MODE_B5, &config, &route) ==
+           CAR_ERROR_STATE);
+    assert(H2026_BuildRoute(H2026_MODE_B6, &config, &route) ==
+           CAR_ERROR_STATE);
+}
+
+static void TestLineClassification(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarGraySample sample = {0};
+    CarLineEstimate line;
+
+    sample.valid = true;
+    sample.normalized[2] = 40U;
+    sample.normalized[3] = 1000U;
+    sample.normalized[4] = 900U;
+    sample.normalized[5] = 40U;
+    assert(CarLineEstimator_Update(&config, &sample, &line) == CAR_OK);
+    assert(line.pattern == CAR_LINE_PATTERN_NARROW_TRACK);
+    assert(line.track_active_count == 2U);
+    assert(line.track_active_mask == 0x18U);
+    assert(line.track_position < 0);
+
+    for (uint8_t i = 0U; i < 8U; i++) {
+        sample.normalized[i] = 900U;
+    }
+    assert(CarLineEstimator_Update(&config, &sample, &line) == CAR_OK);
+    assert(line.pattern == CAR_LINE_PATTERN_WIDE_AREA);
+    assert(line.active_count == 8U);
+
+    for (uint8_t i = 0U; i < 8U; i++) {
+        sample.normalized[i] = 0U;
+    }
+    sample.normalized[0] = 900U;
+    sample.normalized[7] = 900U;
+    assert(CarLineEstimator_Update(&config, &sample, &line) == CAR_OK);
+    assert(line.pattern == CAR_LINE_PATTERN_SPLIT_NOISE);
+    assert(line.track_cluster_count == 2U);
+}
+
+static void TestCurvatureWheelCommands(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route;
+    CarRouteExecutor executor;
+    CarOdometry odometry;
+    CarMotorCommand motor;
+    CarCue cue;
+    CarLineEstimate line = NarrowLine(0);
+    uint32_t faults = 0U;
+
+    assert(H2026_BuildRoute(H2026_MODE_B2, &config, &route) == CAR_OK);
+    StartRoute(&executor, &route, &odometry);
+
+    assert(CarRouteExecutor_Update(&executor, &config, 1000U,
+                                   &odometry, &line, &motor, &cue,
+                                   &faults) == CAR_OK);
+    assert(motor.enable);
+    assert(Near(motor.left_mm_s, 350.0f, 0.01f));
+    assert(Near(motor.right_mm_s, 350.0f, 0.01f));
+
+    odometry.center_distance_mm = 1500.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 1020U,
+                                   &odometry, &line, &motor, &cue,
+                                   &faults) == CAR_OK);
+    assert(executor.index == 2U);
+    assert(CarRouteExecutor_Update(&executor, &config, 1040U,
+                                   &odometry, &line, &motor, &cue,
+                                   &faults) == CAR_OK);
+    assert(motor.enable);
+    assert(Near(motor.left_mm_s, 348.0f, 0.05f));
+    assert(Near(motor.right_mm_s, 252.0f, 0.05f));
+    assert(motor.left_mm_s > motor.right_mm_s);
+    assert(faults == 0U);
+}
+
+static void TestFinishMarkerWindow(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route;
+    CarRouteExecutor executor;
+    CarOdometry odometry = {0};
+    CarMotorCommand motor;
+    CarCue cue;
+    CarLineEstimate marker = WideMarker();
+    uint32_t faults;
+    float arc_length = 3.14159265358979323846f *
+                       H2026_TRACK_ARC_RADIUS_MM;
+    float expected = arc_length - config.finish_sensor_to_test_point_mm;
+    float earliest = expected - config.required_line_search_mm;
+    float latest = expected + config.required_line_search_mm;
+
+    assert(H2026_BuildRoute(H2026_MODE_B2, &config, &route) == CAR_OK);
+
+    faults = 0U;
+    odometry.center_distance_mm = earliest - 1.0f;
+    EnterFinalArc(&executor, &route, odometry.center_distance_mm);
+    assert(CarRouteExecutor_Update(&executor, &config, 20U, &odometry,
+                                   &marker, &motor, &cue, &faults) ==
+           CAR_OK);
+    assert(executor.marker_streak == 0U);
+    assert(executor.track_phase == CAR_TRACK_PHASE_FOLLOW);
+    assert(faults == 0U);
+
+    faults = 0U;
+    odometry.center_distance_mm = expected;
+    EnterFinalArc(&executor, &route, odometry.center_distance_mm);
+    assert(CarRouteExecutor_Update(&executor, &config, 20U, &odometry,
+                                   &marker, &motor, &cue, &faults) ==
+           CAR_OK);
+    assert(executor.marker_streak == 1U);
+    odometry.center_distance_mm = expected + 1.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 40U, &odometry,
+                                   &marker, &motor, &cue, &faults) ==
+           CAR_OK);
+    assert(executor.track_phase == CAR_TRACK_PHASE_FINISH_OFFSET);
+    assert(executor.marker_streak == 0U);
+    odometry.center_distance_mm = expected + 151.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 1000U, &odometry,
+                                   &marker, &motor, &cue, &faults) ==
+           CAR_OK);
+    assert(executor.index == 5U);
+    assert(!motor.enable);
+    assert(executor.last_exit_reason == CAR_ROUTE_EXIT_FINISH_MARKER);
+
+    faults = 0U;
+    odometry.center_distance_mm = latest;
+    EnterFinalArc(&executor, &route, odometry.center_distance_mm);
+    assert(CarRouteExecutor_Update(&executor, &config, 20U, &odometry,
+                                   &marker, &motor, &cue, &faults) ==
+           CAR_OK);
+    assert(executor.marker_streak == 1U);
+    odometry.center_distance_mm = latest + 1.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 40U, &odometry,
+                                   &marker, &motor, &cue, &faults) ==
+           CAR_OK);
+    assert(executor.track_phase == CAR_TRACK_PHASE_FINISH_OFFSET);
+
+    faults = 0U;
+    odometry.center_distance_mm = latest + 1.0f;
+    EnterFinalArc(&executor, &route, odometry.center_distance_mm);
+    executor.track_last_line_distance_mm = odometry.center_distance_mm;
+    assert(CarRouteExecutor_Update(&executor, &config, 20U, &odometry,
+                                   &marker, &motor, &cue, &faults) ==
+           CAR_ERROR_STATE);
+    assert((faults & CAR_FAULT_LINE_MISSED) != 0U);
+    assert(!executor.running);
+    assert(!motor.enable);
+}
+
+static void TestLineLossBound(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route;
+    CarRouteExecutor executor;
+    CarOdometry odometry;
+    CarMotorCommand motor;
+    CarCue cue;
+    CarLineEstimate line = NarrowLine(0);
+    CarLineEstimate none = NoLine();
+    uint32_t faults = 0U;
+
+    assert(H2026_BuildRoute(H2026_MODE_B2, &config, &route) == CAR_OK);
+    StartRoute(&executor, &route, &odometry);
+    assert(CarRouteExecutor_Update(&executor, &config, 20U, &odometry,
+                                   &line, &motor, &cue, &faults) ==
+           CAR_OK);
+    assert(CarRouteExecutor_Update(&executor, &config, 40U, &odometry,
+                                   &line, &motor, &cue, &faults) ==
+           CAR_OK);
+    assert(executor.track_locked);
+
+    odometry.center_distance_mm = 76.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 60U, &odometry,
+                                   &none, &motor, &cue, &faults) ==
+           CAR_OK);
+    assert(faults == 0U);
+    odometry.center_distance_mm = 77.0f;
+    assert(CarRouteExecutor_Update(&executor, &config, 80U, &odometry,
+                                   &none, &motor, &cue, &faults) ==
+           CAR_ERROR_STATE);
+    assert((faults & CAR_FAULT_LINE_MISSED) != 0U);
+    assert(!motor.enable);
+}
+
+static void TestStoppedTimeAcrossWrap(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarApp app;
+    CarInputSnapshot input = {0};
+    CarOutputSnapshot output;
+    uint32_t start_ms = UINT32_MAX - 20U;
+
+    input.encoder.valid = true;
+    input.encoder.timestamp_ms = start_ms;
+    input.imu.valid = true;
+    input.imu.timestamp_ms = start_ms;
+    input.gray.valid = true;
+    input.gray.timestamp_ms = start_ms;
+    assert(CarApp_Init(&app, &config) == CAR_OK);
+    assert(CarApp_Arm(&app, H2026_MODE_B2, start_ms, &input) == CAR_OK);
+    CarApp_Stop(&app, CAR_FAULT_EMERGENCY_STOP, 30U);
+    assert(app.stopped_time_valid);
+    assert(app.stopped_time_ms == 51U);
+    input.encoder.timestamp_ms = 30U;
+    input.imu.timestamp_ms = 30U;
+    input.gray.timestamp_ms = 30U;
+    assert(CarApp_Update(&app, 30U, &input, &output) ==
+           CAR_ERROR_STATE);
+    assert(output.run_time_ms == 51U);
+}
+
+static void TestKeyEmergencyStopLatchesUntilReboot(void)
+{
+    FakeDrive drive = {0};
+    CarFirmware firmware = {0};
+
+    firmware.initialized = true;
+    firmware.config.drive = (CarDrivePort){
+        .read_encoder = FakeDriveReadEncoder,
+        .stop = FakeDriveStop,
+        .service = FakeDriveService,
+        .context = &drive
+    };
+    firmware.app.armed = true;
+    firmware.app.executor.running = true;
+    firmware.app.run_start_ms = 0U;
+    firmware.button.pressed_event = true;
+    CarPeriodicTask_Init(&firmware.control_task, 20U, 0U);
+
+    drive.now_ms = 20U;
+    CarFirmware_Tick(&firmware, drive.now_ms);
+    assert((firmware.hardware_faults & CAR_FAULT_EMERGENCY_STOP) != 0U);
+    assert((firmware.output.faults & CAR_FAULT_EMERGENCY_STOP) != 0U);
+    assert(!firmware.app.armed);
+    assert(!firmware.app.executor.running);
+    assert(firmware.last_button_action ==
+           CAR_BUTTON_ACTION_EMERGENCY_STOP);
+    assert(drive.stop_count == 1U);
+
+    firmware.button.pressed_event = true;
+    drive.now_ms = 40U;
+    CarFirmware_Tick(&firmware, drive.now_ms);
+    assert(!firmware.app.armed);
+    assert(!firmware.app.executor.running);
+    assert(firmware.last_arm_status == CAR_ERROR_STATE);
+    assert(firmware.last_button_action == CAR_BUTTON_ACTION_ARM_REJECTED);
+    assert((firmware.hardware_faults & CAR_FAULT_EMERGENCY_STOP) != 0U);
+    assert(drive.stop_count == 2U);
+    assert(drive.service_count == 2U);
+}
+
+int main(void)
+{
+    TestModeAndRouteContract();
+    TestLineClassification();
+    TestCurvatureWheelCommands();
+    TestFinishMarkerWindow();
+    TestLineLossBound();
+    TestStoppedTimeAcrossWrap();
+    TestKeyEmergencyStopLatchesUntilReboot();
+    puts("2026 H B2 control tests passed");
+    return 0;
+}

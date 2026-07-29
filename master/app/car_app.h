@@ -1,7 +1,7 @@
-#ifndef H2024_CAR_APP_H
-#define H2024_CAR_APP_H
+#ifndef CAR_APP_H
+#define CAR_APP_H
 
-#include "app/h2024_task.h"
+#include "app/h2026_task.h"
 #include "car_config.h"
 #include "car_types.h"
 #include "core/line_estimator.h"
@@ -18,7 +18,7 @@ typedef struct {
     uint32_t run_start_ms;
     uint32_t result_time_ms;
     uint32_t stopped_time_ms;
-    H2024Mode mode;
+    H2026Mode mode;
     bool result_valid;
     bool stopped_time_valid;
     bool armed;
@@ -26,7 +26,7 @@ typedef struct {
 
 CarStatus CarApp_Init(CarApp *app, const CarConfig *config);
 CarStatus CarApp_Arm(CarApp *app,
-                     H2024Mode mode,
+                     H2026Mode mode,
                      uint32_t now_ms,
                      const CarInputSnapshot *input);
 CarStatus CarApp_Update(CarApp *app,

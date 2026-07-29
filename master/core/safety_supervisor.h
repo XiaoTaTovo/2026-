@@ -1,5 +1,5 @@
-#ifndef H2024_SAFETY_SUPERVISOR_H
-#define H2024_SAFETY_SUPERVISOR_H
+#ifndef SAFETY_SUPERVISOR_H
+#define SAFETY_SUPERVISOR_H
 
 #include "car_config.h"
 #include "car_types.h"

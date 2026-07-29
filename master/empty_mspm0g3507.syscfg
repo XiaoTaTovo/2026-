@@ -200,7 +200,7 @@ UART1.rxPinConfig.onlyInternalResistor = scripting.forceWrite(false);
 UART1.rxPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
 UART1.rxPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric3";
 
-UART2.$name                            = "UART_BLUETOOTH";
+UART2.$name                            = "UART_VOFA";
 UART2.targetBaudRate                   = 115200;
 UART2.enabledInterrupts                = ["RX"];
 UART2.enableFIFO                       = true;

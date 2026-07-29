@@ -1,5 +1,5 @@
-#ifndef H2024_TI_MSPM0_PLATFORM_H
-#define H2024_TI_MSPM0_PLATFORM_H
+#ifndef TI_MSPM0_PLATFORM_H
+#define TI_MSPM0_PLATFORM_H
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -7,22 +7,20 @@
 #include "firmware.h"
 
 /*
- * Required SysConfig instance and pin names:
+ * SysConfig owns these fixed resources:
  *
- * UART_MOTOR: UART1, TX PA8, RX PA9, 115200 8N1
- * SPI_IMU: SPI1, POCI PB7, PICO PB8, SCLK PB9, mode confirmed on hardware
- * ADC_GRAY: ADC0 MEM0, OUT PA27, 12 bit, conversion-complete interrupt
- * GPIO_GRAY: AD0 PA24, AD1 PA25, AD2 PA26
- * GPIO_IMU: CS PB0, initialized high
- * GPIO_KEYS: KEY1 PB23, KEY2 PB26, KEY3 PB27, inputs with pull-ups
- * GPIO_BUZZER: BUZZER PB5, initialized low
- * SYSTICK: 1 ms interrupt
+ * TB6612 PWM: PB12/PB4, TIMA0, 20 kHz
+ * TB6612 direction/STBY: PA14/PA15, PA16/PA17, PA28
+ * encoder A/B: PA7/PA22 and PA30/PA31
+ * ICM42688 SPI/CS: PB9/PB8/PB7 and PB0
+ * gray mux/ADC: PA24/PA25/PA26, PA27, PB24, PB25
+ * OLED I2C0: PA0/PA1
+ * KEY1/KEY2/KEY3: PB23/PB26/PB27
+ * buzzer: PB5
+ * tuning/telemetry UART3: PB2/PB3, 115200 8N1
  */
 
 typedef struct {
-    uint32_t motor_rx_bytes;
-    uint32_t motor_rx_overflows;
-    uint32_t motor_tx_timeouts;
     uint32_t imu_spi_timeouts;
     uint32_t gray_adc_timeouts;
 } TiMspm0PlatformDiagnostics;
@@ -33,10 +31,8 @@ uint32_t TiMspm0Platform_Millis(void);
 bool TiMspm0Platform_ReadKey1Level(void);
 bool TiMspm0Platform_ReadKey2Level(void);
 bool TiMspm0Platform_ReadKey3Level(void);
-void TiMspm0Platform_PollMotorRx(CarFirmware *firmware);
-void TiMspm0Platform_ServiceMotorBackend(void);
 void TiMspm0Platform_GetDiagnostics(TiMspm0PlatformDiagnostics *diagnostics);
 CarStatus TiMspm0Platform_BuildConfig(CarFirmwareConfig *config,
-                                      H2024Mode mode);
+                                      H2026Mode mode);
 
 #endif

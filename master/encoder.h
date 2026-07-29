@@ -14,7 +14,7 @@
 
 /*
  * Leave these at zero until one output-wheel revolution has been measured.
- * They can also be configured at runtime with the Bluetooth CPR command.
+ * The active H2026 build instead uses the measured values in platform config.
  */
 #ifndef ENC_LEFT_COUNTS_PER_REV
 #define ENC_LEFT_COUNTS_PER_REV (0U)

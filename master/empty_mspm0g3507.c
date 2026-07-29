@@ -1,134 +1,42 @@
 #include "ti_msp_dl_config.h"
 
 #include <stdbool.h>
-#include <stdio.h>
 #include <stdint.h>
+#include <stdio.h>
 
-#include "project_mode.h"
-#include "platform/ti_mspm0_platform.h"
-
-#if PROJECT_MODE == PROJECT_MODE_GRAY_ADC_DEBUG
-
-#include "app/gray_adc_debug.h"
-
-#elif PROJECT_MODE == PROJECT_MODE_BLUETOOTH_TUNING
-
-#include "bluetooth_control.h"
-#include "encoder.h"
-#include "tb6612.h"
-#include "vofa_telemetry.h"
-
-#define TELEMETRY_PERIOD_MS (100U)
-
-static void RunBluetoothTuning(void)
-{
-    uint32_t lastTelemetryMs = 0;
-
-    TB6612_Init();
-    Encoder_Init();
-    BluetoothControl_Init();
-    VofaTelemetry_TxInit();
-
-    NVIC_ClearPendingIRQ(UART_BLUETOOTH_INST_INT_IRQN);
-    NVIC_EnableIRQ(UART_BLUETOOTH_INST_INT_IRQN);
-
-    VofaTelemetry_SendBanner();
-
-    while (1) {
-        BluetoothControlStatus status;
-        uint32_t nowMs = TiMspm0Platform_Millis();
-        bool sendNow;
-
-        sendNow = BluetoothControl_ProcessPending(nowMs);
-
-        if (BluetoothControl_CheckFailsafe(nowMs)) {
-            sendNow = true;
-        }
-
-        BluetoothControl_Update(nowMs);
-
-        if (sendNow ||
-            ((uint32_t)(nowMs - lastTelemetryMs) >=
-                TELEMETRY_PERIOD_MS)) {
-            BluetoothControl_GetStatus(&status);
-            VofaTelemetry_Send(&status, nowMs);
-            lastTelemetryMs = nowMs;
-        }
-
-        __WFI();
-    }
-}
-
-void UART_BLUETOOTH_INST_IRQHandler(void)
-{
-    switch (DL_UART_Main_getPendingInterrupt(UART_BLUETOOTH_INST)) {
-        case DL_UART_MAIN_IIDX_RX:
-            while (!DL_UART_Main_isRXFIFOEmpty(UART_BLUETOOTH_INST)) {
-                BluetoothControl_PushRxFromIsr(
-                    (uint8_t) DL_UART_Main_receiveData(
-                        UART_BLUETOOTH_INST));
-            }
-            break;
-        case DL_UART_MAIN_IIDX_TX:
-            VofaTelemetry_TxIrqHandler();
-            break;
-        default:
-            break;
-    }
-}
-
-#else
-
-#include "firmware.h"
 #include "OLED.h"
+#include "firmware.h"
+#include "platform/ti_mspm0_platform.h"
+#include "project_mode.h"
 #include "tb6612.h"
 #include "vofa_telemetry.h"
 
-static CarFirmware gFirmware;
-static OLED_Status gH2024OledStatus = OLED_STATUS_ERROR_NOT_INITIALIZED;
-static bool gH2024OledRefreshRequested = true;
+#define H2026_OLED_RENDER_PERIOD_MS (250U)
+#define H2026_OLED_TX_PERIOD_MS (5U)
+#define H2026_TELEMETRY_PERIOD_MS (100U)
 
-#define H2024_OLED_RENDER_PERIOD_MS   (250U)
-#define H2024_OLED_TX_PERIOD_MS       (5U)
-#define H2024_ROUTE_TELEMETRY_PERIOD_MS (100U)
+static CarFirmware g_firmware;
+static OLED_Status g_oled_status = OLED_STATUS_ERROR_NOT_INITIALIZED;
+static bool g_oled_refresh_requested = true;
 
-static const char *H2024_ModeName(H2024Mode mode)
+static H2026Mode H2026_SelectedMode(void)
 {
-    switch (mode) {
-        case H2024_MODE_ITEM_1:
-            return "ITEM1";
-        case H2024_MODE_ITEM_2:
-            return "ITEM2";
-        case H2024_MODE_ITEM_3:
-            return "ITEM3";
-        case H2024_MODE_ITEM_4:
-            return "ITEM4";
-        case H2024_MODE_TURN_DEBUG:
-            return "TURN";
-        case H2026_MODE_ITEM_1:
-            return "H26I1";
-        case H2026_MODE_ITEM_2:
-            return "H26I2";
-        case H2026_MODE_ITEM_3:
-            return "H26I3";
-        case H2026_MODE_ITEM_4:
-            return "H26I4";
-        case H2026_MODE_B2:
-            return "B2";
-        case H2026_MODE_B3:
-            return "B3";
-        case H2026_MODE_B4:
-            return "B4";
-        case H2026_MODE_B5:
-            return "B5";
-        case H2026_MODE_B6:
-            return "B6";
-        default:
-            return "?????";
-    }
+#if PROJECT_MODE == PROJECT_MODE_H2026_B2
+    return H2026_MODE_B2;
+#elif PROJECT_MODE == PROJECT_MODE_H2026_B3
+    return H2026_MODE_B3;
+#elif PROJECT_MODE == PROJECT_MODE_H2026_B4
+    return H2026_MODE_B4;
+#elif PROJECT_MODE == PROJECT_MODE_H2026_B5
+    return H2026_MODE_B5;
+#elif PROJECT_MODE == PROJECT_MODE_H2026_B6
+    return H2026_MODE_B6;
+#else
+#error "Unsupported 2026 H project mode"
+#endif
 }
 
-static const char *H2024_ButtonActionName(CarButtonAction action)
+static const char *H2026_ButtonActionName(CarButtonAction action)
 {
     switch (action) {
         case CAR_BUTTON_ACTION_ARM_OK:
@@ -145,7 +53,8 @@ static const char *H2024_ButtonActionName(CarButtonAction action)
     }
 }
 
-static const char *H2024_GrayCalName(CarGrayCalibrationState state)
+static const char *H2026_GrayCalibrationName(
+    CarGrayCalibrationState state)
 {
     switch (state) {
         case CAR_GRAY_CAL_WAIT_WHITE:
@@ -165,36 +74,36 @@ static const char *H2024_GrayCalName(CarGrayCalibrationState state)
     }
 }
 
-static const char *H2024_RouteExitName(CarRouteExitReason reason)
+static const char *H2026_RouteExitName(CarRouteExitReason reason)
 {
     switch (reason) {
-        case CAR_ROUTE_EXIT_LINE:
-            return "LINE";
         case CAR_ROUTE_EXIT_DISTANCE:
             return "DIST";
-        case CAR_ROUTE_EXIT_ANGLE:
-            return "ANGLE";
-        case CAR_ROUTE_EXIT_REACQUIRE:
-            return "REACQ";
+        case CAR_ROUTE_EXIT_FINISH_MARKER:
+            return "MARK";
         case CAR_ROUTE_EXIT_LINE_MISS:
             return "MISS";
+        case CAR_ROUTE_EXIT_TIMEOUT:
+            return "TIME";
         case CAR_ROUTE_EXIT_NONE:
         default:
             return "-";
     }
 }
 
-static int32_t H2024_ToTenths(float value)
+static int32_t H2026_ToTenths(float value)
 {
     float scaled = value * 10.0f;
 
     return (int32_t)(scaled + ((scaled >= 0.0f) ? 0.5f : -0.5f));
 }
 
-static void H2024_ShowFixed1(uint8_t page, const char *prefix, float value)
+static void H2026_ShowFixed1(uint8_t page,
+                             const char *prefix,
+                             float value)
 {
     char line[22];
-    int32_t scaled = H2024_ToTenths(value);
+    int32_t scaled = H2026_ToTenths(value);
     uint32_t magnitude;
     char sign = (scaled < 0) ? '-' : '+';
 
@@ -209,18 +118,18 @@ static void H2024_ShowFixed1(uint8_t page, const char *prefix, float value)
     (void)OLED_ShowString(0U, page, line);
 }
 
-static void H2024_InitOled(void)
+static void H2026_InitOled(void)
 {
     OLED_Config config = OLED_MakeSSD1306Config(OLED_DEFAULT_ADDR_7BIT);
 
-    gH2024OledStatus = OLED_Init(&config);
-    if (gH2024OledStatus == OLED_STATUS_ERROR_I2C_ADDRESS_NACK) {
+    g_oled_status = OLED_Init(&config);
+    if (g_oled_status == OLED_STATUS_ERROR_I2C_ADDRESS_NACK) {
         config = OLED_MakeSSD1306Config(0x3DU);
-        gH2024OledStatus = OLED_Init(&config);
+        g_oled_status = OLED_Init(&config);
     }
 }
 
-static void H2024_RefreshOled(const CarFirmware *firmware,
+static void H2026_RefreshOled(const CarFirmware *firmware,
                               uint32_t now_ms)
 {
     static uint32_t last_render_ms;
@@ -228,63 +137,54 @@ static void H2024_RefreshOled(const CarFirmware *firmware,
     static uint8_t tx_page = OLED_PAGE_COUNT;
     char line[22];
     uint32_t faults;
-    const char *segment_state;
+    const char *run_state;
 
     if ((firmware == 0) || !OLED_IsInitialized() ||
-        (gH2024OledStatus != OLED_STATUS_OK)) {
+        (g_oled_status != OLED_STATUS_OK)) {
         return;
     }
 
-    if (gH2024OledRefreshRequested ||
+    if (g_oled_refresh_requested ||
         ((tx_page >= OLED_PAGE_COUNT) &&
          ((uint32_t)(now_ms - last_render_ms) >=
-          H2024_OLED_RENDER_PERIOD_MS))) {
+          H2026_OLED_RENDER_PERIOD_MS))) {
         last_render_ms = now_ms;
-        gH2024OledRefreshRequested = false;
+        g_oled_refresh_requested = false;
         tx_page = 0U;
-
         faults = firmware->hardware_faults | firmware->output.faults;
-        segment_state = firmware->app.executor.finished ? "DONE" :
-                        (firmware->app.executor.running ? "RUN" : "STOP");
+        run_state = firmware->app.executor.finished ? "DONE" :
+                    (firmware->app.executor.running ? "RUN" : "STOP");
+
         (void)OLED_Clear();
-#if ((PROJECT_MODE >= PROJECT_MODE_H2026_B2) && \
-     (PROJECT_MODE <= PROJECT_MODE_H2026_B6))
-        (void)snprintf(line, sizeof(line), "%s %s T:%lu.%02lu",
-                       H2024_ModeName(firmware->config.mode), segment_state,
+        (void)snprintf(line, sizeof(line), "H26%s %s T:%lu.%02lu",
+                       H2026_ModeName(firmware->config.mode), run_state,
                        (unsigned long)(firmware->output.run_time_ms / 1000U),
                        (unsigned long)((firmware->output.run_time_ms / 10U) %
                                        100U));
-#elif (PROJECT_MODE >= PROJECT_MODE_H2026_ITEM_1) && \
-      (PROJECT_MODE <= PROJECT_MODE_H2026_ITEM_4)
-        (void)snprintf(line, sizeof(line), "%s %s V49",
-                       H2024_ModeName(firmware->config.mode), segment_state);
-#else
-        (void)snprintf(line, sizeof(line), "%s %s TB",
-                       H2024_ModeName(firmware->config.mode), segment_state);
-#endif
         (void)OLED_ShowString(0U, 0U, line);
         (void)snprintf(line, sizeof(line), "IMU:%s GC:%s",
                        firmware->yaw.calibrated ? "OK" : "WAIT",
-                       H2024_GrayCalName(firmware->gray_cal_state));
+                       H2026_GrayCalibrationName(firmware->gray_cal_state));
         (void)OLED_ShowString(0U, 1U, line);
-        H2024_ShowFixed1(2U, "YAW:", firmware->imu_sample.yaw_deg);
+        H2026_ShowFixed1(2U, "YAW:", firmware->imu_sample.yaw_deg);
         (void)snprintf(line, sizeof(line), "SEG:%02u P:%u X:%s",
                        (unsigned)firmware->app.executor.index,
-                       (unsigned)firmware->app.executor.line_follow_phase,
-                       H2024_RouteExitName(
-                           firmware->app.executor.last_motion_exit_reason));
+                       (unsigned)firmware->app.executor.track_phase,
+                       H2026_RouteExitName(
+                           firmware->app.executor.last_exit_reason));
         (void)OLED_ShowString(0U, 3U, line);
         (void)snprintf(line, sizeof(line), "K:%u%u%u B:%lu %s",
                        TiMspm0Platform_ReadKey1Level() ? 1U : 0U,
                        TiMspm0Platform_ReadKey2Level() ? 1U : 0U,
                        TiMspm0Platform_ReadKey3Level() ? 1U : 0U,
                        (unsigned long)firmware->button_event_count,
-                       H2024_ButtonActionName(firmware->last_button_action));
+                       H2026_ButtonActionName(firmware->last_button_action));
         (void)OLED_ShowString(0U, 4U, line);
         if ((firmware->gray_cal_state == CAR_GRAY_CAL_CAPTURE_WHITE) ||
             (firmware->gray_cal_state == CAR_GRAY_CAL_CAPTURE_BLACK)) {
             (void)snprintf(line, sizeof(line), "GC:%s %u/%u",
-                           H2024_GrayCalName(firmware->gray_cal_state),
+                           H2026_GrayCalibrationName(
+                               firmware->gray_cal_state),
                            (unsigned)firmware->gray_cal_frame_count,
                            (unsigned)CAR_GRAY_CALIBRATION_FRAMES);
         } else if (firmware->gray_cal_state == CAR_GRAY_CAL_ERROR) {
@@ -294,9 +194,9 @@ static void H2024_RefreshOled(const CarFirmware *firmware,
         } else {
             (void)snprintf(line, sizeof(line), "LN:%c C:%u A:%u M:%02X",
                            firmware->app.line.valid ? 'Y' : 'N',
-                           (unsigned)firmware->app.line.confidence,
-                           (unsigned)firmware->app.line.active_count,
-                           (unsigned)firmware->app.line.active_mask);
+                           (unsigned)firmware->app.line.track_confidence,
+                           (unsigned)firmware->app.line.track_active_count,
+                           (unsigned)firmware->app.line.track_active_mask);
         }
         (void)OLED_ShowString(0U, 5U, line);
         (void)snprintf(line, sizeof(line), "PWM:%d/%d",
@@ -308,135 +208,84 @@ static void H2024_RefreshOled(const CarFirmware *firmware,
     }
 
     if ((tx_page >= OLED_PAGE_COUNT) ||
-        ((uint32_t)(now_ms - last_tx_ms) < H2024_OLED_TX_PERIOD_MS)) {
+        ((uint32_t)(now_ms - last_tx_ms) < H2026_OLED_TX_PERIOD_MS)) {
         return;
     }
     last_tx_ms = now_ms;
     if (OLED_UpdatePages(tx_page, 1U) != OLED_STATUS_OK) {
-        gH2024OledStatus = OLED_STATUS_ERROR_I2C_BUS;
+        g_oled_status = OLED_STATUS_ERROR_I2C_BUS;
         return;
     }
     tx_page++;
 }
 
-static H2024Mode GetH2024Mode(void)
-{
-#if PROJECT_MODE == PROJECT_MODE_H2024_ITEM_1
-    return H2024_MODE_ITEM_1;
-#elif PROJECT_MODE == PROJECT_MODE_H2024_ITEM_2
-    return H2024_MODE_ITEM_2;
-#elif PROJECT_MODE == PROJECT_MODE_H2024_ITEM_3
-    return H2024_MODE_ITEM_3;
-#elif PROJECT_MODE == PROJECT_MODE_TURN_DEBUG
-    return H2024_MODE_TURN_DEBUG;
-#elif PROJECT_MODE == PROJECT_MODE_H2026_ITEM_1
-    return H2026_MODE_ITEM_1;
-#elif PROJECT_MODE == PROJECT_MODE_H2026_ITEM_2
-    return H2026_MODE_ITEM_2;
-#elif PROJECT_MODE == PROJECT_MODE_H2026_ITEM_3
-    return H2026_MODE_ITEM_3;
-#elif PROJECT_MODE == PROJECT_MODE_H2026_ITEM_4
-    /* PROJECT_MODE_H2026_MAIN aliases the final three-lap route. */
-    return H2026_MODE_ITEM_4;
-#elif PROJECT_MODE == PROJECT_MODE_H2026_B2
-    return H2026_MODE_B2;
-#elif PROJECT_MODE == PROJECT_MODE_H2026_B3
-    return H2026_MODE_B3;
-#elif PROJECT_MODE == PROJECT_MODE_H2026_B4
-    return H2026_MODE_B4;
-#elif PROJECT_MODE == PROJECT_MODE_H2026_B5
-    return H2026_MODE_B5;
-#elif PROJECT_MODE == PROJECT_MODE_H2026_B6
-    return H2026_MODE_B6;
-#else
-    return H2024_MODE_ITEM_4;
-#endif
-}
-
-static void RunH2024Firmware(void)
+static void H2026_RunFirmware(void)
 {
     CarFirmwareConfig config;
     CarStatus status;
     uint32_t last_telemetry_ms = 0U;
-    uint16_t last_telemetry_index = UINT16_MAX;
-    CarLineFollowPhase last_telemetry_phase =
-        (CarLineFollowPhase)UINT8_MAX;
-    CarRouteExitReason last_telemetry_exit =
+    uint16_t last_route_index = UINT16_MAX;
+    CarTrackPhase last_track_phase = (CarTrackPhase)UINT8_MAX;
+    CarRouteExitReason last_exit_reason =
         (CarRouteExitReason)UINT8_MAX;
-    bool last_telemetry_candidate = false;
-    uint8_t last_telemetry_event_streak = UINT8_MAX;
-    uint8_t last_telemetry_reacquire_streak = UINT8_MAX;
+    uint32_t last_faults = UINT32_MAX;
 
     TiMspm0Platform_Init();
-    H2024_InitOled();
-    status = TiMspm0Platform_BuildConfig(&config, GetH2024Mode());
+    H2026_InitOled();
+    status = TiMspm0Platform_BuildConfig(&config, H2026_SelectedMode());
     if (status == CAR_OK) {
-        status = CarFirmware_Init(
-            &gFirmware, &config, TiMspm0Platform_Millis());
+        status = CarFirmware_Init(&g_firmware, &config,
+                                  TiMspm0Platform_Millis());
     }
     if (status != CAR_OK) {
         while (1) {
             __WFI();
         }
     }
-    VofaTelemetry_RouteCommandInit();
-    NVIC_ClearPendingIRQ(UART_BLUETOOTH_INST_INT_IRQN);
-    NVIC_EnableIRQ(UART_BLUETOOTH_INST_INT_IRQN);
-    VofaTelemetry_SendRouteBanner();
+
+    VofaTelemetry_Init();
+    NVIC_ClearPendingIRQ(UART_VOFA_INST_INT_IRQN);
+    NVIC_EnableIRQ(UART_VOFA_INST_INT_IRQN);
+    VofaTelemetry_SendBanner();
 
     while (1) {
         uint32_t now_ms = TiMspm0Platform_Millis();
-        bool telemetry_event;
+        uint32_t faults;
         bool command_event;
+        bool telemetry_event;
 
-        command_event =
-            VofaTelemetry_ProcessRouteCommands(&gFirmware, now_ms);
-        TiMspm0Platform_PollMotorRx(&gFirmware);
-        CarFirmware_Tick(&gFirmware, now_ms);
-        TiMspm0Platform_ServiceMotorBackend();
+        command_event = VofaTelemetry_ProcessCommands(&g_firmware, now_ms);
+        CarFirmware_Tick(&g_firmware, now_ms);
+        faults = g_firmware.hardware_faults | g_firmware.output.faults;
         telemetry_event =
             command_event ||
-            (gFirmware.app.executor.index != last_telemetry_index) ||
-            (gFirmware.app.executor.line_follow_phase !=
-             last_telemetry_phase) ||
-            (gFirmware.app.executor.last_motion_exit_reason !=
-             last_telemetry_exit) ||
-            (gFirmware.app.executor.line_corner_candidate !=
-             last_telemetry_candidate) ||
-            (gFirmware.app.executor.line_event_streak !=
-             last_telemetry_event_streak) ||
-            (gFirmware.app.executor.turn_line_reacquire_streak !=
-             last_telemetry_reacquire_streak);
+            (g_firmware.app.executor.index != last_route_index) ||
+            (g_firmware.app.executor.track_phase != last_track_phase) ||
+            (g_firmware.app.executor.last_exit_reason != last_exit_reason) ||
+            (faults != last_faults);
         if (telemetry_event ||
             ((uint32_t)(now_ms - last_telemetry_ms) >=
-             H2024_ROUTE_TELEMETRY_PERIOD_MS)) {
-            VofaTelemetry_SendRoute(&gFirmware, now_ms);
+             H2026_TELEMETRY_PERIOD_MS)) {
+            VofaTelemetry_SendFrame(&g_firmware, now_ms);
             last_telemetry_ms = now_ms;
-            last_telemetry_index = gFirmware.app.executor.index;
-            last_telemetry_phase =
-                gFirmware.app.executor.line_follow_phase;
-            last_telemetry_exit =
-                gFirmware.app.executor.last_motion_exit_reason;
-            last_telemetry_candidate =
-                gFirmware.app.executor.line_corner_candidate;
-            last_telemetry_event_streak =
-                gFirmware.app.executor.line_event_streak;
-            last_telemetry_reacquire_streak =
-                gFirmware.app.executor.turn_line_reacquire_streak;
+            last_route_index = g_firmware.app.executor.index;
+            last_track_phase = g_firmware.app.executor.track_phase;
+            last_exit_reason = g_firmware.app.executor.last_exit_reason;
+            last_faults = faults;
         }
-        H2024_RefreshOled(&gFirmware, now_ms);
+        H2026_RefreshOled(&g_firmware, now_ms);
         __WFI();
     }
 }
 
-void UART_BLUETOOTH_INST_IRQHandler(void)
+void UART_VOFA_INST_IRQHandler(void)
 {
-    switch (DL_UART_Main_getPendingInterrupt(UART_BLUETOOTH_INST)) {
+    switch (DL_UART_Main_getPendingInterrupt(UART_VOFA_INST)) {
         case DL_UART_MAIN_IIDX_RX:
-            while (!DL_UART_Main_isRXFIFOEmpty(UART_BLUETOOTH_INST)) {
-                VofaTelemetry_RouteCommandPushRxFromIsr(
+            while (!DL_UART_Main_isRXFIFOEmpty(UART_VOFA_INST)) {
+                VofaTelemetry_PushRxFromIsr(
                     (uint8_t)DL_UART_Main_receiveData(
-                        UART_BLUETOOTH_INST));
+                        UART_VOFA_INST));
             }
             break;
         case DL_UART_MAIN_IIDX_TX:
@@ -447,21 +296,11 @@ void UART_BLUETOOTH_INST_IRQHandler(void)
     }
 }
 
-#endif
-
 int main(void)
 {
     SYSCFG_DL_init();
     DL_SYSTICK_config(CPUCLK_FREQ / 1000U);
-
-#if PROJECT_MODE == PROJECT_MODE_GRAY_ADC_DEBUG
-    GrayAdcDebug_Run();
-#elif PROJECT_MODE == PROJECT_MODE_BLUETOOTH_TUNING
-    RunBluetoothTuning();
-#else
-    RunH2024Firmware();
-#endif
-
+    H2026_RunFirmware();
     return 0;
 }
 

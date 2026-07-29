@@ -36,33 +36,12 @@ static void set_pwm(int8_t leftPercent, int8_t rightPercent)
         percent_to_compare(rightPercent), GPIO_PWM_TB1_C2_IDX);
 }
 
-static int8_t units_to_percent(int16_t units,
-                               int16_t units_at_max_duty)
-{
-    int32_t scaled;
-    int32_t denominator = (units_at_max_duty > 0) ?
-        units_at_max_duty : 350;//规定映射
-
-    scaled = (int32_t)units * (int32_t)TB6612_MAX_DUTY_PERCENT;
-    if (scaled >= 0) {
-        scaled = (scaled + denominator / 2) / denominator;
-    } else {
-        scaled = (scaled - denominator / 2) / denominator;
-    }
-    if (scaled > (int32_t)TB6612_MAX_DUTY_PERCENT) {
-        scaled = TB6612_MAX_DUTY_PERCENT;
-    } else if (scaled < -(int32_t)TB6612_MAX_DUTY_PERCENT) {
-        scaled = -(int32_t)TB6612_MAX_DUTY_PERCENT;
-    }
-    return (int8_t)scaled;
-}
-
 static int32_t round_signed(float value)
 {
     return (int32_t)(value + ((value >= 0.0f) ? 0.5f : -0.5f));
 }
 
-static int32_t speed_to_rpm(const TB6612MotorBoardContext *context,
+static int32_t speed_to_rpm(const TB6612Drive *context,
                             int16_t speed_mm_s)
 {
     float circumference_mm = TB6612_PI_F *
@@ -165,7 +144,7 @@ static int8_t run_speed_pid(const TB6612SpeedLoopConfig *config,
     return (int8_t)output;
 }
 
-static void reset_speed_loop_state(TB6612MotorBoardContext *context)
+static void reset_speed_loop_state(TB6612Drive *context)
 {
     context->target_left_rpm = 0;
     context->target_right_rpm = 0;
@@ -182,7 +161,7 @@ static void reset_speed_loop_state(TB6612MotorBoardContext *context)
     context->speed_filter_ready = false;
 }
 
-static void update_speed_loop(TB6612MotorBoardContext *context,
+static void update_speed_loop(TB6612Drive *context,
                               uint32_t now_ms,
                               uint32_t elapsed_ms)
 {
@@ -234,11 +213,6 @@ static void update_speed_loop(TB6612MotorBoardContext *context,
     TB6612_SetMotors(left_output, right_output);
     context->update_count++;
 }
-//units_at_max_duty这个参数的意思是最大占空比的时候的这个对应的速度，单位是mm/s,但是现在是开环，也从来没有测试过，以后变成闭环
-// 占空比% = 速度指令 / 350 × 80
-//现在速度的规定映射是 350 ，对应最大占空比是80
-//也是很好理解 速度350对应百分之80，那么要求一个指定速度，对应除以速度350即可再乘以80
-//所以想要多少占空比就是这个规定映射乘以对应的百分比即可
 static void set_left_direction(int8_t percent)
 {//先都清零，clear函数是清零的：确保没有一瞬间都是1，这个叫刹车状态（电机两端短接，强行按住）会有卡顿和异响
     //然后根据我们这个left的值来确定正反转和我们要的前进方向的关系
@@ -322,22 +296,20 @@ int8_t TB6612_GetRightCommand(void)
     return gRightCommand;
 }
 
-void TB6612_MotorBoardContextInit(TB6612MotorBoardContext *context,
-                                  TB6612NowFn now_ms,
-                                  void *now_context,
-                                  int16_t speed_units_at_max_duty)
+void TB6612_DriveInit(TB6612Drive *context,
+                      TB6612NowFn now_ms,
+                      void *now_context)
 {
     if (context == 0) {
         return;
     }
-    *context = (TB6612MotorBoardContext){0};
+    *context = (TB6612Drive){0};
     context->now_ms = now_ms;
     context->now_context = now_context;
-    context->speed_units_at_max_duty = speed_units_at_max_duty;
 }
 
-bool TB6612_MotorBoardConfigureSpeedLoop(
-    TB6612MotorBoardContext *context,
+bool TB6612_DriveConfigureSpeedLoop(
+    TB6612Drive *context,
     const TB6612SpeedLoopConfig *config)
 {
     CarMotionWatchdogConfig watchdog_config;
@@ -369,8 +341,8 @@ bool TB6612_MotorBoardConfigureSpeedLoop(
     return true;
 }
 
-bool TB6612_MotorBoardGetSpeedLoopConfig(
-    const TB6612MotorBoardContext *context,
+bool TB6612_DriveGetSpeedLoopConfig(
+    const TB6612Drive *context,
     TB6612SpeedLoopConfig *config)
 {
     if ((context == 0) || (config == 0) ||
@@ -381,8 +353,8 @@ bool TB6612_MotorBoardGetSpeedLoopConfig(
     return true;
 }
 
-bool TB6612_MotorBoardUpdateSpeedLoopTuning(
-    TB6612MotorBoardContext *context,
+bool TB6612_DriveUpdateSpeedLoopTuning(
+    TB6612Drive *context,
     uint32_t kp_milli,
     uint32_t ki_milli,
     uint32_t kd_milli,
@@ -410,8 +382,8 @@ bool TB6612_MotorBoardUpdateSpeedLoopTuning(
     return true;
 }
 
-void TB6612_MotorBoardGetSpeedLoopStatus(
-    const TB6612MotorBoardContext *context,
+void TB6612_DriveGetSpeedLoopStatus(
+    const TB6612Drive *context,
     TB6612SpeedLoopStatus *status)
 {
     if (status == 0) {
@@ -434,7 +406,7 @@ void TB6612_MotorBoardGetSpeedLoopStatus(
     status->sample_elapsed_ms = context->last_sample_elapsed_ms;
 }
 
-void TB6612_MotorBoardService(TB6612MotorBoardContext *context)
+void TB6612_DriveService(TB6612Drive *context)
 {
     uint32_t now_ms;
     uint32_t elapsed_ms;
@@ -462,59 +434,51 @@ void TB6612_MotorBoardService(TB6612MotorBoardContext *context)
     }
 }
 
-bool TB6612_MotorBoard_SetWheelSpeeds(int16_t left,
-                                      int16_t right,
-                                      void *context)
+bool TB6612_DriveSetWheelSpeeds(int16_t left,
+                                int16_t right,
+                                void *context)
 {
-    TB6612MotorBoardContext *adapter = (TB6612MotorBoardContext *)context;
-    int16_t scale = (adapter == 0) ? 350 :
-                    adapter->speed_units_at_max_duty;
+    TB6612Drive *adapter = (TB6612Drive *)context;
+    int32_t old_left_target;
+    int32_t old_right_target;
 
-    if ((adapter != 0) && adapter->speed_loop_enabled) {
-        int32_t old_left_target = adapter->target_left_rpm;
-        int32_t old_right_target = adapter->target_right_rpm;
-
-        if ((left == 0) && (right == 0)) {
-            reset_speed_loop_state(adapter);
-            CarMotionWatchdog_Reset(&adapter->motion_watchdog);
-            TB6612_Stop();
-            return true;
-        }
-        adapter->target_left_rpm = speed_to_rpm(adapter, left);
-        adapter->target_right_rpm = speed_to_rpm(adapter, right);
-        if (((old_left_target < 0) != (adapter->target_left_rpm < 0)) ||
-            ((old_left_target == 0) != (adapter->target_left_rpm == 0))) {
-            adapter->left_integral_milli = 0;
-            adapter->left_previous_error = 0;
-        }
-        if (((old_right_target < 0) != (adapter->target_right_rpm < 0)) ||
-            ((old_right_target == 0) != (adapter->target_right_rpm == 0))) {
-            adapter->right_integral_milli = 0;
-            adapter->right_previous_error = 0;
-        }
-
-        TB6612_MotorBoardService(adapter);
+    if ((adapter == 0) || !adapter->speed_loop_enabled) {
+        return false;
+    }
+    old_left_target = adapter->target_left_rpm;
+    old_right_target = adapter->target_right_rpm;
+    if ((left == 0) && (right == 0)) {
+        reset_speed_loop_state(adapter);
+        CarMotionWatchdog_Reset(&adapter->motion_watchdog);
+        TB6612_Stop();
         return true;
     }
+    adapter->target_left_rpm = speed_to_rpm(adapter, left);
+    adapter->target_right_rpm = speed_to_rpm(adapter, right);
+    if (((old_left_target < 0) != (adapter->target_left_rpm < 0)) ||
+        ((old_left_target == 0) != (adapter->target_left_rpm == 0))) {
+        adapter->left_integral_milli = 0;
+        adapter->left_previous_error = 0;
+    }
+    if (((old_right_target < 0) != (adapter->target_right_rpm < 0)) ||
+        ((old_right_target == 0) != (adapter->target_right_rpm == 0))) {
+        adapter->right_integral_milli = 0;
+        adapter->right_previous_error = 0;
+    }
 
-    TB6612_SetMotors(units_to_percent(left, scale),
-                     units_to_percent(right, scale));
+    TB6612_DriveService(adapter);
     return true;
 }
 
-bool TB6612_MotorBoard_GetEncoder(int16_t *left,
-                                  int16_t *right,
-                                  uint32_t *timestamp_ms,
-                                  void *context)
+bool TB6612_DriveReadEncoder(CarEncoderSample *sample, void *context)
 {
-    TB6612MotorBoardContext *adapter = (TB6612MotorBoardContext *)context;
+    TB6612Drive *adapter = (TB6612Drive *)context;
     CarMotionWatchdogResult watchdog_result = {true, true};
     int32_t left_count;
     int32_t right_count;
     uint32_t now_ms;
 
-    if ((left == 0) || (right == 0) || (timestamp_ms == 0) ||
-        (adapter == 0) || (adapter->now_ms == 0)) {
+    if ((sample == 0) || (adapter == 0) || (adapter->now_ms == 0)) {
         return false;
     }
     left_count = Encoder_GetLeftCount();
@@ -534,8 +498,9 @@ bool TB6612_MotorBoard_GetEncoder(int16_t *left,
             return false;
         }
     }
-    *left = (int16_t)left_count;
-    *right = (int16_t)right_count;
-    *timestamp_ms = now_ms;
+    sample->left_count = (int16_t)left_count;
+    sample->right_count = (int16_t)right_count;
+    sample->timestamp_ms = now_ms;
+    sample->valid = true;
     return true;
 }

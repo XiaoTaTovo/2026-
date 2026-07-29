@@ -1,5 +1,5 @@
-#ifndef H2024_GRAY_ARRAY_H
-#define H2024_GRAY_ARRAY_H
+#ifndef GRAY_ARRAY_H
+#define GRAY_ARRAY_H
 
 #include <stdbool.h>
 #include <stdint.h>

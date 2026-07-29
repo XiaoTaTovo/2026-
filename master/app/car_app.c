@@ -1,6 +1,5 @@
 #include "app/car_app.h"
 
-#include "app/h2026_task.h"
 #include "core/safety_supervisor.h"
 
 static void CarApp_FillTiming(const CarApp *app,
@@ -45,27 +44,29 @@ CarStatus CarApp_Init(CarApp *app, const CarConfig *config)
 }
 
 CarStatus CarApp_Arm(CarApp *app,
-                     H2024Mode mode,
+                     H2026Mode mode,
                      uint32_t now_ms,
                      const CarInputSnapshot *input)
 {
     CarStatus status;
 
-    if ((app == 0) || (input == 0) || !input->encoder.valid || !input->imu.valid) {
+    if ((app == 0) || (input == 0) || !input->encoder.valid ||
+        !input->imu.valid) {
         return CAR_ERROR_ARG;
     }
     CarOdometry_Init(&app->odometry);
-    status = CarOdometry_Update(&app->odometry, &app->config, &input->encoder);
+    status = CarOdometry_Update(&app->odometry, &app->config,
+                                &input->encoder);
     if (status != CAR_OK) {
         return status;
     }
-    status = H2024_BuildRoute(mode, &app->config, &app->route);
+    status = H2026_BuildRoute(mode, &app->config, &app->route);
     if (status != CAR_OK) {
         app->faults |= CAR_FAULT_ROUTE_INVALID;
         return status;
     }
     status = CarRouteExecutor_Start(&app->executor, &app->route, now_ms,
-                                    &app->odometry, input->imu.yaw_deg);
+                                    &app->odometry);
     if (status == CAR_OK) {
         app->faults = CAR_FAULT_NONE;
         app->mode = mode;
@@ -88,25 +89,24 @@ CarStatus CarApp_Update(CarApp *app,
     CarMotorCommand motor = {0};
     CarCue cue = CAR_CUE_NONE;
     bool gray_required;
-    uint32_t current_faults;
-    uint16_t previous_route_index;
 
     if ((app == 0) || (input == 0) || (output == 0)) {
         return CAR_ERROR_ARG;
     }
     *output = (CarOutputSnapshot){0};
-
     if (input->encoder.valid) {
-        (void)CarOdometry_Update(&app->odometry, &app->config, &input->encoder);
+        (void)CarOdometry_Update(&app->odometry, &app->config,
+                                 &input->encoder);
     }
     if (input->gray.valid) {
-        (void)CarLineEstimator_Update(&app->config, &input->gray, &app->line);
+        (void)CarLineEstimator_Update(&app->config, &input->gray,
+                                      &app->line);
     }
 
     gray_required = CarRouteExecutor_GrayRequired(&app->executor);
-    current_faults = CarSafety_Evaluate(&app->config, now_ms, input,
-                                        app->executor.running, gray_required);
-    app->faults |= current_faults;
+    app->faults |= CarSafety_Evaluate(&app->config, now_ms, input,
+                                      app->executor.running,
+                                      gray_required);
     if (app->faults != CAR_FAULT_NONE) {
         CarApp_LatchStoppedTime(app, now_ms);
         app->armed = false;
@@ -116,7 +116,6 @@ CarStatus CarApp_Update(CarApp *app,
         CarApp_FillTiming(app, now_ms, output);
         return CAR_ERROR_STATE;
     }
-
     if (!app->armed) {
         output->faults = app->faults;
         output->route_index = app->executor.index;
@@ -126,28 +125,19 @@ CarStatus CarApp_Update(CarApp *app,
         return CAR_OK;
     }
 
-    previous_route_index = app->executor.index;
     status = CarRouteExecutor_Update(&app->executor, &app->config, now_ms,
-                                     &app->odometry, input->imu.yaw_deg,
-                                     &app->line, &motor, &cue, &app->faults);
+                                     &app->odometry, &app->line, &motor,
+                                     &cue, &app->faults);
     if (app->faults != CAR_FAULT_NONE) {
         motor = (CarMotorCommand){0};
         cue = CAR_CUE_FAULT;
         CarApp_LatchStoppedTime(app, now_ms);
         app->armed = false;
     }
-
-    if (!app->result_valid) {
-        bool b4_checkpoint = (app->mode == H2026_MODE_B4) &&
-            (previous_route_index == 1U) &&
-            (app->executor.index == 2U);
-        bool stopped_at_result = H2026_ModeIsOfficial(app->mode) &&
-            CarApp_CurrentSegmentIsStop(app) && !motor.enable;
-
-        if (b4_checkpoint || stopped_at_result) {
-            app->result_time_ms = (uint32_t)(now_ms - app->run_start_ms);
-            app->result_valid = true;
-        }
+    if (!app->result_valid && H2026_ModeIsOfficial(app->mode) &&
+        CarApp_CurrentSegmentIsStop(app) && !motor.enable) {
+        app->result_time_ms = (uint32_t)(now_ms - app->run_start_ms);
+        app->result_valid = true;
     }
 
     output->motor = motor;

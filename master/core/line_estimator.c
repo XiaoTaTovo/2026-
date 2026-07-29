@@ -75,9 +75,9 @@ CarStatus CarLineEstimator_Update(const CarConfig *config,
         }
     }
 
-    /* The two darkest channels estimate the local floor. Subtracting this
-     * floor makes a thin coherent peak survive illumination drift without
-     * changing the legacy absolute-threshold result above. */
+    /* The two lowest-response channels estimate the local floor. Subtracting this
+     * floor makes a thin coherent peak survive illumination drift while the
+     * absolute channels remain available for final-marker detection. */
     estimate->adaptive_background = (uint16_t)(
         ((uint32_t)minimum_1 + (uint32_t)minimum_2) / 2U);
     estimate->adaptive_contrast = (maximum > estimate->adaptive_background) ?
@@ -115,9 +115,8 @@ CarStatus CarLineEstimator_Update(const CarConfig *config,
     }
 
     /* A broad footprint is WIDE only when even its two darkest channels are
-     * strongly black. This rejects a true all-black area with local variation,
-     * while preserving a narrow peak on a raised but still white background
-     * where the legacy low threshold can also produce mask 0xFF. */
+     * strongly black. This rejects local variation inside a black marker and
+     * preserves a narrow peak on a raised but still white background. */
     if ((config->gray_wide_min_active > 0U) &&
         (active_count >= config->gray_wide_min_active) &&
         (estimate->adaptive_background >=
@@ -147,9 +146,8 @@ CarStatus CarLineEstimator_Update(const CarConfig *config,
         (uint8_t)(last_active - first_active + 1U);
     if ((sum >= config->gray_min_confidence) && (active_count > 0U)) {
         int32_t position = weighted_sum / (int32_t)sum;
-        /* 改造3：减去标定的中心偏移，把传感器零点漂移补偿掉，
-         * 使 position==0 真正对应车体中线。offset 默认 0 时行为与旧版一致。
-         * 减完后夹到 int16_t 范围，避免极端标定值造成溢出。 */
+        /* 减去标定的中心偏移，使 position==0 对应车体中线；随后夹到
+         * int16_t 范围，避免极端标定值造成溢出。 */
         position -= (int32_t)config->gray_center_offset;
         estimate->position = CarLine_ClampPosition(position);
         estimate->valid = true;

@@ -4,13 +4,14 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "car_types.h"
 #include "core/motion_watchdog.h"
 
-#define TB6612_PWM_PERIOD_TICKS       (1600U)
-#define TB6612_MAX_DUTY_PERCENT       (80U)//最大占空比
+#define TB6612_PWM_PERIOD_TICKS (1600U)
+#define TB6612_MAX_DUTY_PERCENT (80U)
 
-/* Set a value to 0 if that wheel's vehicle-forward direction is reversed. */
-#define TB6612_LEFT_FORWARD_IN1_HIGH  (0)
+/* Set to 1 when IN1=High is physical forward, otherwise set to 0. */
+#define TB6612_LEFT_FORWARD_IN1_HIGH (0)
 #define TB6612_RIGHT_FORWARD_IN1_HIGH (0)
 
 typedef uint32_t (*TB6612NowFn)(void *context);
@@ -48,7 +49,6 @@ typedef struct {
 typedef struct {
     TB6612NowFn now_ms;
     void *now_context;
-    int16_t speed_units_at_max_duty;
     TB6612SpeedLoopConfig speed_loop;
     CarMotionWatchdog motion_watchdog;
     int32_t target_left_rpm;
@@ -70,40 +70,32 @@ typedef struct {
     bool motion_watchdog_enabled;
     bool encoder_sample_ready;
     bool speed_filter_ready;
-} TB6612MotorBoardContext;
+} TB6612Drive;
 
 void TB6612_Init(void);
 void TB6612_Stop(void);
-void TB6612_SetMotors(int8_t leftPercent, int8_t rightPercent);
+void TB6612_SetMotors(int8_t left_percent, int8_t right_percent);
 int8_t TB6612_GetLeftCommand(void);
 int8_t TB6612_GetRightCommand(void);
 
-void TB6612_MotorBoardContextInit(TB6612MotorBoardContext *context,
-                                  TB6612NowFn now_ms,
-                                  void *now_context,
-                                  int16_t speed_units_at_max_duty);
-bool TB6612_MotorBoardConfigureSpeedLoop(
-    TB6612MotorBoardContext *context,
-    const TB6612SpeedLoopConfig *config);
-bool TB6612_MotorBoardGetSpeedLoopConfig(
-    const TB6612MotorBoardContext *context,
-    TB6612SpeedLoopConfig *config);
-bool TB6612_MotorBoardUpdateSpeedLoopTuning(
-    TB6612MotorBoardContext *context,
-    uint32_t kp_milli,
-    uint32_t ki_milli,
-    uint32_t kd_milli,
-    uint8_t output_limit_percent);
-void TB6612_MotorBoardGetSpeedLoopStatus(
-    const TB6612MotorBoardContext *context,
-    TB6612SpeedLoopStatus *status);
-void TB6612_MotorBoardService(TB6612MotorBoardContext *context);
-bool TB6612_MotorBoard_SetWheelSpeeds(int16_t left,
-                                      int16_t right,
-                                      void *context);
-bool TB6612_MotorBoard_GetEncoder(int16_t *left,
-                                  int16_t *right,
-                                  uint32_t *timestamp_ms,
-                                  void *context);
+void TB6612_DriveInit(TB6612Drive *drive,
+                      TB6612NowFn now_ms,
+                      void *now_context);
+bool TB6612_DriveConfigureSpeedLoop(TB6612Drive *drive,
+                                    const TB6612SpeedLoopConfig *config);
+bool TB6612_DriveGetSpeedLoopConfig(const TB6612Drive *drive,
+                                    TB6612SpeedLoopConfig *config);
+bool TB6612_DriveUpdateSpeedLoopTuning(TB6612Drive *drive,
+                                       uint32_t kp_milli,
+                                       uint32_t ki_milli,
+                                       uint32_t kd_milli,
+                                       uint8_t output_limit_percent);
+void TB6612_DriveGetSpeedLoopStatus(const TB6612Drive *drive,
+                                    TB6612SpeedLoopStatus *status);
+void TB6612_DriveService(TB6612Drive *drive);
+bool TB6612_DriveSetWheelSpeeds(int16_t left_mm_s,
+                                int16_t right_mm_s,
+                                void *context);
+bool TB6612_DriveReadEncoder(CarEncoderSample *sample, void *context);
 
 #endif

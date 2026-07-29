@@ -1,5 +1,5 @@
-#ifndef H2024_BUTTON_H
-#define H2024_BUTTON_H
+#ifndef BUTTON_H
+#define BUTTON_H
 
 #include <stdbool.h>
 #include <stdint.h>

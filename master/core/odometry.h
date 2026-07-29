@@ -1,5 +1,5 @@
-#ifndef H2024_ODOMETRY_H
-#define H2024_ODOMETRY_H
+#ifndef ODOMETRY_H
+#define ODOMETRY_H
 
 #include "car_config.h"
 #include "car_types.h"

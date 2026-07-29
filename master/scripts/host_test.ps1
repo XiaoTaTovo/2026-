@@ -18,10 +18,9 @@ try {
         (Get-ChildItem -LiteralPath (Join-Path $projectDir "drivers") -Filter "*.c" |
             Sort-Object Name | ForEach-Object FullName)
         (Join-Path $projectDir "app\car_app.c")
-        (Join-Path $projectDir "app\h2024_task.c")
         (Join-Path $projectDir "app\h2026_task.c")
         (Join-Path $projectDir "firmware.c")
-        (Join-Path $projectDir "tests\test_main.c.reference")
+        (Join-Path $projectDir "tests\test_h2026.c.reference")
     )
 
     & $Compiler -std=c11 -Wall -Wextra -Werror -pedantic `

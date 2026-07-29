@@ -1,5 +1,5 @@
-#ifndef H2024_YAW_ESTIMATOR_H
-#define H2024_YAW_ESTIMATOR_H
+#ifndef YAW_ESTIMATOR_H
+#define YAW_ESTIMATOR_H
 
 #include <stdbool.h>
 #include <stdint.h>

@@ -1,5 +1,5 @@
-#ifndef H2024_LINE_ESTIMATOR_H
-#define H2024_LINE_ESTIMATOR_H
+#ifndef LINE_ESTIMATOR_H
+#define LINE_ESTIMATOR_H
 
 #include "car_config.h"
 #include "car_types.h"
@@ -24,7 +24,7 @@ typedef struct {
     uint16_t right_confidence;
     uint16_t right_ratio_permille;
     uint8_t active_span;
-    /* Adaptive diagnostics are independent of the legacy fields above. */
+    /* Local-background diagnostics used by the track classifier. */
     int16_t track_position;
     uint16_t adaptive_background;
     uint16_t adaptive_contrast;
