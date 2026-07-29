@@ -455,6 +455,13 @@ bool TB6612_DriveSetWheelSpeeds(int16_t left,
     }
     adapter->target_left_rpm = speed_to_rpm(adapter, left);
     adapter->target_right_rpm = speed_to_rpm(adapter, right);
+    if ((adapter->target_left_rpm == 0) &&
+        (adapter->target_right_rpm == 0)) {
+        reset_speed_loop_state(adapter);
+        CarMotionWatchdog_Reset(&adapter->motion_watchdog);
+        TB6612_Stop();
+        return true;
+    }
     if (((old_left_target < 0) != (adapter->target_left_rpm < 0)) ||
         ((old_left_target == 0) != (adapter->target_left_rpm == 0))) {
         adapter->left_integral_milli = 0;

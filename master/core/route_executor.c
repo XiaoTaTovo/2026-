@@ -72,6 +72,8 @@ static bool CarRoute_IsFinishMarker(const CarConfig *config,
         (config->gray_wide_min_active > 0U) &&
         (line->active_count >= config->gray_wide_min_active) &&
         (line->active_span == line->active_count) &&
+        (line->adaptive_background >=
+         config->gray_wide_min_background) &&
         CarRoute_HasAdjacentActive(line->active_mask);
     return (line->pattern == CAR_LINE_PATTERN_WIDE_AREA) || coherent_wide;
 }

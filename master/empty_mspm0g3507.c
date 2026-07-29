@@ -274,6 +274,7 @@ static void H2026_RunFirmware(void)
             last_faults = faults;
         }
         H2026_RefreshOled(&g_firmware, now_ms);
+        DL_WWDT_restart(WWDT0_INST);
         __WFI();
     }
 }
@@ -299,6 +300,7 @@ void UART_VOFA_INST_IRQHandler(void)
 int main(void)
 {
     SYSCFG_DL_init();
+    DL_WWDT_setCoreHaltBehavior(WWDT0_INST, DL_WWDT_CORE_HALT_STOP);
     DL_SYSTICK_config(CPUCLK_FREQ / 1000U);
     H2026_RunFirmware();
     return 0;

@@ -29,6 +29,13 @@ static volatile uint16_t g_tx_tail;
 static volatile uint32_t g_tx_drop_count;
 static char g_frame[VOFA_FRAME_SIZE];
 
+typedef struct {
+    char *begin;
+    char *out;
+    char *end;
+    bool overflow;
+} VofaTelemetryWriter;
+
 static void VofaTelemetry_FillTxFifo(void)
 {
     while ((g_tx_tail != g_tx_head) &&
@@ -85,7 +92,30 @@ static void VofaTelemetry_SendText(const char *text)
     }
 }
 
-static char *VofaTelemetry_AppendUnsigned(char *out, uint32_t value)
+static VofaTelemetryWriter VofaTelemetry_BeginWrite(char *buffer,
+                                                    uint16_t capacity)
+{
+    VofaTelemetryWriter writer = {
+        .begin = buffer,
+        .out = buffer,
+        .end = buffer + capacity,
+        .overflow = false
+    };
+
+    return writer;
+}
+
+static void VofaTelemetry_AppendChar(VofaTelemetryWriter *writer, char value)
+{
+    if (writer->out < writer->end) {
+        *writer->out++ = value;
+    } else {
+        writer->overflow = true;
+    }
+}
+
+static void VofaTelemetry_AppendUnsigned(VofaTelemetryWriter *writer,
+                                         uint32_t value)
 {
     char reversed[10];
     uint8_t count = 0U;
@@ -95,52 +125,63 @@ static char *VofaTelemetry_AppendUnsigned(char *out, uint32_t value)
         value /= 10U;
     } while (value != 0U);
     while (count > 0U) {
-        *out++ = reversed[--count];
+        VofaTelemetry_AppendChar(writer, reversed[--count]);
     }
-    return out;
 }
 
-static char *VofaTelemetry_AppendSigned(char *out, int32_t value)
+static void VofaTelemetry_AppendSigned(VofaTelemetryWriter *writer,
+                                       int32_t value)
 {
     uint32_t magnitude;
 
     if (value < 0) {
-        *out++ = '-';
+        VofaTelemetry_AppendChar(writer, '-');
         magnitude = (uint32_t)(-(value + 1)) + 1U;
     } else {
         magnitude = (uint32_t)value;
     }
-    return VofaTelemetry_AppendUnsigned(out, magnitude);
+    VofaTelemetry_AppendUnsigned(writer, magnitude);
 }
 
-static char *VofaTelemetry_AppendText(char *out, const char *text)
+static void VofaTelemetry_AppendText(VofaTelemetryWriter *writer,
+                                     const char *text)
 {
     while ((text != 0) && (*text != '\0')) {
-        *out++ = *text++;
+        VofaTelemetry_AppendChar(writer, *text++);
     }
-    return out;
 }
 
-static char *VofaTelemetry_AppendU32Field(char *out,
+static void VofaTelemetry_AppendU32Field(VofaTelemetryWriter *writer,
                                          uint32_t value,
                                          bool *first)
 {
     if (!*first) {
-        *out++ = ',';
+        VofaTelemetry_AppendChar(writer, ',');
     }
     *first = false;
-    return VofaTelemetry_AppendUnsigned(out, value);
+    VofaTelemetry_AppendUnsigned(writer, value);
 }
 
-static char *VofaTelemetry_AppendI32Field(char *out,
+static void VofaTelemetry_AppendI32Field(VofaTelemetryWriter *writer,
                                          int32_t value,
                                          bool *first)
 {
     if (!*first) {
-        *out++ = ',';
+        VofaTelemetry_AppendChar(writer, ',');
     }
     *first = false;
-    return VofaTelemetry_AppendSigned(out, value);
+    VofaTelemetry_AppendSigned(writer, value);
+}
+
+static bool VofaTelemetry_EnqueueWriter(
+    const VofaTelemetryWriter *writer)
+{
+    if (writer->overflow) {
+        g_tx_drop_count++;
+        return false;
+    }
+    return VofaTelemetry_Enqueue(
+        writer->begin, (uint16_t)(writer->out - writer->begin));
 }
 
 static int32_t VofaTelemetry_RoundFloat(float value)
@@ -261,56 +302,59 @@ static bool VofaTelemetry_IsStopped(const CarFirmware *firmware)
 static void VofaTelemetry_SendError(const char *reason)
 {
     char line[96];
-    char *out = line;
+    VofaTelemetryWriter writer = VofaTelemetry_BeginWrite(
+        line, (uint16_t)sizeof(line));
 
-    out = VofaTelemetry_AppendText(out, "#ERR ");
-    out = VofaTelemetry_AppendText(out, reason);
-    *out++ = '\r';
-    *out++ = '\n';
-    (void)VofaTelemetry_Enqueue(line, (uint16_t)(out - line));
+    VofaTelemetry_AppendText(&writer, "#ERR ");
+    VofaTelemetry_AppendText(&writer, reason);
+    VofaTelemetry_AppendChar(&writer, '\r');
+    VofaTelemetry_AppendChar(&writer, '\n');
+    (void)VofaTelemetry_EnqueueWriter(&writer);
 }
 
 static void VofaTelemetry_SendOk(const char *name)
 {
     char line[96];
-    char *out = line;
+    VofaTelemetryWriter writer = VofaTelemetry_BeginWrite(
+        line, (uint16_t)sizeof(line));
 
-    out = VofaTelemetry_AppendText(out, "#OK ");
-    out = VofaTelemetry_AppendText(out, name);
-    out = VofaTelemetry_AppendText(out, " RAM_ONLY\r\n");
-    (void)VofaTelemetry_Enqueue(line, (uint16_t)(out - line));
+    VofaTelemetry_AppendText(&writer, "#OK ");
+    VofaTelemetry_AppendText(&writer, name);
+    VofaTelemetry_AppendText(&writer, " RAM_ONLY\r\n");
+    (void)VofaTelemetry_EnqueueWriter(&writer);
 }
 
 static void VofaTelemetry_SendParams(const CarFirmware *firmware)
 {
     TB6612SpeedLoopConfig speed = {0};
     char line[192];
-    char *out = line;
+    VofaTelemetryWriter writer = VofaTelemetry_BeginWrite(
+        line, (uint16_t)sizeof(line));
 
     if (!TB6612_DriveGetSpeedLoopConfig(
             VofaTelemetry_GetDriveConst(firmware), &speed)) {
         VofaTelemetry_SendError("TB6612_NOT_READY");
         return;
     }
-    out = VofaTelemetry_AppendText(out, "#PARAMS SPDKP_MILLI=");
-    out = VofaTelemetry_AppendUnsigned(out, speed.kp_milli);
-    out = VofaTelemetry_AppendText(out, " SPDKI_MILLI=");
-    out = VofaTelemetry_AppendUnsigned(out, speed.ki_milli);
-    out = VofaTelemetry_AppendText(out, " SPDKD_MILLI=");
-    out = VofaTelemetry_AppendUnsigned(out, speed.kd_milli);
-    out = VofaTelemetry_AppendText(out, " SPDLIMIT_PCT=");
-    out = VofaTelemetry_AppendUnsigned(out, speed.output_limit_percent);
-    out = VofaTelemetry_AppendText(out, " LINEKP_X1E6=");
-    out = VofaTelemetry_AppendSigned(
-        out, VofaTelemetry_RoundFloat(
-                 firmware->app.config.line_kp * 1000000.0f));
-    out = VofaTelemetry_AppendText(out, " SEARCHMM_X10=");
-    out = VofaTelemetry_AppendSigned(
-        out, VofaTelemetry_RoundFloat(
-                 firmware->app.config.required_line_search_mm * 10.0f));
-    *out++ = '\r';
-    *out++ = '\n';
-    (void)VofaTelemetry_Enqueue(line, (uint16_t)(out - line));
+    VofaTelemetry_AppendText(&writer, "#PARAMS SPDKP_MILLI=");
+    VofaTelemetry_AppendUnsigned(&writer, speed.kp_milli);
+    VofaTelemetry_AppendText(&writer, " SPDKI_MILLI=");
+    VofaTelemetry_AppendUnsigned(&writer, speed.ki_milli);
+    VofaTelemetry_AppendText(&writer, " SPDKD_MILLI=");
+    VofaTelemetry_AppendUnsigned(&writer, speed.kd_milli);
+    VofaTelemetry_AppendText(&writer, " SPDLIMIT_PCT=");
+    VofaTelemetry_AppendUnsigned(&writer, speed.output_limit_percent);
+    VofaTelemetry_AppendText(&writer, " LINEKP_X1E6=");
+    VofaTelemetry_AppendSigned(
+        &writer, VofaTelemetry_RoundFloat(
+                     firmware->app.config.line_kp * 1000000.0f));
+    VofaTelemetry_AppendText(&writer, " SEARCHMM_X10=");
+    VofaTelemetry_AppendSigned(
+        &writer, VofaTelemetry_RoundFloat(
+                     firmware->app.config.required_line_search_mm * 10.0f));
+    VofaTelemetry_AppendChar(&writer, '\r');
+    VofaTelemetry_AppendChar(&writer, '\n');
+    (void)VofaTelemetry_EnqueueWriter(&writer);
 }
 
 static void VofaTelemetry_ResetLineController(CarFirmware *firmware,
@@ -535,7 +579,8 @@ void VofaTelemetry_SendFrame(const CarFirmware *firmware,
                              uint32_t uptime_ms)
 {
     TB6612SpeedLoopStatus speed = {0};
-    char *out = g_frame;
+    VofaTelemetryWriter writer = VofaTelemetry_BeginWrite(
+        g_frame, (uint16_t)sizeof(g_frame));
     bool first = true;
     uint32_t faults;
 
@@ -546,77 +591,77 @@ void VofaTelemetry_SendFrame(const CarFirmware *firmware,
         VofaTelemetry_GetDriveConst(firmware), &speed);
     faults = firmware->hardware_faults | firmware->output.faults;
 
-    out = VofaTelemetry_AppendU32Field(out, uptime_ms, &first);                 /* I0 */
-    out = VofaTelemetry_AppendU32Field(out, firmware->config.mode, &first);    /* I1 */
-    out = VofaTelemetry_AppendU32Field(out,
+    VofaTelemetry_AppendU32Field(&writer, uptime_ms, &first);                  /* I0 */
+    VofaTelemetry_AppendU32Field(&writer, firmware->config.mode, &first);     /* I1 */
+    VofaTelemetry_AppendU32Field(&writer,
         firmware->app.executor.running ? 1U : 0U, &first);                    /* I2 */
-    out = VofaTelemetry_AppendU32Field(out,
+    VofaTelemetry_AppendU32Field(&writer,
         firmware->app.executor.finished ? 1U : 0U, &first);                   /* I3 */
-    out = VofaTelemetry_AppendU32Field(out,
+    VofaTelemetry_AppendU32Field(&writer,
         firmware->app.executor.index, &first);                                /* I4 */
-    out = VofaTelemetry_AppendU32Field(out,
+    VofaTelemetry_AppendU32Field(&writer,
         firmware->app.executor.track_phase, &first);                          /* I5 */
-    out = VofaTelemetry_AppendI32Field(out, VofaTelemetry_RoundFloat(
+    VofaTelemetry_AppendI32Field(&writer, VofaTelemetry_RoundFloat(
         firmware->app.executor.segment_progress_mm * 10.0f), &first);         /* I6 */
-    out = VofaTelemetry_AppendI32Field(out, VofaTelemetry_RoundFloat(
+    VofaTelemetry_AppendI32Field(&writer, VofaTelemetry_RoundFloat(
         firmware->app.odometry.center_distance_mm * 10.0f), &first);          /* I7 */
-    out = VofaTelemetry_AppendU32Field(out,
+    VofaTelemetry_AppendU32Field(&writer,
         firmware->app.line.valid ? 1U : 0U, &first);                          /* I8 */
-    out = VofaTelemetry_AppendI32Field(out,
+    VofaTelemetry_AppendI32Field(&writer,
         firmware->app.line.track_position, &first);                           /* I9 */
-    out = VofaTelemetry_AppendU32Field(out,
+    VofaTelemetry_AppendU32Field(&writer,
         firmware->app.line.track_confidence, &first);                         /* I10 */
-    out = VofaTelemetry_AppendU32Field(out,
+    VofaTelemetry_AppendU32Field(&writer,
         firmware->app.line.track_active_count, &first);                       /* I11 */
-    out = VofaTelemetry_AppendU32Field(out,
+    VofaTelemetry_AppendU32Field(&writer,
         firmware->app.line.track_active_mask, &first);                        /* I12 */
-    out = VofaTelemetry_AppendU32Field(out,
+    VofaTelemetry_AppendU32Field(&writer,
         firmware->app.line.pattern, &first);                                  /* I13 */
-    out = VofaTelemetry_AppendI32Field(out, VofaTelemetry_RoundFloat(
+    VofaTelemetry_AppendI32Field(&writer, VofaTelemetry_RoundFloat(
         firmware->app.executor.line_correction_mm_s * 10.0f), &first);        /* I14 */
-    out = VofaTelemetry_AppendI32Field(out, VofaTelemetry_RoundFloat(
+    VofaTelemetry_AppendI32Field(&writer, VofaTelemetry_RoundFloat(
         firmware->output.motor.left_mm_s * 10.0f), &first);                   /* I15 */
-    out = VofaTelemetry_AppendI32Field(out, VofaTelemetry_RoundFloat(
+    VofaTelemetry_AppendI32Field(&writer, VofaTelemetry_RoundFloat(
         firmware->output.motor.right_mm_s * 10.0f), &first);                  /* I16 */
-    out = VofaTelemetry_AppendI32Field(out, speed.target_left_rpm, &first);    /* I17 */
-    out = VofaTelemetry_AppendI32Field(out, speed.target_right_rpm, &first);   /* I18 */
-    out = VofaTelemetry_AppendI32Field(out, speed.measured_left_rpm, &first);  /* I19 */
-    out = VofaTelemetry_AppendI32Field(out, speed.measured_right_rpm, &first); /* I20 */
-    out = VofaTelemetry_AppendI32Field(out, speed.left_output_percent, &first);/* I21 */
-    out = VofaTelemetry_AppendI32Field(out, speed.right_output_percent, &first);/* I22 */
-    out = VofaTelemetry_AppendI32Field(out, speed.left_delta_count, &first);   /* I23 */
-    out = VofaTelemetry_AppendI32Field(out, speed.right_delta_count, &first);  /* I24 */
-    out = VofaTelemetry_AppendU32Field(out, speed.sample_elapsed_ms, &first);  /* I25 */
-    out = VofaTelemetry_AppendU32Field(out, speed.update_count, &first);       /* I26 */
-    out = VofaTelemetry_AppendI32Field(out, VofaTelemetry_RoundFloat(
+    VofaTelemetry_AppendI32Field(&writer, speed.target_left_rpm, &first);      /* I17 */
+    VofaTelemetry_AppendI32Field(&writer, speed.target_right_rpm, &first);     /* I18 */
+    VofaTelemetry_AppendI32Field(&writer, speed.measured_left_rpm, &first);    /* I19 */
+    VofaTelemetry_AppendI32Field(&writer, speed.measured_right_rpm, &first);   /* I20 */
+    VofaTelemetry_AppendI32Field(&writer, speed.left_output_percent, &first);  /* I21 */
+    VofaTelemetry_AppendI32Field(&writer, speed.right_output_percent, &first); /* I22 */
+    VofaTelemetry_AppendI32Field(&writer, speed.left_delta_count, &first);     /* I23 */
+    VofaTelemetry_AppendI32Field(&writer, speed.right_delta_count, &first);    /* I24 */
+    VofaTelemetry_AppendU32Field(&writer, speed.sample_elapsed_ms, &first);    /* I25 */
+    VofaTelemetry_AppendU32Field(&writer, speed.update_count, &first);         /* I26 */
+    VofaTelemetry_AppendI32Field(&writer, VofaTelemetry_RoundFloat(
         firmware->imu_sample.yaw_deg * 10.0f), &first);                       /* I27 */
-    out = VofaTelemetry_AppendU32Field(out, faults, &first);                   /* I28 */
-    out = VofaTelemetry_AppendU32Field(out,
+    VofaTelemetry_AppendU32Field(&writer, faults, &first);                     /* I28 */
+    VofaTelemetry_AppendU32Field(&writer,
         firmware->app.executor.last_exit_reason, &first);                     /* I29 */
-    out = VofaTelemetry_AppendI32Field(out, VofaTelemetry_RoundFloat(
+    VofaTelemetry_AppendI32Field(&writer, VofaTelemetry_RoundFloat(
         firmware->app.executor.track_line_gap_mm * 10.0f), &first);           /* I30 */
-    out = VofaTelemetry_AppendU32Field(out,
+    VofaTelemetry_AppendU32Field(&writer,
         firmware->app.executor.marker_streak, &first);                        /* I31 */
-    out = VofaTelemetry_AppendU32Field(out,
+    VofaTelemetry_AppendU32Field(&writer,
         firmware->app.executor.last_marker_confidence, &first);               /* I32 */
-    out = VofaTelemetry_AppendU32Field(out,
+    VofaTelemetry_AppendU32Field(&writer,
         firmware->app.executor.last_marker_active_count, &first);             /* I33 */
-    out = VofaTelemetry_AppendI32Field(out, VofaTelemetry_RoundFloat(
+    VofaTelemetry_AppendI32Field(&writer, VofaTelemetry_RoundFloat(
         firmware->app.executor.finish_offset_progress_mm * 10.0f), &first);   /* I34 */
-    out = VofaTelemetry_AppendU32Field(out,
+    VofaTelemetry_AppendU32Field(&writer,
         firmware->output.result_time_ms, &first);                             /* I35 */
-    out = VofaTelemetry_AppendU32Field(out,
+    VofaTelemetry_AppendU32Field(&writer,
         firmware->output.result_valid ? 1U : 0U, &first);                     /* I36 */
-    out = VofaTelemetry_AppendU32Field(out,
+    VofaTelemetry_AppendU32Field(&writer,
         firmware->encoder_valid_current ? 1U : 0U, &first);                   /* I37 */
-    out = VofaTelemetry_AppendU32Field(out,
+    VofaTelemetry_AppendU32Field(&writer,
         firmware->drive_active ? 1U : 0U, &first);                            /* I38 */
     for (uint8_t i = 0U; i < GRAY_ARRAY_CHANNELS; i++) {
-        out = VofaTelemetry_AppendU32Field(
-            out, firmware->gray_sample.normalized[i], &first);                /* I39-I46 */
+        VofaTelemetry_AppendU32Field(
+            &writer, firmware->gray_sample.normalized[i], &first);            /* I39-I46 */
     }
-    out = VofaTelemetry_AppendU32Field(out, g_tx_drop_count, &first);          /* I47 */
-    *out++ = '\r';
-    *out++ = '\n';
-    (void)VofaTelemetry_Enqueue(g_frame, (uint16_t)(out - g_frame));
+    VofaTelemetry_AppendU32Field(&writer, g_tx_drop_count, &first);            /* I47 */
+    VofaTelemetry_AppendChar(&writer, '\r');
+    VofaTelemetry_AppendChar(&writer, '\n');
+    (void)VofaTelemetry_EnqueueWriter(&writer);
 }

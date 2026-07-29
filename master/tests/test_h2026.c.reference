@@ -81,6 +81,20 @@ static CarLineEstimate WideMarker(void)
     return line;
 }
 
+static CarLineEstimate UniformGrayBackground(void)
+{
+    CarLineEstimate line = {0};
+
+    line.confidence = 2400U;
+    line.active_count = 8U;
+    line.active_mask = 0xFFU;
+    line.active_span = 8U;
+    line.adaptive_background = 300U;
+    line.pattern = CAR_LINE_PATTERN_NONE;
+    line.valid = true;
+    return line;
+}
+
 static CarLineEstimate NoLine(void)
 {
     CarLineEstimate line = {0};
@@ -248,6 +262,7 @@ static void TestFinishMarkerWindow(void)
     CarMotorCommand motor;
     CarCue cue;
     CarLineEstimate marker = WideMarker();
+    CarLineEstimate gray_background = UniformGrayBackground();
     uint32_t faults;
     float arc_length = 3.14159265358979323846f *
                        H2026_TRACK_ARC_RADIUS_MM;
@@ -256,6 +271,16 @@ static void TestFinishMarkerWindow(void)
     float latest = expected + config.required_line_search_mm;
 
     assert(H2026_BuildRoute(H2026_MODE_B2, &config, &route) == CAR_OK);
+
+    faults = 0U;
+    odometry.center_distance_mm = expected;
+    EnterFinalArc(&executor, &route, odometry.center_distance_mm);
+    assert(CarRouteExecutor_Update(&executor, &config, 20U, &odometry,
+                                   &gray_background, &motor, &cue, &faults) ==
+           CAR_OK);
+    assert(executor.marker_streak == 0U);
+    assert(executor.track_phase == CAR_TRACK_PHASE_FOLLOW);
+    assert(faults == 0U);
 
     faults = 0U;
     odometry.center_distance_mm = earliest - 1.0f;

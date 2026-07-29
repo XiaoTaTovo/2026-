@@ -1,0 +1,186 @@
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "tb6612.h"
+#include "ti_msp_dl_config.h"
+
+TestGpioRegs g_test_gpio_a;
+TestGpioRegs g_test_gpio_b;
+TestTimerARegs g_test_timer_a;
+
+static uint32_t g_gpio_a_output;
+static uint32_t g_gpio_b_output;
+static uint32_t g_left_compare;
+static uint32_t g_right_compare;
+static uint32_t g_now_ms;
+static int32_t g_left_encoder_count;
+static int32_t g_right_encoder_count;
+static bool g_timer_started;
+
+void DL_TimerA_setCaptureCompareValue(TestTimerARegs *timer,
+                                      uint32_t value,
+                                      uint32_t index)
+{
+    assert(timer == &g_test_timer_a);
+    if (index == GPIO_PWM_TB1_C1_IDX) {
+        g_left_compare = value;
+    } else {
+        assert(index == GPIO_PWM_TB1_C2_IDX);
+        g_right_compare = value;
+    }
+}
+
+void DL_TimerA_startCounter(TestTimerARegs *timer)
+{
+    assert(timer == &g_test_timer_a);
+    g_timer_started = true;
+}
+
+void DL_GPIO_clearPins(TestGpioRegs *gpio, uint32_t pins)
+{
+    if (gpio == &g_test_gpio_a) {
+        g_gpio_a_output &= ~pins;
+    } else {
+        assert(gpio == &g_test_gpio_b);
+        g_gpio_b_output &= ~pins;
+    }
+}
+
+void DL_GPIO_setPins(TestGpioRegs *gpio, uint32_t pins)
+{
+    if (gpio == &g_test_gpio_a) {
+        g_gpio_a_output |= pins;
+    } else {
+        assert(gpio == &g_test_gpio_b);
+        g_gpio_b_output |= pins;
+    }
+}
+
+void delay_cycles(uint32_t cycles)
+{
+    assert(cycles == CPUCLK_FREQ / 1000000U);
+}
+
+int32_t Encoder_GetLeftCount(void)
+{
+    return g_left_encoder_count;
+}
+
+int32_t Encoder_GetRightCount(void)
+{
+    return g_right_encoder_count;
+}
+
+static uint32_t FakeNow(void *context)
+{
+    assert(context == &g_now_ms);
+    return g_now_ms;
+}
+
+static TB6612SpeedLoopConfig TestSpeedLoopConfig(void)
+{
+    const TB6612SpeedLoopConfig config = {
+        .wheel_diameter_mm = 65.0f,
+        .left_counts_per_rev = 724U,
+        .right_counts_per_rev = 724U,
+        .control_period_ms = 50U,
+        .kp_milli = 250U,
+        .ki_milli = 600U,
+        .kd_milli = 0U,
+        .feedforward_static_milli = 6000,
+        .feedforward_rpm_milli = 225U,
+        .error_deadband_rpm = 2,
+        .output_limit_percent = 60U,
+        .motion_watchdog_min_target_rpm = 10U,
+        .motion_watchdog_timeout_ms = 600U
+    };
+
+    return config;
+}
+
+static void ResetFakeHardware(void)
+{
+    g_gpio_a_output = UINT32_MAX;
+    g_gpio_b_output = UINT32_MAX;
+    g_left_compare = 0U;
+    g_right_compare = 0U;
+    g_now_ms = 0U;
+    g_left_encoder_count = 0;
+    g_right_encoder_count = 0;
+    g_timer_started = false;
+}
+
+static TB6612Drive TestDrive(void)
+{
+    TB6612Drive drive;
+    TB6612SpeedLoopConfig config = TestSpeedLoopConfig();
+
+    TB6612_DriveInit(&drive, FakeNow, &g_now_ms);
+    assert(TB6612_DriveConfigureSpeedLoop(&drive, &config));
+    return drive;
+}
+
+static void TestClosedLoopUsesEncoderFeedback(void)
+{
+    TB6612SpeedLoopStatus status;
+    TB6612Drive drive;
+
+    ResetFakeHardware();
+    TB6612_Init();
+    assert(g_timer_started);
+    assert((g_gpio_a_output & STBY_PIN_STBY_PIN) == 0U);
+    drive = TestDrive();
+
+    assert(TB6612_DriveSetWheelSpeeds(350, 350, &drive));
+    g_left_encoder_count = 62;
+    g_right_encoder_count = 62;
+    g_now_ms = 50U;
+    TB6612_DriveService(&drive);
+    TB6612_DriveGetSpeedLoopStatus(&drive, &status);
+
+    assert(status.target_left_rpm == 103);
+    assert(status.target_right_rpm == 103);
+    assert(status.measured_left_rpm == 103);
+    assert(status.measured_right_rpm == 103);
+    assert(status.left_output_percent > 0);
+    assert(status.right_output_percent > 0);
+    assert(status.left_output_percent <= 60);
+    assert(status.right_output_percent <= 60);
+    assert((g_gpio_a_output & STBY_PIN_STBY_PIN) != 0U);
+}
+
+static void TestTinyNonzeroCommandStopsOldPwm(void)
+{
+    TB6612SpeedLoopStatus status;
+    TB6612Drive drive;
+
+    ResetFakeHardware();
+    TB6612_Init();
+    drive = TestDrive();
+    TB6612_SetMotors(40, 35);
+    assert(TB6612_GetLeftCommand() == 40);
+    assert(TB6612_GetRightCommand() == 35);
+    assert((g_gpio_a_output & STBY_PIN_STBY_PIN) != 0U);
+
+    assert(TB6612_DriveSetWheelSpeeds(1, 1, &drive));
+    TB6612_DriveGetSpeedLoopStatus(&drive, &status);
+    assert(status.target_left_rpm == 0);
+    assert(status.target_right_rpm == 0);
+    assert(TB6612_GetLeftCommand() == 0);
+    assert(TB6612_GetRightCommand() == 0);
+    assert(g_left_compare == TB6612_PWM_PERIOD_TICKS);
+    assert(g_right_compare == TB6612_PWM_PERIOD_TICKS);
+    assert((g_gpio_a_output & (A_PIN_AIN1_PIN | A_PIN_AIN2_PIN |
+                              B_PIN_BIN1_PIN | B_PIN_BIN2_PIN |
+                              STBY_PIN_STBY_PIN)) == 0U);
+}
+
+int main(void)
+{
+    TestClosedLoopUsesEncoderFeedback();
+    TestTinyNonzeroCommandStopsOldPwm();
+    puts("TB6612 closed-loop and zero-rounding tests passed");
+    return 0;
+}

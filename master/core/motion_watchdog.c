@@ -24,8 +24,11 @@ static bool CarMotionWatchdog_UpdateWheel(
 {
     int8_t direction = CarMotionWatchdog_TargetDirection(
         target_rpm, config->minimum_target_rpm);
-    bool encoder_moved = wheel->encoder_count_valid &&
-        (encoder_count != wheel->previous_encoder_count);
+    int32_t encoder_delta = (int32_t)((uint32_t)encoder_count -
+                                      (uint32_t)wheel->previous_encoder_count);
+    bool encoder_moved_in_target_direction = wheel->encoder_count_valid &&
+        (((direction > 0) && (encoder_delta > 0)) ||
+         ((direction < 0) && (encoder_delta < 0)));
 
     wheel->previous_encoder_count = encoder_count;
     wheel->encoder_count_valid = true;
@@ -49,14 +52,13 @@ static bool CarMotionWatchdog_UpdateWheel(
     if (wheel->timed_out) {
         return false;
     }
-    if (encoder_moved) {
-        wheel->last_motion_ms = now_ms;
-        return true;
-    }
     if ((uint32_t)(now_ms - wheel->last_motion_ms) >=
         config->no_motion_timeout_ms) {
         wheel->timed_out = true;
         return false;
+    }
+    if (encoder_moved_in_target_direction) {
+        wheel->last_motion_ms = now_ms;
     }
     return true;
 }

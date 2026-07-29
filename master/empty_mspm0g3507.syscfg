@@ -25,6 +25,7 @@ const GPIO6         = GPIO.addInstance();
 const GPIO7         = GPIO.addInstance();
 const GPIO8         = GPIO.addInstance();
 const GPIO9         = GPIO.addInstance();
+const GPIO10        = GPIO.addInstance();
 const I2C           = scripting.addModule("/ti/driverlib/I2C", {}, false);
 const I2C1          = I2C.addInstance();
 const PWM           = scripting.addModule("/ti/driverlib/PWM", {}, false);
@@ -35,7 +36,8 @@ const SYSCTL        = scripting.addModule("/ti/driverlib/SYSCTL");
 const UART          = scripting.addModule("/ti/driverlib/UART", {}, false);
 const UART1         = UART.addInstance();
 const UART2         = UART.addInstance();
-const UART3         = UART.addInstance();
+const WWDT          = scripting.addModule("/ti/driverlib/WWDT", {}, false);
+const WWDT1         = WWDT.addInstance();
 const ProjectConfig = scripting.addModule("/ti/project_config/ProjectConfig");
 
 /**
@@ -132,6 +134,15 @@ GPIO9.$name                         = "GPIO_BUZZER";
 GPIO9.associatedPins[0].$name       = "BUZZER";
 GPIO9.associatedPins[0].pin.$assign = "PB5";
 
+GPIO10.$name                         = "GPIO_RESERVED";
+GPIO10.associatedPins.create(2);
+GPIO10.associatedPins[0].$name       = "PA8_UNUSED";
+GPIO10.associatedPins[0].direction   = "INPUT";
+GPIO10.associatedPins[0].pin.$assign = "PA8";
+GPIO10.associatedPins[1].$name       = "PA9_UNUSED";
+GPIO10.associatedPins[1].direction   = "INPUT";
+GPIO10.associatedPins[1].pin.$assign = "PA9";
+
 I2C1.$name                             = "I2C_OLED";
 I2C1.basicEnableController             = true;
 I2C1.basicControllerStandardBusSpeed   = "Fast";
@@ -219,22 +230,16 @@ UART2.rxPinConfig.onlyInternalResistor = scripting.forceWrite(false);
 UART2.rxPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
 UART2.rxPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric5";
 
-UART3.$name                            = "UART_MOTOR";
-UART3.targetBaudRate                   = 115200;
-UART3.enabledInterrupts                = ["RX"];
-UART3.interruptPriority                = "0";
-UART3.peripheral.$assign               = "UART1";
-UART3.peripheral.rxPin.$assign         = "PA9";
-UART3.peripheral.txPin.$assign         = "PA8";
-UART3.txPinConfig.direction            = scripting.forceWrite("OUTPUT");
-UART3.txPinConfig.hideOutputInversion  = scripting.forceWrite(false);
-UART3.txPinConfig.onlyInternalResistor = scripting.forceWrite(false);
-UART3.txPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
-UART3.txPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric11";
-UART3.rxPinConfig.hideOutputInversion  = scripting.forceWrite(false);
-UART3.rxPinConfig.onlyInternalResistor = scripting.forceWrite(false);
-UART3.rxPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
-UART3.rxPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric12";
+WWDT1.$name               = "WWDT0";
+WWDT1.clockDivider        = "4";
+WWDT1.wwdtMode            = "WATCHDOG";
+WWDT1.periodCount         = "15";
+WWDT1.activeWindow        = "0";
+WWDT1.window0ClosedPeriod = "0";
+WWDT1.window1ClosedPeriod = "0";
+WWDT1.sleepMode           = true;
+WWDT1.enabledInterrupts   = false;
+WWDT1.peripheral.$assign  = "WWDT0";
 
 ProjectConfig.deviceSpin = "MSPM0G3507";
 

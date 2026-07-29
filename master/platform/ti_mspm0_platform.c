@@ -29,17 +29,22 @@ static void TiDrive_Service(void *context)
     TB6612_DriveService((TB6612Drive *)context);
 }
 
-static uint8_t TiImu_Transfer(uint8_t value, void *context)
+static bool TiImu_Transfer(uint8_t value,
+                           uint8_t *received,
+                           void *context)
 {
     uint32_t timeout = H2026_SPI_TIMEOUT_LOOPS;
 
     (void)context;
+    if (received == 0) {
+        return false;
+    }
     while (DL_SPI_isTXFIFOFull(SPI_IMU_INST) && (timeout > 0U)) {
         timeout--;
     }
     if (timeout == 0U) {
         g_diagnostics.imu_spi_timeouts++;
-        return 0xFFU;
+        return false;
     }
     DL_SPI_transmitData8(SPI_IMU_INST, value);
     timeout = H2026_SPI_TIMEOUT_LOOPS;
@@ -48,9 +53,10 @@ static uint8_t TiImu_Transfer(uint8_t value, void *context)
     }
     if (timeout == 0U) {
         g_diagnostics.imu_spi_timeouts++;
-        return 0xFFU;
+        return false;
     }
-    return DL_SPI_receiveData8(SPI_IMU_INST);
+    *received = DL_SPI_receiveData8(SPI_IMU_INST);
+    return true;
 }
 
 static void TiImu_Select(bool active, void *context)
@@ -117,14 +123,20 @@ static bool TiGray_ReadAdc(uint16_t *value, void *context)
         return false;
     }
     g_adc_ready = false;
+    DL_ADC12_clearInterruptStatus(
+        ADC_GRAY_INST, DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED);
     DL_ADC12_startConversion(ADC_GRAY_INST);
     while (!g_adc_ready && (timeout > 0U)) {
         timeout--;
     }
     if (!g_adc_ready) {
+        DL_ADC12_stopConversion(ADC_GRAY_INST);
+        DL_ADC12_clearInterruptStatus(
+            ADC_GRAY_INST, DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED);
         g_diagnostics.gray_adc_timeouts++;
         return false;
     }
+    DL_ADC12_stopConversion(ADC_GRAY_INST);
     *value = (uint16_t)DL_ADC12_getMemResult(
         ADC_GRAY_INST, ADC_GRAY_ADCMEM_GRAY_OUT);
     return true;
@@ -206,7 +218,7 @@ void TiMspm0Platform_Init(void)
     DL_ADC12_disableConversions(ADC_GRAY_INST);
     DL_ADC12_initSingleSample(
         ADC_GRAY_INST,
-        DL_ADC12_REPEAT_MODE_ENABLED,
+        DL_ADC12_REPEAT_MODE_DISABLED,
         DL_ADC12_SAMPLING_SOURCE_AUTO,
         DL_ADC12_TRIG_SRC_SOFTWARE,
         DL_ADC12_SAMP_CONV_RES_12_BIT,

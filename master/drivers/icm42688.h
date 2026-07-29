@@ -4,7 +4,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-typedef uint8_t (*Icm42688TransferFn)(uint8_t value, void *context);
+typedef bool (*Icm42688TransferFn)(uint8_t value,
+                                   uint8_t *received,
+                                   void *context);
 typedef void (*Icm42688ChipSelectFn)(bool active, void *context);
 typedef void (*Icm42688DelayMsFn)(uint32_t delay_ms, void *context);
 

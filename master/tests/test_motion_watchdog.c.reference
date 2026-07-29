@@ -98,6 +98,35 @@ static void TestDirectionChangeResetsDeadline(void)
     assert(!result.left_valid);
 }
 
+static void TestReverseCountsDoNotRefreshDeadline(void)
+{
+    CarMotionWatchdog watchdog = TestWatchdog();
+    CarMotionWatchdogResult result;
+
+    result = CarMotionWatchdog_Update(&watchdog, 20, 0, 0, 0, 0U);
+    assert(result.left_valid);
+    result = CarMotionWatchdog_Update(&watchdog, 20, 0, -1, 0, 200U);
+    assert(result.left_valid);
+    assert(watchdog.left.last_motion_ms == 0U);
+    result = CarMotionWatchdog_Update(&watchdog, 20, 0, -2, 0, 599U);
+    assert(result.left_valid);
+    result = CarMotionWatchdog_Update(&watchdog, 20, 0, -3, 0, 600U);
+    assert(!result.left_valid);
+    assert(watchdog.left.timed_out);
+}
+
+static void TestPulseAtDeadlineIsTooLate(void)
+{
+    CarMotionWatchdog watchdog = TestWatchdog();
+    CarMotionWatchdogResult result;
+
+    result = CarMotionWatchdog_Update(&watchdog, 20, 0, 0, 0, 0U);
+    assert(result.left_valid);
+    result = CarMotionWatchdog_Update(&watchdog, 20, 0, 1, 0, 600U);
+    assert(!result.left_valid);
+    assert(watchdog.left.timed_out);
+}
+
 static void TestTimeWrap(void)
 {
     CarMotionWatchdog watchdog = TestWatchdog();
@@ -120,6 +149,8 @@ int main(void)
     TestMotionRefreshAndIndependentWheels();
     TestTimeoutLatchAndReset();
     TestDirectionChangeResetsDeadline();
+    TestReverseCountsDoNotRefreshDeadline();
+    TestPulseAtDeadlineIsTooLate();
     TestTimeWrap();
     puts("motion watchdog tests passed");
     return 0;
