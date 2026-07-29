@@ -103,7 +103,6 @@ try {
         (Join-Path $projectDir "app\h2026_task.c")
         (Join-Path $projectDir "firmware.c")
         (Join-Path $projectDir "tb6612.c")
-        (Join-Path $projectDir "vofa_telemetry.c")
         (Join-Path $projectDir "tests\test_vofa_telemetry.c.reference")
     )
     & $Compiler @ExtraCompilerArgs -std=c11 -Wall -Wextra -Werror -pedantic `

@@ -9,6 +9,9 @@
 #include "ti_msp_dl_config.h"
 #include "vofa_telemetry.h"
 
+/* White-box the bounded writer without adding a production test API. */
+#include "../vofa_telemetry.c"
+
 #define TEST_TX_CAPACITY (2048U)
 
 TestGpioRegs g_test_gpio_a;
@@ -166,6 +169,36 @@ static TB6612Drive TestDrive(void)
     return drive;
 }
 
+static void TestWriterExactFitAndOverflow(void)
+{
+    char buffer[3] = {'X', 'X', 'S'};
+    VofaTelemetryWriter writer;
+    uint32_t drops_before;
+
+    VofaTelemetry_Init();
+    ResetCapture();
+    writer = VofaTelemetry_BeginWrite(buffer, 2U);
+    VofaTelemetry_AppendText(&writer, "AB");
+    assert(!writer.overflow);
+    assert(writer.out == writer.end);
+    assert(buffer[2] == 'S');
+    assert(VofaTelemetry_EnqueueWriter(&writer));
+    assert(g_tx_length == 2U);
+    assert(memcmp(g_tx_capture, "AB", 2U) == 0);
+
+    VofaTelemetry_Init();
+    ResetCapture();
+    writer = VofaTelemetry_BeginWrite(buffer, 2U);
+    VofaTelemetry_AppendText(&writer, "ABC");
+    assert(writer.overflow);
+    assert(writer.out == writer.end);
+    assert(buffer[2] == 'S');
+    drops_before = g_tx_drop_count;
+    assert(!VofaTelemetry_EnqueueWriter(&writer));
+    assert(g_tx_drop_count == drops_before + 1U);
+    assert(g_tx_length == 0U);
+}
+
 static void TestFrameHas48BoundedFields(void)
 {
     CarFirmware firmware = {0};
@@ -230,8 +263,9 @@ static void TestStopCommandLatchesEmergencyStop(void)
 
 int main(void)
 {
+    TestWriterExactFitAndOverflow();
     TestFrameHas48BoundedFields();
     TestStopCommandLatchesEmergencyStop();
-    puts("VOFA frame-bound and STOP-command tests passed");
+    puts("VOFA writer-bound, frame-bound, and STOP-command tests passed");
     return 0;
 }
