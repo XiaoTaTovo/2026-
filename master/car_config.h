@@ -39,6 +39,7 @@ typedef struct {
 
     /* Final A marker uses a stronger rule than ordinary line following. */
     uint16_t gray_finish_min_confidence;
+    uint16_t gray_finish_min_active_mean;
     uint8_t gray_finish_min_active;
     uint8_t gray_finish_consecutive_frames;
 
@@ -87,7 +88,8 @@ static inline CarConfig CarConfig_MakeDefault(void)
         .gray_wide_min_active = 6U,
         .gray_wide_min_background = 600U,
         .gray_finish_min_confidence = 1200U,
-        .gray_finish_min_active = 2U,
+        .gray_finish_min_active_mean = 600U,
+        .gray_finish_min_active = 3U,
         .gray_finish_consecutive_frames = 2U,
         .line_kp = 0.025f,
         .line_ki = 0.0f,

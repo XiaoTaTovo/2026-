@@ -124,6 +124,9 @@ static bool TiGray_ReadAdc(uint16_t *value, void *context)
         return false;
     }
     g_adc_ready = false;
+    /* ADC0 also owns RED slots; select only GRAY MEM0 for this read. */
+    DL_ADC12_setStartAddress(ADC_GRAY_INST, DL_ADC12_SEQ_START_ADDR_00);
+    DL_ADC12_setEndAddress(ADC_GRAY_INST, DL_ADC12_SEQ_END_ADDR_00);
     DL_ADC12_clearInterruptStatus(
         ADC_GRAY_INST, DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED);
     /* TI SDK adc12_single_conversion: re-arm ENC for every single sample. */
@@ -160,39 +163,141 @@ static bool TiGray_ReadAdc(uint16_t *value, void *context)
     return true;
 }
 
-static bool TiRed_ReadFrame(
-    uint16_t values[RED_ARRAY_CHANNELS], void *context)
+static bool TiRed_ReadOneFrame(uint16_t values[RED_ARRAY_CHANNELS])
 {
+    const uint32_t adc0_status =
+        DL_ADC12_INTERRUPT_MEM1_RESULT_LOADED |
+        DL_ADC12_INTERRUPT_MEM2_RESULT_LOADED |
+        DL_ADC12_INTERRUPT_MEM3_RESULT_LOADED;
+    const uint32_t adc1_status =
+        DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED |
+        DL_ADC12_INTERRUPT_MEM1_RESULT_LOADED |
+        DL_ADC12_INTERRUPT_MEM2_RESULT_LOADED |
+        DL_ADC12_INTERRUPT_MEM3_RESULT_LOADED |
+        DL_ADC12_INTERRUPT_MEM4_RESULT_LOADED;
+    uint32_t timeout = H2026_ADC_TIMEOUT_LOOPS;
+    bool adc0_complete = false;
+    bool adc1_complete = false;
+
     if (values == 0) {
         return false;
     }
 
-    /*
-     * The verified red-array connector reuses the existing three-bit mux
-     * and single ADC signal. The module IR pin remains electrically unowned
-     * by firmware: no GPIO is configured or driven for it here.
-     */
-    for (uint8_t channel = 0U; channel < RED_ARRAY_CHANNELS; channel++) {
-        uint32_t sum = 0U;
+    /* D3/D2/D7 are ADC0 MEM1/2/3; do not sample GRAY MEM0 here. */
+    DL_ADC12_setStartAddress(ADC_GRAY_INST, DL_ADC12_SEQ_START_ADDR_01);
+    DL_ADC12_setEndAddress(ADC_GRAY_INST, DL_ADC12_SEQ_END_ADDR_03);
+    DL_ADC12_setStartAddress(ADC_RED1_INST, DL_ADC12_SEQ_START_ADDR_00);
+    DL_ADC12_setEndAddress(ADC_RED1_INST, DL_ADC12_SEQ_END_ADDR_04);
+    DL_ADC12_clearInterruptStatus(ADC_GRAY_INST, adc0_status);
+    DL_ADC12_clearInterruptStatus(ADC_RED1_INST, adc1_status);
+    DL_ADC12_enableConversions(ADC_GRAY_INST);
+    DL_ADC12_enableConversions(ADC_RED1_INST);
+    DL_ADC12_startConversion(ADC_GRAY_INST);
+    DL_ADC12_startConversion(ADC_RED1_INST);
 
-        if (!TiGray_Select(channel, context)) {
-            return false;
+    while ((!adc0_complete || !adc1_complete) && (timeout > 0U)) {
+        if (DL_ADC12_getRawInterruptStatus(
+                ADC_GRAY_INST,
+                DL_ADC12_INTERRUPT_MEM3_RESULT_LOADED) != 0U) {
+            adc0_complete = true;
         }
-        TiDelayUs(H2026_GRAY_SETTLE_US, context);
-        for (uint8_t sample = 0U;
-             sample < H2026_GRAY_SAMPLES_PER_CHANNEL;
-             sample++) {
-            uint16_t value;
-
-            if (!TiGray_ReadAdc(&value, context)) {
-                return false;
-            }
-            sum += value;
+        if (DL_ADC12_getRawInterruptStatus(
+                ADC_RED1_INST,
+                DL_ADC12_INTERRUPT_MEM4_RESULT_LOADED) != 0U) {
+            adc1_complete = true;
         }
-        values[channel] = (uint16_t)(
-            sum / H2026_GRAY_SAMPLES_PER_CHANNEL);
+        timeout--;
     }
+    DL_ADC12_stopConversion(ADC_GRAY_INST);
+    DL_ADC12_stopConversion(ADC_RED1_INST);
+
+    if (!adc0_complete || !adc1_complete) {
+        DL_ADC12_clearInterruptStatus(ADC_GRAY_INST, adc0_status);
+        DL_ADC12_clearInterruptStatus(ADC_RED1_INST, adc1_status);
+        g_diagnostics.red_adc_timeouts++;
+        return false;
+    }
+
+    values[0] = (uint16_t)DL_ADC12_getMemResult(
+        ADC_RED1_INST, ADC_RED1_ADCMEM_RED_D0);
+    values[1] = (uint16_t)DL_ADC12_getMemResult(
+        ADC_RED1_INST, ADC_RED1_ADCMEM_RED_D1);
+    values[2] = (uint16_t)DL_ADC12_getMemResult(
+        ADC_GRAY_INST, ADC_GRAY_ADCMEM_RED_D2);
+    values[3] = (uint16_t)DL_ADC12_getMemResult(
+        ADC_GRAY_INST, ADC_GRAY_ADCMEM_RED_D3);
+    values[4] = (uint16_t)DL_ADC12_getMemResult(
+        ADC_RED1_INST, ADC_RED1_ADCMEM_RED_D4);
+    values[5] = (uint16_t)DL_ADC12_getMemResult(
+        ADC_RED1_INST, ADC_RED1_ADCMEM_RED_D5);
+    values[6] = (uint16_t)DL_ADC12_getMemResult(
+        ADC_RED1_INST, ADC_RED1_ADCMEM_RED_D6);
+    values[7] = (uint16_t)DL_ADC12_getMemResult(
+        ADC_GRAY_INST, ADC_GRAY_ADCMEM_RED_D7);
+    DL_ADC12_clearInterruptStatus(ADC_GRAY_INST, adc0_status);
+    DL_ADC12_clearInterruptStatus(ADC_RED1_INST, adc1_status);
+    g_diagnostics.red_adc_poll_completions++;
     return true;
+}
+
+static bool TiRed_ReadFrame(
+    uint16_t values[RED_ARRAY_CHANNELS], void *context)
+{
+    uint32_t sums[RED_ARRAY_CHANNELS] = {0U};
+    uint8_t sample_count = H2026_RED_SAMPLES_PER_CHANNEL;
+    bool result = false;
+
+    (void)context;
+    if (values == 0) {
+        return false;
+    }
+
+    if (sample_count == 0U) {
+        return false;
+    }
+
+    /* ADC0 MEM0 interrupt belongs to GRAY; RED waits for both final slots. */
+    g_adc_ready = false;
+    DL_ADC12_disableInterrupt(
+        ADC_GRAY_INST, DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED);
+    NVIC_ClearPendingIRQ(ADC_GRAY_INST_INT_IRQN);
+
+    for (uint8_t discard = 0U;
+         discard < H2026_RED_DISCARD_SAMPLES;
+         discard++) {
+        uint16_t ignored[RED_ARRAY_CHANNELS];
+
+        if (!TiRed_ReadOneFrame(ignored)) {
+            goto cleanup;
+        }
+    }
+    for (uint8_t sample = 0U; sample < sample_count; sample++) {
+        uint16_t frame[RED_ARRAY_CHANNELS];
+
+        if (!TiRed_ReadOneFrame(frame)) {
+            goto cleanup;
+        }
+        for (uint8_t channel = 0U;
+             channel < RED_ARRAY_CHANNELS;
+             channel++) {
+            sums[channel] += frame[channel];
+        }
+    }
+    for (uint8_t channel = 0U; channel < RED_ARRAY_CHANNELS; channel++) {
+        values[channel] = (uint16_t)(sums[channel] / sample_count);
+    }
+    result = true;
+
+cleanup:
+    /* Restore the independent GRAY MEM0 path for a later source switch. */
+    DL_ADC12_setStartAddress(ADC_GRAY_INST, DL_ADC12_SEQ_START_ADDR_00);
+    DL_ADC12_setEndAddress(ADC_GRAY_INST, DL_ADC12_SEQ_END_ADDR_00);
+    DL_ADC12_clearInterruptStatus(
+        ADC_GRAY_INST, DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED);
+    DL_ADC12_enableInterrupt(
+        ADC_GRAY_INST, DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED);
+    NVIC_ClearPendingIRQ(ADC_GRAY_INST_INT_IRQN);
+    return result;
 }
 
 static bool TiButton_Read(void *context)
@@ -276,20 +381,13 @@ void TiMspm0Platform_Init(void)
     TB6612_Init();
     Encoder_Init();
 
-    DL_ADC12_disableConversions(ADC_GRAY_INST);
-    DL_ADC12_initSingleSample(
-        ADC_GRAY_INST,
-        DL_ADC12_REPEAT_MODE_DISABLED,
-        DL_ADC12_SAMPLING_SOURCE_AUTO,
-        DL_ADC12_TRIG_SRC_SOFTWARE,
-        DL_ADC12_SAMP_CONV_RES_12_BIT,
-        DL_ADC12_SAMP_CONV_DATA_FORMAT_UNSIGNED);
-    DL_ADC12_setSampleTime0(ADC_GRAY_INST, 8U);
+    /* SysConfig owns both ADC sequence layouts and their analog pinmux. */
     DL_ADC12_clearInterruptStatus(
         ADC_GRAY_INST, DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED);
     DL_ADC12_enableInterrupt(
         ADC_GRAY_INST, DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED);
     DL_ADC12_enableConversions(ADC_GRAY_INST);
+    DL_ADC12_enableConversions(ADC_RED1_INST);
     NVIC_ClearPendingIRQ(ADC_GRAY_INST_INT_IRQN);
     NVIC_EnableIRQ(ADC_GRAY_INST_INT_IRQN);
 }
@@ -368,6 +466,8 @@ CarStatus TiMspm0Platform_BuildConfig(CarFirmwareConfig *config,
     config->car.gray_wide_min_background =
         H2026_GRAY_WIDE_MIN_BACKGROUND;
     config->car.gray_finish_min_confidence = H2026_FINISH_MIN_CONFIDENCE;
+    config->car.gray_finish_min_active_mean =
+        H2026_FINISH_MIN_ACTIVE_MEAN;
     config->car.gray_finish_min_active = H2026_FINISH_MIN_ACTIVE;
     config->car.gray_finish_consecutive_frames =
         H2026_FINISH_CONSECUTIVE_FRAMES;

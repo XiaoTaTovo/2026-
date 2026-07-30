@@ -47,6 +47,16 @@ static void CarRoute_Stop(CarMotorCommand *motor)
     *motor = (CarMotorCommand){0};
 }
 
+static bool CarRoute_CurrentSegmentIsStop(
+    const CarRouteExecutor *executor)
+{
+    return (executor != 0) && executor->running &&
+           (executor->route != 0) &&
+           (executor->index < executor->route->count) &&
+           (executor->route->segments[executor->index].type ==
+            CAR_SEGMENT_STOP);
+}
+
 static bool CarRoute_IsNarrowTrack(const CarLineEstimate *line)
 {
     return (line != 0) &&
@@ -61,21 +71,18 @@ static bool CarRoute_HasAdjacentActive(uint8_t active_mask)
 static bool CarRoute_IsFinishMarker(const CarConfig *config,
                                     const CarLineEstimate *line)
 {
-    bool coherent_wide;
-
     if ((config == 0) || (line == 0) || !line->valid ||
+        (line->active_count == 0U) ||
         (line->confidence < config->gray_finish_min_confidence) ||
-        (line->active_count < config->gray_finish_min_active)) {
+        (line->active_count < config->gray_finish_min_active) ||
+        ((config->gray_finish_min_active_mean > 0U) &&
+         ((uint32_t)line->confidence /
+              (uint32_t)line->active_count <
+          config->gray_finish_min_active_mean))) {
         return false;
     }
-    coherent_wide =
-        (config->gray_wide_min_active > 0U) &&
-        (line->active_count >= config->gray_wide_min_active) &&
-        (line->active_span == line->active_count) &&
-        (line->adaptive_background >=
-         config->gray_wide_min_background) &&
-        CarRoute_HasAdjacentActive(line->active_mask);
-    return (line->pattern == CAR_LINE_PATTERN_WIDE_AREA) || coherent_wide;
+    return (line->active_span == line->active_count) &&
+           CarRoute_HasAdjacentActive(line->active_mask);
 }
 
 static void CarRoute_UpdateTrackLock(CarRouteExecutor *executor,
@@ -394,10 +401,12 @@ static CarStatus CarRoute_UpdateTrack(CarRouteExecutor *executor,
                                  CAR_FAULT_LINE_MISSED,
                                  CAR_ROUTE_EXIT_LINE_MISS);
         }
-    } else if (progress + config->distance_tolerance_mm >=
-               CarRoute_Abs(segment->distance_mm)) {
+    } else if (progress >= CarRoute_Abs(segment->distance_mm)) {
         CarRoute_Advance(executor, now_ms, odometry,
                          CAR_ROUTE_EXIT_DISTANCE);
+        if (CarRoute_CurrentSegmentIsStop(executor)) {
+            CarRoute_Stop(motor);
+        }
     }
     return CAR_OK;
 }
@@ -466,12 +475,23 @@ CarStatus CarRouteExecutor_Update(CarRouteExecutor *executor,
     }
 
     switch (segment->type) {
-        case CAR_SEGMENT_TRACK:
+        case CAR_SEGMENT_TRACK: {
+            CarStatus status;
+
             if (line == 0) {
                 return CAR_ERROR_ARG;
             }
-            return CarRoute_UpdateTrack(executor, segment, config, now_ms,
-                                        odometry, line, motor, faults);
+            status = CarRoute_UpdateTrack(executor, segment, config, now_ms,
+                                          odometry, line, motor, faults);
+            if ((status == CAR_OK) && !motor->enable &&
+                CarRoute_CurrentSegmentIsStop(executor)) {
+                segment = &executor->route->segments[executor->index];
+                *cue = segment->cue;
+                CarRoute_Advance(executor, now_ms, odometry,
+                                 CAR_ROUTE_EXIT_NONE);
+            }
+            return status;
+        }
         case CAR_SEGMENT_CUE:
             *cue = segment->cue;
             CarRoute_Advance(executor, now_ms, odometry,

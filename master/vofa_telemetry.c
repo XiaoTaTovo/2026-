@@ -575,6 +575,89 @@ void VofaTelemetry_SendBanner(void)
         "Send HELP for names.\r\n");
 }
 
+void VofaTelemetry_SendSpeedLoopBanner(void)
+{
+    VofaTelemetry_SendText(
+        "#H2026_SPEED_TUNING_FIREWATER_V1 fields=9 period_ms=25 "
+        "baud=115200\r\n");
+    VofaTelemetry_SendText(
+        "#FIELDS t_ms,target_l_rpm,measured_l_rpm,output_l_pct,"
+        "target_r_rpm,measured_r_rpm,output_r_pct,faults,tx_drop\r\n");
+    VofaTelemetry_SendText(
+        "#KEY1 ARM_OR_STOP 5S; STOP LATCHES; PARAMS READS; "
+        "SPDKP/SPDKI/SPDKD/SPDLIMIT REQUIRE_STOP\r\n");
+}
+
+void VofaTelemetry_SendSpeedLoopArm(uint32_t trial_id,
+                                    int16_t target_mm_s,
+                                    uint32_t uptime_ms)
+{
+    char line[96];
+    VofaTelemetryWriter writer = VofaTelemetry_BeginWrite(
+        line, (uint16_t)sizeof(line));
+
+    VofaTelemetry_AppendText(&writer, "#EVT ARM ");
+    VofaTelemetry_AppendUnsigned(&writer, trial_id);
+    VofaTelemetry_AppendText(&writer, " SPEED_LOOP ");
+    VofaTelemetry_AppendSigned(&writer, target_mm_s);
+    VofaTelemetry_AppendChar(&writer, ' ');
+    VofaTelemetry_AppendUnsigned(&writer, uptime_ms);
+    VofaTelemetry_AppendChar(&writer, '\r');
+    VofaTelemetry_AppendChar(&writer, '\n');
+    (void)VofaTelemetry_EnqueueWriter(&writer);
+}
+
+void VofaTelemetry_SendSpeedLoopDone(uint32_t trial_id,
+                                     const char *reason,
+                                     uint32_t duration_ms,
+                                     uint32_t faults)
+{
+    char line[112];
+    VofaTelemetryWriter writer = VofaTelemetry_BeginWrite(
+        line, (uint16_t)sizeof(line));
+
+    VofaTelemetry_AppendText(&writer, "#EVT DONE ");
+    VofaTelemetry_AppendUnsigned(&writer, trial_id);
+    VofaTelemetry_AppendChar(&writer, ' ');
+    VofaTelemetry_AppendText(&writer, reason);
+    VofaTelemetry_AppendChar(&writer, ' ');
+    VofaTelemetry_AppendUnsigned(&writer, duration_ms);
+    VofaTelemetry_AppendChar(&writer, ' ');
+    VofaTelemetry_AppendUnsigned(&writer, faults);
+    VofaTelemetry_AppendChar(&writer, '\r');
+    VofaTelemetry_AppendChar(&writer, '\n');
+    (void)VofaTelemetry_EnqueueWriter(&writer);
+}
+
+void VofaTelemetry_SendSpeedLoopFrame(const CarFirmware *firmware,
+                                      uint32_t uptime_ms)
+{
+    TB6612SpeedLoopStatus speed = {0};
+    VofaTelemetryWriter writer = VofaTelemetry_BeginWrite(
+        g_frame, (uint16_t)sizeof(g_frame));
+    bool first = true;
+    uint32_t faults;
+
+    if (firmware == 0) {
+        return;
+    }
+    TB6612_DriveGetSpeedLoopStatus(
+        VofaTelemetry_GetDriveConst(firmware), &speed);
+    faults = firmware->hardware_faults | firmware->output.faults;
+    VofaTelemetry_AppendU32Field(&writer, uptime_ms, &first);
+    VofaTelemetry_AppendI32Field(&writer, speed.target_left_rpm, &first);
+    VofaTelemetry_AppendI32Field(&writer, speed.measured_left_rpm, &first);
+    VofaTelemetry_AppendI32Field(&writer, speed.left_output_percent, &first);
+    VofaTelemetry_AppendI32Field(&writer, speed.target_right_rpm, &first);
+    VofaTelemetry_AppendI32Field(&writer, speed.measured_right_rpm, &first);
+    VofaTelemetry_AppendI32Field(&writer, speed.right_output_percent, &first);
+    VofaTelemetry_AppendU32Field(&writer, faults, &first);
+    VofaTelemetry_AppendU32Field(&writer, g_tx_drop_count, &first);
+    VofaTelemetry_AppendChar(&writer, '\r');
+    VofaTelemetry_AppendChar(&writer, '\n');
+    (void)VofaTelemetry_EnqueueWriter(&writer);
+}
+
 void VofaTelemetry_SendFrame(const CarFirmware *firmware,
                              uint32_t uptime_ms)
 {

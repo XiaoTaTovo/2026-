@@ -266,6 +266,6 @@ int main(void)
     TestWriterExactFitAndOverflow();
     TestFrameHas48BoundedFields();
     TestStopCommandLatchesEmergencyStop();
-    puts("VOFA writer-bound, frame-bound, and STOP-command tests passed");
+    puts("VOFA writer, frame, and STOP-command tests passed");
     return 0;
 }

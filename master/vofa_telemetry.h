@@ -8,8 +8,18 @@
 
 void VofaTelemetry_Init(void);
 void VofaTelemetry_SendBanner(void);
+void VofaTelemetry_SendSpeedLoopBanner(void);
 void VofaTelemetry_SendFrame(const CarFirmware *firmware,
                              uint32_t uptime_ms);
+void VofaTelemetry_SendSpeedLoopFrame(const CarFirmware *firmware,
+                                      uint32_t uptime_ms);
+void VofaTelemetry_SendSpeedLoopArm(uint32_t trial_id,
+                                    int16_t target_mm_s,
+                                    uint32_t uptime_ms);
+void VofaTelemetry_SendSpeedLoopDone(uint32_t trial_id,
+                                     const char *reason,
+                                     uint32_t duration_ms,
+                                     uint32_t faults);
 void VofaTelemetry_TxIrqHandler(void);
 void VofaTelemetry_PushRxFromIsr(uint8_t byte);
 bool VofaTelemetry_ProcessCommands(CarFirmware *firmware,

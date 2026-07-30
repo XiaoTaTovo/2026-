@@ -1,0 +1,8 @@
+#ifndef SPEED_TUNING_H
+#define SPEED_TUNING_H
+
+#ifndef H2026_SPEED_TUNING_BUILD
+#define H2026_SPEED_TUNING_BUILD (1)
+#endif
+
+#endif

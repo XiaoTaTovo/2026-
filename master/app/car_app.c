@@ -135,7 +135,8 @@ CarStatus CarApp_Update(CarApp *app,
         app->armed = false;
     }
     if (!app->result_valid && H2026_ModeIsOfficial(app->mode) &&
-        CarApp_CurrentSegmentIsStop(app) && !motor.enable) {
+        (CarApp_CurrentSegmentIsStop(app) || app->executor.finished) &&
+        !motor.enable) {
         app->result_time_ms = (uint32_t)(now_ms - app->run_start_ms);
         app->result_valid = true;
     }

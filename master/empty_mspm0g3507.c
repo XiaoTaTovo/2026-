@@ -311,403 +311,405 @@
 //     TiMspm0Platform_OnSysTick();
 // }
 
-#include "ti_msp_dl_config.h"
+// #include "ti_msp_dl_config.h"
 
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
+// #include <stdbool.h>
+// #include <stdint.h>
+// #include <stdio.h>
 
-#include "OLED.h"
-#include "firmware.h"
-#include "platform/ti_mspm0_platform.h"
-#include "project_mode.h"
-#include "tb6612.h"
-#include "vofa_telemetry.h"
+// #include "OLED.h"
+// #include "firmware.h"
+// #include "platform/ti_mspm0_platform.h"
+// #include "project_mode.h"
+// #include "tb6612.h"
+// #include "vofa_telemetry.h"
 
-#define H2026_OLED_RENDER_PERIOD_MS (250U)
-#define H2026_OLED_TX_PERIOD_MS (5U)
-#define H2026_TELEMETRY_PERIOD_MS (100U)
-#define H2026_OLED_UI_PAGE_COUNT (2U)
-#define H2026_BUTTON_DEBOUNCE_MS (20U)
+// #define H2026_OLED_RENDER_PERIOD_MS (250U)
+// #define H2026_OLED_TX_PERIOD_MS (5U)
+// #define H2026_TELEMETRY_PERIOD_MS (100U)
+// #define H2026_OLED_UI_PAGE_COUNT (2U)
+// #define H2026_BUTTON_DEBOUNCE_MS (20U)
 
-static CarFirmware g_firmware;
-static Button g_page_button;
-static OLED_Status g_oled_status = OLED_STATUS_ERROR_NOT_INITIALIZED;
-static bool g_oled_dirty = true;
-static uint8_t g_oled_ui_page;
-static uint8_t g_oled_tx_page = OLED_PAGE_COUNT;
-static uint32_t g_oled_last_render_ms;
-static uint32_t g_oled_last_tx_ms;
+// static CarFirmware g_firmware;
+// static Button g_page_button;
+// static OLED_Status g_oled_status = OLED_STATUS_ERROR_NOT_INITIALIZED;
+// static bool g_oled_dirty = true;
+// static uint8_t g_oled_ui_page;
+// static uint8_t g_oled_tx_page = OLED_PAGE_COUNT;
+// static uint32_t g_oled_last_render_ms;
+// static uint32_t g_oled_last_tx_ms;
 
-static H2026Mode H2026_SelectedMode(void)
-{
-#if PROJECT_MODE == PROJECT_MODE_H2026_B2
-    return H2026_MODE_B2;
-#elif PROJECT_MODE == PROJECT_MODE_H2026_B3
-    return H2026_MODE_B3;
-#elif PROJECT_MODE == PROJECT_MODE_H2026_B4
-    return H2026_MODE_B4;
-#elif PROJECT_MODE == PROJECT_MODE_H2026_B5
-    return H2026_MODE_B5;
-#elif PROJECT_MODE == PROJECT_MODE_H2026_B6
-    return H2026_MODE_B6;
-#else
-#error "Unsupported 2026 H project mode"
-#endif
-}
+// static H2026Mode H2026_SelectedMode(void)
+// {
+// #if PROJECT_MODE == PROJECT_MODE_H2026_B2
+//     return H2026_MODE_B2;
+// #elif PROJECT_MODE == PROJECT_MODE_H2026_B3
+//     return H2026_MODE_B3;
+// #elif PROJECT_MODE == PROJECT_MODE_H2026_B4
+//     return H2026_MODE_B4;
+// #elif PROJECT_MODE == PROJECT_MODE_H2026_B5
+//     return H2026_MODE_B5;
+// #elif PROJECT_MODE == PROJECT_MODE_H2026_B6
+//     return H2026_MODE_B6;
+// #else
+// #error "Unsupported 2026 H project mode"
+// #endif
+// }
 
-static bool H2026_ReadPageButton(void *context)
-{
-    (void)context;
-    return TiMspm0Platform_ReadKey3Level();
-}
+// static bool H2026_ReadPageButton(void *context)
+// {
+//     (void)context;
+//     return TiMspm0Platform_ReadKey3Level();
+// }
 
-static const char *H2026_TrackName(const CarFirmware *firmware)
-{
-    return (firmware->config.track_sensor_source ==
-            CAR_TRACK_SENSOR_RED_ARRAY) ? "RED" : "GRAY";
-}
+// static const char *H2026_TrackName(const CarFirmware *firmware)
+// {
+//     return (firmware->config.track_sensor_source ==
+//             CAR_TRACK_SENSOR_RED_ARRAY) ? "RED" : "GRAY";
+// }
 
-static const uint16_t *H2026_TrackRaw(const CarFirmware *firmware)
-{
-    if (firmware->config.track_sensor_source ==
-        CAR_TRACK_SENSOR_RED_ARRAY) {
-        return firmware->red.raw;
-    }
-    return firmware->gray.raw;
-}
+// static const uint16_t *H2026_TrackRaw(const CarFirmware *firmware)
+// {
+//     if (firmware->config.track_sensor_source ==
+//         CAR_TRACK_SENSOR_RED_ARRAY) {
+//         return firmware->red.raw;
+//     }
+//     return firmware->gray.raw;
+// }
 
-static bool H2026_TrackCalibrated(const CarFirmware *firmware)
-{
-    return firmware->gray_cal_state == CAR_GRAY_CAL_READY;
-}
+// static bool H2026_TrackCalibrated(const CarFirmware *firmware)
+// {
+//     return firmware->gray_cal_state == CAR_GRAY_CAL_READY;
+// }
 
-static const char *H2026_RunStateName(const CarFirmware *firmware)
-{
-    if (firmware->app.executor.finished) {
-        return "DONE";
-    }
-    return firmware->app.executor.running ? "RUN" : "STOP";
-}
+// static const char *H2026_RunStateName(const CarFirmware *firmware)
+// {
+//     if (firmware->app.executor.finished) {
+//         return "DONE";
+//     }
+//     return firmware->app.executor.running ? "RUN" : "STOP";
+// }
 
-static const char *H2026_ButtonActionName(CarButtonAction action)
-{
-    switch (action) {
-        case CAR_BUTTON_ACTION_ARM_OK:
-            return "ARM";
-        case CAR_BUTTON_ACTION_ARM_REJECTED:
-            return "REJ";
-        case CAR_BUTTON_ACTION_GRAY_REQUIRED:
-            return "CAL";
-        case CAR_BUTTON_ACTION_EMERGENCY_STOP:
-            return "STOP";
-        case CAR_BUTTON_ACTION_NONE:
-        default:
-            return "-";
-    }
-}
+// static const char *H2026_ButtonActionName(CarButtonAction action)
+// {
+//     switch (action) {
+//         case CAR_BUTTON_ACTION_ARM_OK:
+//             return "ARM";
+//         case CAR_BUTTON_ACTION_ARM_REJECTED:
+//             return "REJ";
+//         case CAR_BUTTON_ACTION_GRAY_REQUIRED:
+//             return "CAL";
+//         case CAR_BUTTON_ACTION_EMERGENCY_STOP:
+//             return "STOP";
+//         case CAR_BUTTON_ACTION_NONE:
+//         default:
+//             return "-";
+//     }
+// }
 
-static const char *H2026_RouteExitName(CarRouteExitReason reason)
-{
-    switch (reason) {
-        case CAR_ROUTE_EXIT_DISTANCE:
-            return "DIST";
-        case CAR_ROUTE_EXIT_FINISH_MARKER:
-            return "MARK";
-        case CAR_ROUTE_EXIT_LINE_MISS:
-            return "MISS";
-        case CAR_ROUTE_EXIT_TIMEOUT:
-            return "TIME";
-        case CAR_ROUTE_EXIT_NONE:
-        default:
-            return "-";
-    }
-}
+// static const char *H2026_RouteExitName(CarRouteExitReason reason)
+// {
+//     switch (reason) {
+//         case CAR_ROUTE_EXIT_DISTANCE:
+//             return "DIST";
+//         case CAR_ROUTE_EXIT_FINISH_MARKER:
+//             return "MARK";
+//         case CAR_ROUTE_EXIT_LINE_MISS:
+//             return "MISS";
+//         case CAR_ROUTE_EXIT_TIMEOUT:
+//             return "TIME";
+//         case CAR_ROUTE_EXIT_NONE:
+//         default:
+//             return "-";
+//     }
+// }
 
-static int32_t H2026_Round(float value)
-{
-    return (int32_t)(value + ((value >= 0.0f) ? 0.5f : -0.5f));
-}
+// static int32_t H2026_Round(float value)
+// {
+//     return (int32_t)(value + ((value >= 0.0f) ? 0.5f : -0.5f));
+// }
 
-static int32_t H2026_ClampDisplayRpm(int32_t rpm)
-{
-    if (rpm > 999) {
-        return 999;
-    }
-    if (rpm < -999) {
-        return -999;
-    }
-    return rpm;
-}
+// static int32_t H2026_ClampDisplayRpm(int32_t rpm)
+// {
+//     if (rpm > 999) {
+//         return 999;
+//     }
+//     if (rpm < -999) {
+//         return -999;
+//     }
+//     return rpm;
+// }
 
-static void H2026_DrawCalibration(const CarFirmware *firmware)
-{
-    char line[22];
+// static void H2026_DrawCalibration(const CarFirmware *firmware)
+// {
+//     char line[22];
 
-    switch (firmware->gray_cal_state) {
-        case CAR_GRAY_CAL_WAIT_WHITE:
-            (void)OLED_ShowString(0U, 1U, "CAL:WHITE -> K2");
-            break;
-        case CAR_GRAY_CAL_CAPTURE_WHITE:
-            (void)snprintf(line, sizeof(line), "WHITE %u/%u",
-                           (unsigned)firmware->gray_cal_frame_count,
-                           (unsigned)CAR_GRAY_CALIBRATION_FRAMES);
-            (void)OLED_ShowString(0U, 1U, line);
-            break;
-        case CAR_GRAY_CAL_WAIT_BLACK:
-            (void)OLED_ShowString(0U, 1U, "CAL:BLACK -> K2");
-            break;
-        case CAR_GRAY_CAL_CAPTURE_BLACK:
-            (void)snprintf(line, sizeof(line), "BLACK %u/%u",
-                           (unsigned)firmware->gray_cal_frame_count,
-                           (unsigned)CAR_GRAY_CALIBRATION_FRAMES);
-            (void)OLED_ShowString(0U, 1U, line);
-            break;
-        case CAR_GRAY_CAL_READY:
-            (void)OLED_ShowString(0U, 1U, "CAL:OK K1 START");
-            break;
-        case CAR_GRAY_CAL_ERROR:
-            (void)snprintf(line, sizeof(line), "CAL:ERR C%u D%ld",
-                           (unsigned)(firmware->gray_cal_bad_channel + 1U),
-                           (long)firmware->gray_cal_bad_span);
-            (void)OLED_ShowString(0U, 1U, line);
-            break;
-        default:
-            (void)OLED_ShowString(0U, 1U, "CAL:?");
-            break;
-    }
-}
+//     switch (firmware->gray_cal_state) {
+//         case CAR_GRAY_CAL_WAIT_WHITE:
+//             (void)OLED_ShowString(0U, 1U, "CAL:WHITE -> K2");
+//             break;
+//         case CAR_GRAY_CAL_CAPTURE_WHITE:
+//             (void)snprintf(line, sizeof(line), "WHITE %u/%u",
+//                            (unsigned)firmware->gray_cal_frame_count,
+//                            (unsigned)CAR_GRAY_CALIBRATION_FRAMES);
+//             (void)OLED_ShowString(0U, 1U, line);
+//             break;
+//         case CAR_GRAY_CAL_WAIT_BLACK:
+//             (void)OLED_ShowString(0U, 1U, "CAL:BLACK -> K2");
+//             break;
+//         case CAR_GRAY_CAL_CAPTURE_BLACK:
+//             (void)snprintf(line, sizeof(line), "BLACK %u/%u",
+//                            (unsigned)firmware->gray_cal_frame_count,
+//                            (unsigned)CAR_GRAY_CALIBRATION_FRAMES);
+//             (void)OLED_ShowString(0U, 1U, line);
+//             break;
+//         case CAR_GRAY_CAL_READY:
+//             (void)OLED_ShowString(0U, 1U, "CAL:OK K1 START");
+//             break;
+//         case CAR_GRAY_CAL_ERROR:
+//             (void)snprintf(line, sizeof(line), "CAL:ERR C%u D%ld",
+//                            (unsigned)(firmware->gray_cal_bad_channel + 1U),
+//                            (long)firmware->gray_cal_bad_span);
+//             (void)OLED_ShowString(0U, 1U, line);
+//             break;
+//         default:
+//             (void)OLED_ShowString(0U, 1U, "CAL:?");
+//             break;
+//     }
+// }
 
-static void H2026_DrawStatusPage(const CarFirmware *firmware)
-{
-    char line[22];
-    uint32_t faults = firmware->hardware_faults | firmware->output.faults;
+// static void H2026_DrawStatusPage(const CarFirmware *firmware)
+// {
+//     char line[22];
+//     uint32_t faults = firmware->hardware_faults | firmware->output.faults;
 
-    (void)snprintf(line, sizeof(line), "%s P1/2 B2 %s",
-                   H2026_TrackName(firmware), H2026_RunStateName(firmware));
-    (void)OLED_ShowString(0U, 0U, line);
-    H2026_DrawCalibration(firmware);
-    (void)snprintf(line, sizeof(line), "IMU:%s ENC:%u",
-                   firmware->yaw.calibrated ? "OK" : "WAIT",
-                   firmware->encoder_valid_current ? 1U : 0U);
-    (void)OLED_ShowString(0U, 2U, line);
-    (void)snprintf(line, sizeof(line), "SEG:%u P:%u X:%s",
-                   (unsigned)firmware->app.executor.index,
-                   (unsigned)firmware->app.executor.track_phase,
-                   H2026_RouteExitName(
-                       firmware->app.executor.last_exit_reason));
-    (void)OLED_ShowString(0U, 3U, line);
-    (void)snprintf(line, sizeof(line), "LINE:%c E:%+5d",
-                   firmware->app.line.valid ? 'Y' : 'N',
-                   (int)firmware->app.line.track_position);
-    (void)OLED_ShowString(0U, 4U, line);
-    (void)snprintf(line, sizeof(line), "PWM:%+3d/%+3d",
-                   (int)TB6612_GetLeftCommand(),
-                   (int)TB6612_GetRightCommand());
-    (void)OLED_ShowString(0U, 5U, line);
-    (void)snprintf(line, sizeof(line), "K:%u%u%u A:%s",
-                   TiMspm0Platform_ReadKey1Level() ? 1U : 0U,
-                   TiMspm0Platform_ReadKey2Level() ? 1U : 0U,
-                   TiMspm0Platform_ReadKey3Level() ? 1U : 0U,
-                   H2026_ButtonActionName(firmware->last_button_action));
-    (void)OLED_ShowString(0U, 6U, line);
-    (void)snprintf(line, sizeof(line), "F:%08lX",
-                   (unsigned long)faults);
-    (void)OLED_ShowString(0U, 7U, line);
-}
+//     (void)snprintf(line, sizeof(line), "%s P1/2 B2 %s",
+//                    H2026_TrackName(firmware), H2026_RunStateName(firmware));
+//     (void)OLED_ShowString(0U, 0U, line);
+//     H2026_DrawCalibration(firmware);
+//     (void)snprintf(line, sizeof(line), "IMU:%s ENC:%u",
+//                    firmware->yaw.calibrated ? "OK" : "WAIT",
+//                    firmware->encoder_valid_current ? 1U : 0U);
+//     (void)OLED_ShowString(0U, 2U, line);
+//     (void)snprintf(line, sizeof(line), "SEG:%u P:%u X:%s",
+//                    (unsigned)firmware->app.executor.index,
+//                    (unsigned)firmware->app.executor.track_phase,
+//                    H2026_RouteExitName(
+//                        firmware->app.executor.last_exit_reason));
+//     (void)OLED_ShowString(0U, 3U, line);
+//     (void)snprintf(line, sizeof(line), "LINE:%c E:%+5d",
+//                    firmware->app.line.valid ? 'Y' : 'N',
+//                    (int)firmware->app.line.track_position);
+//     (void)OLED_ShowString(0U, 4U, line);
+//     (void)snprintf(line, sizeof(line), "PWM:%+3d/%+3d",
+//                    (int)TB6612_GetLeftCommand(),
+//                    (int)TB6612_GetRightCommand());
+//     (void)OLED_ShowString(0U, 5U, line);
+//     (void)snprintf(line, sizeof(line), "K:%u%u%u A:%s",
+//                    TiMspm0Platform_ReadKey1Level() ? 1U : 0U,
+//                    TiMspm0Platform_ReadKey2Level() ? 1U : 0U,
+//                    TiMspm0Platform_ReadKey3Level() ? 1U : 0U,
+//                    H2026_ButtonActionName(firmware->last_button_action));
+//     (void)OLED_ShowString(0U, 6U, line);
+//     (void)snprintf(line, sizeof(line), "F:%08lX",
+//                    (unsigned long)faults);
+//     (void)OLED_ShowString(0U, 7U, line);
+// }
 
-static void H2026_DrawDataPage(const CarFirmware *firmware)
-{
-    char line[22];
-    const uint16_t *raw = H2026_TrackRaw(firmware);
-    const uint16_t *values = H2026_TrackCalibrated(firmware) ?
-        firmware->gray_sample.normalized : raw;
-    char prefix = H2026_TrackCalibrated(firmware) ? 'N' : 'R';
-    TB6612SpeedLoopStatus speed = {0};
+// static void H2026_DrawDataPage(const CarFirmware *firmware)
+// {
+//     char line[22];
+//     const uint16_t *raw = H2026_TrackRaw(firmware);
+//     const uint16_t *values = H2026_TrackCalibrated(firmware) ?
+//         firmware->gray_sample.normalized : raw;
+//     char prefix = H2026_TrackCalibrated(firmware) ? 'N' : 'R';
+//     TB6612SpeedLoopStatus speed = {0};
 
-    TB6612_DriveGetSpeedLoopStatus(
-        (const TB6612Drive *)firmware->config.drive.context, &speed);
-    (void)snprintf(line, sizeof(line), "%s P2/2 %s",
-                   H2026_TrackName(firmware),
-                   H2026_TrackCalibrated(firmware) ? "NRM" : "RAW");
-    (void)OLED_ShowString(0U, 0U, line);
-    for (uint8_t row = 0U; row < 4U; row++) {
-        uint8_t first = (uint8_t)(row * 2U);
+//     TB6612_DriveGetSpeedLoopStatus(
+//         (const TB6612Drive *)firmware->config.drive.context, &speed);
+//     (void)snprintf(line, sizeof(line), "%s P2/2 %s",
+//                    H2026_TrackName(firmware),
+//                    H2026_TrackCalibrated(firmware) ? "NRM" : "RAW");
+//     (void)OLED_ShowString(0U, 0U, line);
+//     for (uint8_t row = 0U; row < 4U; row++) {
+//         uint8_t first = (uint8_t)(row * 2U);
 
-        (void)snprintf(line, sizeof(line), "%c%u:%4u %u:%4u",
-                       prefix, (unsigned)(first + 1U),
-                       (unsigned)values[first],
-                       (unsigned)(first + 2U),
-                       (unsigned)values[first + 1U]);
-        (void)OLED_ShowString(0U, (uint8_t)(row + 1U), line);
-    }
-    (void)snprintf(line, sizeof(line), "E:%+5d U:%+4ld",
-                   (int)firmware->app.line.track_position,
-                   (long)H2026_Round(
-                       firmware->app.executor.line_correction_mm_s));
-    (void)OLED_ShowString(0U, 5U, line);
-    (void)snprintf(line, sizeof(line), "T:%+4ld/%+4ld",
-                   (long)H2026_ClampDisplayRpm(speed.target_left_rpm),
-                   (long)H2026_ClampDisplayRpm(speed.target_right_rpm));
-    (void)OLED_ShowString(0U, 6U, line);
-    (void)snprintf(line, sizeof(line), "M:%+4ld/%+4ld",
-                   (long)H2026_ClampDisplayRpm(speed.measured_left_rpm),
-                   (long)H2026_ClampDisplayRpm(speed.measured_right_rpm));
-    (void)OLED_ShowString(0U, 7U, line);
-}
+//         (void)snprintf(line, sizeof(line), "%c%u:%4u %u:%4u",
+//                        prefix, (unsigned)(first + 1U),
+//                        (unsigned)values[first],
+//                        (unsigned)(first + 2U),
+//                        (unsigned)values[first + 1U]);
+//         (void)OLED_ShowString(0U, (uint8_t)(row + 1U), line);
+//     }
+//     (void)snprintf(line, sizeof(line), "E:%+5d U:%+4ld",
+//                    (int)firmware->app.line.track_position,
+//                    (long)H2026_Round(
+//                        firmware->app.executor.line_correction_mm_s));
+//     (void)OLED_ShowString(0U, 5U, line);
+//     (void)snprintf(line, sizeof(line), "T:%+4ld/%+4ld",
+//                    (long)H2026_ClampDisplayRpm(speed.target_left_rpm),
+//                    (long)H2026_ClampDisplayRpm(speed.target_right_rpm));
+//     (void)OLED_ShowString(0U, 6U, line);
+//     (void)snprintf(line, sizeof(line), "M:%+4ld/%+4ld",
+//                    (long)H2026_ClampDisplayRpm(speed.measured_left_rpm),
+//                    (long)H2026_ClampDisplayRpm(speed.measured_right_rpm));
+//     (void)OLED_ShowString(0U, 7U, line);
+// }
 
-static void H2026_InitOled(void)
-{
-    OLED_Config config = OLED_MakeSSD1306Config(OLED_DEFAULT_ADDR_7BIT);
+// static void H2026_InitOled(void)
+// {
+//     OLED_Config config = OLED_MakeSSD1306Config(OLED_DEFAULT_ADDR_7BIT);
 
-    g_oled_status = OLED_Init(&config);
-    if (g_oled_status == OLED_STATUS_ERROR_I2C_ADDRESS_NACK) {
-        config = OLED_MakeSSD1306Config(0x3DU);
-        g_oled_status = OLED_Init(&config);
-    }
-    g_oled_dirty = g_oled_status == OLED_STATUS_OK;
-}
+//     g_oled_status = OLED_Init(&config);
+//     if (g_oled_status == OLED_STATUS_ERROR_I2C_ADDRESS_NACK) {
+//         config = OLED_MakeSSD1306Config(0x3DU);
+//         g_oled_status = OLED_Init(&config);
+//     }
+//     g_oled_dirty = g_oled_status == OLED_STATUS_OK;
+// }
 
-static void H2026_ServiceOled(const CarFirmware *firmware, uint32_t now_ms)
-{
-    if ((firmware == 0) || !OLED_IsInitialized()) {
-        return;
-    }
-    if ((g_oled_tx_page >= OLED_PAGE_COUNT) &&
-        (g_oled_dirty ||
-         ((uint32_t)(now_ms - g_oled_last_render_ms) >=
-          H2026_OLED_RENDER_PERIOD_MS))) {
-        (void)OLED_Clear();
-        if (g_oled_ui_page == 0U) {
-            H2026_DrawStatusPage(firmware);
-        } else {
-            H2026_DrawDataPage(firmware);
-        }
-        g_oled_dirty = false;
-        g_oled_last_render_ms = now_ms;
-        g_oled_tx_page = 0U;
-    }
-    if ((g_oled_tx_page >= OLED_PAGE_COUNT) ||
-        ((uint32_t)(now_ms - g_oled_last_tx_ms) <
-         H2026_OLED_TX_PERIOD_MS)) {
-        return;
-    }
-    g_oled_last_tx_ms = now_ms;
-    g_oled_status = OLED_UpdatePages(g_oled_tx_page, 1U);
-    if (g_oled_status == OLED_STATUS_OK) {
-        g_oled_tx_page++;
-    } else {
-        g_oled_tx_page = OLED_PAGE_COUNT;
-    }
-}
+// static void H2026_ServiceOled(const CarFirmware *firmware, uint32_t now_ms)
+// {
+//     if ((firmware == 0) || !OLED_IsInitialized()) {
+//         return;
+//     }
+//     if ((g_oled_tx_page >= OLED_PAGE_COUNT) &&
+//         (g_oled_dirty ||
+//          ((uint32_t)(now_ms - g_oled_last_render_ms) >=
+//           H2026_OLED_RENDER_PERIOD_MS))) {
+//         (void)OLED_Clear();
+//         if (g_oled_ui_page == 0U) {
+//             H2026_DrawStatusPage(firmware);
+//         } else {
+//             H2026_DrawDataPage(firmware);
+//         }
+//         g_oled_dirty = false;
+//         g_oled_last_render_ms = now_ms;
+//         g_oled_tx_page = 0U;
+//     }
+//     if ((g_oled_tx_page >= OLED_PAGE_COUNT) ||
+//         ((uint32_t)(now_ms - g_oled_last_tx_ms) <
+//          H2026_OLED_TX_PERIOD_MS)) {
+//         return;
+//     }
+//     g_oled_last_tx_ms = now_ms;
+//     g_oled_status = OLED_UpdatePages(g_oled_tx_page, 1U);
+//     if (g_oled_status == OLED_STATUS_OK) {
+//         g_oled_tx_page++;
+//     } else {
+//         g_oled_tx_page = OLED_PAGE_COUNT;
+//     }
+// }
 
-static void H2026_ServicePageButton(uint32_t now_ms)
-{
-    Button_Update(&g_page_button, now_ms);
-    if (Button_TakePressedEvent(&g_page_button)) {
-        g_oled_ui_page = (uint8_t)((g_oled_ui_page + 1U) %
-                                   H2026_OLED_UI_PAGE_COUNT);
-        g_oled_dirty = true;
-    }
-}
+// static void H2026_ServicePageButton(uint32_t now_ms)
+// {
+//     Button_Update(&g_page_button, now_ms);
+//     if (Button_TakePressedEvent(&g_page_button)) {
+//         g_oled_ui_page = (uint8_t)((g_oled_ui_page + 1U) %
+//                                    H2026_OLED_UI_PAGE_COUNT);
+//         g_oled_dirty = true;
+//     }
+// }
 
-static void H2026_RunFirmware(void)
-{
-    CarFirmwareConfig config;
-    CarStatus status;
-    uint32_t last_telemetry_ms = 0U;
-    uint16_t last_route_index = UINT16_MAX;
-    CarTrackPhase last_track_phase = (CarTrackPhase)UINT8_MAX;
-    CarRouteExitReason last_exit_reason =
-        (CarRouteExitReason)UINT8_MAX;
-    uint32_t last_faults = UINT32_MAX;
+// static void H2026_RunFirmware(void)
+// {
+//     CarFirmwareConfig config;
+//     CarStatus status;
+//     uint32_t last_telemetry_ms = 0U;
+//     uint16_t last_route_index = UINT16_MAX;
+//     CarTrackPhase last_track_phase = (CarTrackPhase)UINT8_MAX;
+//     CarRouteExitReason last_exit_reason =
+//         (CarRouteExitReason)UINT8_MAX;
+//     uint32_t last_faults = UINT32_MAX;
 
-    TiMspm0Platform_Init();
-    H2026_InitOled();
-    Button_Init(&g_page_button, H2026_ReadPageButton, 0, true,
-                H2026_BUTTON_DEBOUNCE_MS);
-    status = TiMspm0Platform_BuildConfig(&config, H2026_SelectedMode());
-    if (status == CAR_OK) {
-        status = CarFirmware_Init(&g_firmware, &config,
-                                  TiMspm0Platform_Millis());
-    }
-    if (status != CAR_OK) {
-        TB6612_Stop();
-        while (1) {
-            DL_WWDT_restart(WWDT0_INST);
-            __WFI();
-        }
-    }
+//     TiMspm0Platform_Init();
+//     H2026_InitOled();
+//     Button_Init(&g_page_button, H2026_ReadPageButton, 0, true,
+//                 H2026_BUTTON_DEBOUNCE_MS);
+//     status = TiMspm0Platform_BuildConfig(&config, H2026_SelectedMode());
+//     if (status == CAR_OK) {
+//         status = CarFirmware_Init(&g_firmware, &config,
+//                                   TiMspm0Platform_Millis());
+//     }
+//     if (status != CAR_OK) {
+//         TB6612_Stop();
+//         while (1) {
+//             DL_WWDT_restart(WWDT0_INST);
+//             __WFI();
+//         }
+//     }
 
-    VofaTelemetry_Init();
-    NVIC_ClearPendingIRQ(UART_VOFA_INST_INT_IRQN);
-    NVIC_EnableIRQ(UART_VOFA_INST_INT_IRQN);
-    VofaTelemetry_SendBanner();
+//     VofaTelemetry_Init();
+//     NVIC_ClearPendingIRQ(UART_VOFA_INST_INT_IRQN);
+//     NVIC_EnableIRQ(UART_VOFA_INST_INT_IRQN);
+//     VofaTelemetry_SendBanner();
 
-    while (1) {
-        uint32_t now_ms = TiMspm0Platform_Millis();
-        uint32_t faults;
-        bool command_event;
-        bool telemetry_event;
+//     while (1) {
+//         uint32_t now_ms = TiMspm0Platform_Millis();
+//         uint32_t faults;
+//         bool command_event;
+//         bool telemetry_event;
 
-        command_event = VofaTelemetry_ProcessCommands(&g_firmware, now_ms);
-        CarFirmware_Tick(&g_firmware, now_ms);
-        H2026_ServicePageButton(now_ms);
-        faults = g_firmware.hardware_faults | g_firmware.output.faults;
-        telemetry_event =
-            command_event ||
-            (g_firmware.app.executor.index != last_route_index) ||
-            (g_firmware.app.executor.track_phase != last_track_phase) ||
-            (g_firmware.app.executor.last_exit_reason != last_exit_reason) ||
-            (faults != last_faults);
-        if (telemetry_event ||
-            ((uint32_t)(now_ms - last_telemetry_ms) >=
-             H2026_TELEMETRY_PERIOD_MS)) {
-            VofaTelemetry_SendFrame(&g_firmware, now_ms);
-            last_telemetry_ms = now_ms;
-            last_route_index = g_firmware.app.executor.index;
-            last_track_phase = g_firmware.app.executor.track_phase;
-            last_exit_reason = g_firmware.app.executor.last_exit_reason;
-            last_faults = faults;
-        }
-        H2026_ServiceOled(&g_firmware, now_ms);
-        DL_WWDT_restart(WWDT0_INST);
-        __WFI();
-    }
-}
+//         command_event = VofaTelemetry_ProcessCommands(&g_firmware, now_ms);
+//         CarFirmware_Tick(&g_firmware, now_ms);
+//         H2026_ServicePageButton(now_ms);
+//         faults = g_firmware.hardware_faults | g_firmware.output.faults;
+//         telemetry_event =
+//             command_event ||
+//             (g_firmware.app.executor.index != last_route_index) ||
+//             (g_firmware.app.executor.track_phase != last_track_phase) ||
+//             (g_firmware.app.executor.last_exit_reason != last_exit_reason) ||
+//             (faults != last_faults);
+//         if (telemetry_event ||
+//             ((uint32_t)(now_ms - last_telemetry_ms) >=
+//              H2026_TELEMETRY_PERIOD_MS)) {
+//             VofaTelemetry_SendFrame(&g_firmware, now_ms);
+//             last_telemetry_ms = now_ms;
+//             last_route_index = g_firmware.app.executor.index;
+//             last_track_phase = g_firmware.app.executor.track_phase;
+//             last_exit_reason = g_firmware.app.executor.last_exit_reason;
+//             last_faults = faults;
+//         }
+//         H2026_ServiceOled(&g_firmware, now_ms);
+//         DL_WWDT_restart(WWDT0_INST);
+//         __WFI();
+//     }
+// }
 
-void UART_VOFA_INST_IRQHandler(void)
-{
-    switch (DL_UART_Main_getPendingInterrupt(UART_VOFA_INST)) {
-        case DL_UART_MAIN_IIDX_RX:
-            while (!DL_UART_Main_isRXFIFOEmpty(UART_VOFA_INST)) {
-                VofaTelemetry_PushRxFromIsr(
-                    (uint8_t)DL_UART_Main_receiveData(UART_VOFA_INST));
-            }
-            break;
-        case DL_UART_MAIN_IIDX_TX:
-            VofaTelemetry_TxIrqHandler();
-            break;
-        default:
-            break;
-    }
-}
+// void UART_VOFA_INST_IRQHandler(void)
+// {
+//     switch (DL_UART_Main_getPendingInterrupt(UART_VOFA_INST)) {
+//         case DL_UART_MAIN_IIDX_RX:
+//             while (!DL_UART_Main_isRXFIFOEmpty(UART_VOFA_INST)) {
+//                 VofaTelemetry_PushRxFromIsr(
+//                     (uint8_t)DL_UART_Main_receiveData(UART_VOFA_INST));
+//             }
+//             break;
+//         case DL_UART_MAIN_IIDX_TX:
+//             VofaTelemetry_TxIrqHandler();
+//             break;
+//         default:
+//             break;
+//     }
+// }
 
-int main(void)
-{
-    SYSCFG_DL_init();
-    DL_WWDT_setCoreHaltBehavior(WWDT0_INST, DL_WWDT_CORE_HALT_STOP);
-    DL_SYSTICK_config(CPUCLK_FREQ / 1000U);
-    H2026_RunFirmware();
-    return 0;
-}
+// int main(void)
+// {
+//     SYSCFG_DL_init();
+//     DL_WWDT_setCoreHaltBehavior(WWDT0_INST, DL_WWDT_CORE_HALT_STOP);
+//     DL_SYSTICK_config(CPUCLK_FREQ / 1000U);
+//     H2026_RunFirmware();
+//     return 0;
+// }
 
-void SysTick_Handler(void)
-{
-    TiMspm0Platform_OnSysTick();
-}
+// void SysTick_Handler(void)
+// {
+//     TiMspm0Platform_OnSysTick();
+// }
 
-#if 0
+#include "speed_tuning.h"
+
+#if !H2026_SPEED_TUNING_BUILD
 /*
  * 最小验证单元：TB6612 开环 + 八路红外原始值/归一化值 + 按键黑白标定。
  *
@@ -718,7 +720,7 @@ void SysTick_Handler(void)
  * 传感器后端由 platform/ti_mspm0_platform_config.h 的
  * H2026_TRACK_SENSOR_SOURCE 决定（CAR_TRACK_SENSOR_GRAY_ARRAY /
  * CAR_TRACK_SENSOR_RED_ARRAY），与正式固件共用同一个开关。
- * 两者当前共用同一套硬件：3 位地址 mux PA24/25/26 + ADC PA27。
+ * GRAY 使用 PA24/25/26 地址 mux 与 ADC0/PA27；RED 使用八路独立 ADC。
  *
  * 蓝牙 = UART_VOFA = UART3 = PB2(TX)/PB3(RX)，115200 8N1。
  *
@@ -762,6 +764,10 @@ _Static_assert((H2026_TRACK_SENSOR_SOURCE == CAR_TRACK_SENSOR_GRAY_ARRAY) ||
 #define GRAY_CAL_FRAMES      (16U)
 #define GRAY_SETTLE_US       (10U)
 #define GRAY_SAMPLES_PER_CH  (4U)
+/* RED-only timing is shared with the formal platform adapter. */
+#define RED_SETTLE_US        H2026_RED_SETTLE_US
+#define RED_DISCARD_SAMPLES  H2026_RED_DISCARD_SAMPLES
+#define RED_SAMPLES_PER_CH   H2026_RED_SAMPLES_PER_CHANNEL
 #define KEY_DEBOUNCE_MS      (20U)
 #define ADC_TIMEOUT_LOOPS    (100000U)
 #define UART_TIMEOUT_LOOPS   (100000U)
@@ -866,7 +872,7 @@ static void uart_puts(const char *text)
     }
 }
 
-/* ---------------- 红外阵列底层：3 位地址选通 + 单通道 ADC ------------------ */
+/* ---------------- GRAY 阵列底层：3 位地址选通 + 单通道 ADC ---------------- */
 
 static bool gray_select(uint8_t channel, void *context)
 {
@@ -903,6 +909,9 @@ static bool gray_read_adc(uint16_t *value, void *context)
     }
     g_adc_ready = false;
     g_adc_last_completion = TRACK_ADC_NONE;
+    /* ADC0 also owns RED slots; select only GRAY MEM0 for this read. */
+    DL_ADC12_setStartAddress(ADC_GRAY_INST, DL_ADC12_SEQ_START_ADDR_00);
+    DL_ADC12_setEndAddress(ADC_GRAY_INST, DL_ADC12_SEQ_END_ADDR_00);
     DL_ADC12_clearInterruptStatus(ADC_GRAY_INST,
         DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED);
     /* Source: TI MSPM0 SDK 2.09 adc12_single_conversion.c. */
@@ -945,21 +954,13 @@ static bool gray_read_adc(uint16_t *value, void *context)
 
 static void track_adc_init(void)
 {
-    /* Keep this runtime setup identical to the known-good platform path. */
-    DL_ADC12_disableConversions(ADC_GRAY_INST);
-    DL_ADC12_initSingleSample(
-        ADC_GRAY_INST,
-        DL_ADC12_REPEAT_MODE_DISABLED,
-        DL_ADC12_SAMPLING_SOURCE_AUTO,
-        DL_ADC12_TRIG_SRC_SOFTWARE,
-        DL_ADC12_SAMP_CONV_RES_12_BIT,
-        DL_ADC12_SAMP_CONV_DATA_FORMAT_UNSIGNED);
-    DL_ADC12_setSampleTime0(ADC_GRAY_INST, 8U);
+    /* SysConfig owns the ADC0/ADC1 sequence layout and sample times. */
     DL_ADC12_clearInterruptStatus(
         ADC_GRAY_INST, DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED);
     DL_ADC12_enableInterrupt(
         ADC_GRAY_INST, DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED);
     DL_ADC12_enableConversions(ADC_GRAY_INST);
+    DL_ADC12_enableConversions(ADC_RED1_INST);
     NVIC_ClearPendingIRQ(ADC_GRAY_INST_INT_IRQN);
     NVIC_EnableIRQ(ADC_GRAY_INST_INT_IRQN);
 }
@@ -973,31 +974,138 @@ static void gray_delay_us(uint32_t delay_us, void *context)
     }
 }
 
-/* ---------------- 后端适配层：两种驱动挂到同一套 mux + ADC 上 ------------- */
+/* ---------------- 后端适配层：GRAY mux 与 RED 独立 ADC -------------------- */
 
-/* RED 后端的 port 要的是「一次给完整 8 通道」的回调，这里自己扫一遍 mux。 */
-static bool track_read_frame(uint16_t values[RED_ARRAY_CHANNELS],
-                             void *context)
+static bool red_read_one_frame(uint16_t values[RED_ARRAY_CHANNELS])
 {
-    (void)context;
-    for (uint8_t channel = 0U; channel < RED_ARRAY_CHANNELS; channel++) {
-        uint32_t sum = 0U;
+    const uint32_t adc0_status =
+        DL_ADC12_INTERRUPT_MEM1_RESULT_LOADED |
+        DL_ADC12_INTERRUPT_MEM2_RESULT_LOADED |
+        DL_ADC12_INTERRUPT_MEM3_RESULT_LOADED;
+    const uint32_t adc1_status =
+        DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED |
+        DL_ADC12_INTERRUPT_MEM1_RESULT_LOADED |
+        DL_ADC12_INTERRUPT_MEM2_RESULT_LOADED |
+        DL_ADC12_INTERRUPT_MEM3_RESULT_LOADED |
+        DL_ADC12_INTERRUPT_MEM4_RESULT_LOADED;
+    uint32_t timeout = ADC_TIMEOUT_LOOPS;
+    bool adc0_complete = false;
+    bool adc1_complete = false;
 
-        if (!gray_select(channel, 0)) {
-            return false;
-        }
-        gray_delay_us(GRAY_SETTLE_US, 0);
-        for (uint8_t s = 0U; s < GRAY_SAMPLES_PER_CH; s++) {
-            uint16_t sample;
-
-            if (!gray_read_adc(&sample, 0)) {
-                return false;
-            }
-            sum += sample;
-        }
-        values[channel] = (uint16_t)(sum / GRAY_SAMPLES_PER_CH);
+    if (values == 0) {
+        return false;
     }
+
+    /* ADC0: D3/D2/D7 in MEM1/2/3. ADC1: D0/D1/D4/D5/D6 in MEM0..4. */
+    DL_ADC12_setStartAddress(ADC_GRAY_INST, DL_ADC12_SEQ_START_ADDR_01);
+    DL_ADC12_setEndAddress(ADC_GRAY_INST, DL_ADC12_SEQ_END_ADDR_03);
+    DL_ADC12_setStartAddress(ADC_RED1_INST, DL_ADC12_SEQ_START_ADDR_00);
+    DL_ADC12_setEndAddress(ADC_RED1_INST, DL_ADC12_SEQ_END_ADDR_04);
+    DL_ADC12_clearInterruptStatus(ADC_GRAY_INST, adc0_status);
+    DL_ADC12_clearInterruptStatus(ADC_RED1_INST, adc1_status);
+    DL_ADC12_enableConversions(ADC_GRAY_INST);
+    DL_ADC12_enableConversions(ADC_RED1_INST);
+    DL_ADC12_startConversion(ADC_GRAY_INST);
+    DL_ADC12_startConversion(ADC_RED1_INST);
+
+    while ((!adc0_complete || !adc1_complete) && (timeout > 0U)) {
+        if (DL_ADC12_getRawInterruptStatus(
+                ADC_GRAY_INST,
+                DL_ADC12_INTERRUPT_MEM3_RESULT_LOADED) != 0U) {
+            adc0_complete = true;
+        }
+        if (DL_ADC12_getRawInterruptStatus(
+                ADC_RED1_INST,
+                DL_ADC12_INTERRUPT_MEM4_RESULT_LOADED) != 0U) {
+            adc1_complete = true;
+        }
+        timeout--;
+    }
+    DL_ADC12_stopConversion(ADC_GRAY_INST);
+    DL_ADC12_stopConversion(ADC_RED1_INST);
+
+    if (!adc0_complete || !adc1_complete) {
+        g_adc_timeout_count++;
+        g_adc_last_completion = TRACK_ADC_TIMEOUT;
+        DL_ADC12_clearInterruptStatus(ADC_GRAY_INST, adc0_status);
+        DL_ADC12_clearInterruptStatus(ADC_RED1_INST, adc1_status);
+        return false;
+    }
+
+    values[0] = (uint16_t)DL_ADC12_getMemResult(
+        ADC_RED1_INST, ADC_RED1_ADCMEM_RED_D0);
+    values[1] = (uint16_t)DL_ADC12_getMemResult(
+        ADC_RED1_INST, ADC_RED1_ADCMEM_RED_D1);
+    values[2] = (uint16_t)DL_ADC12_getMemResult(
+        ADC_GRAY_INST, ADC_GRAY_ADCMEM_RED_D2);
+    values[3] = (uint16_t)DL_ADC12_getMemResult(
+        ADC_GRAY_INST, ADC_GRAY_ADCMEM_RED_D3);
+    values[4] = (uint16_t)DL_ADC12_getMemResult(
+        ADC_RED1_INST, ADC_RED1_ADCMEM_RED_D4);
+    values[5] = (uint16_t)DL_ADC12_getMemResult(
+        ADC_RED1_INST, ADC_RED1_ADCMEM_RED_D5);
+    values[6] = (uint16_t)DL_ADC12_getMemResult(
+        ADC_RED1_INST, ADC_RED1_ADCMEM_RED_D6);
+    values[7] = (uint16_t)DL_ADC12_getMemResult(
+        ADC_GRAY_INST, ADC_GRAY_ADCMEM_RED_D7);
+    g_adc_poll_count++;
+    g_adc_last_completion = TRACK_ADC_POLL;
+    DL_ADC12_clearInterruptStatus(ADC_GRAY_INST, adc0_status);
+    DL_ADC12_clearInterruptStatus(ADC_RED1_INST, adc1_status);
     return true;
+}
+
+static bool red_read_frame(uint16_t values[RED_ARRAY_CHANNELS],
+                           void *context)
+{
+    uint32_t sums[RED_ARRAY_CHANNELS] = {0U};
+    uint8_t sample_count = RED_SAMPLES_PER_CH;
+    bool result = false;
+
+    (void)context;
+    if ((values == 0) || (sample_count == 0U)) {
+        return false;
+    }
+
+    /* ADC0 MEM0 interrupt belongs to GRAY; RED polls both final slots. */
+    g_adc_ready = false;
+    DL_ADC12_disableInterrupt(
+        ADC_GRAY_INST, DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED);
+    NVIC_ClearPendingIRQ(ADC_GRAY_INST_INT_IRQN);
+
+    for (uint8_t discard = 0U; discard < RED_DISCARD_SAMPLES; discard++) {
+        uint16_t ignored[RED_ARRAY_CHANNELS];
+
+        if (!red_read_one_frame(ignored)) {
+            goto cleanup;
+        }
+    }
+    for (uint8_t sample = 0U; sample < sample_count; sample++) {
+        uint16_t frame[RED_ARRAY_CHANNELS];
+
+        if (!red_read_one_frame(frame)) {
+            goto cleanup;
+        }
+        for (uint8_t channel = 0U;
+             channel < RED_ARRAY_CHANNELS;
+             channel++) {
+            sums[channel] += frame[channel];
+        }
+    }
+    for (uint8_t channel = 0U; channel < RED_ARRAY_CHANNELS; channel++) {
+        values[channel] = (uint16_t)(sums[channel] / sample_count);
+    }
+    result = true;
+
+cleanup:
+    DL_ADC12_setStartAddress(ADC_GRAY_INST, DL_ADC12_SEQ_START_ADDR_00);
+    DL_ADC12_setEndAddress(ADC_GRAY_INST, DL_ADC12_SEQ_END_ADDR_00);
+    DL_ADC12_clearInterruptStatus(
+        ADC_GRAY_INST, DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED);
+    DL_ADC12_enableInterrupt(
+        ADC_GRAY_INST, DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED);
+    NVIC_ClearPendingIRQ(ADC_GRAY_INST_INT_IRQN);
+    return result;
 }
 
 static void track_init(void)
@@ -1006,7 +1114,7 @@ static void track_init(void)
         gray_select, gray_read_adc, gray_delay_us, 0,
         GRAY_SETTLE_US, GRAY_SAMPLES_PER_CH
     };
-    const RedArrayPort red_port = {track_read_frame, 0, 1U};
+    const RedArrayPort red_port = {red_read_frame, 0, 1U};
 
     GrayArray_Init(&g_gray, &gray_port);
     RedArray_Init(&g_red, &red_port);
@@ -1112,9 +1220,9 @@ static void track_oled_draw_status_page(void)
     const uint16_t *raw = track_raw();
 
     if (H2026_TRACK_SENSOR_SOURCE == CAR_TRACK_SENSOR_RED_ARRAY) {
-        (void)OLED_ShowString(0U, 0U, "RED P1/2 IR:NC");
+        (void)OLED_ShowString(0U, 0U, "RED P1/2 ADC:8");
     } else {
-        (void)OLED_ShowString(0U, 0U, "GRAY P1/2 EN:PB24");
+        (void)OLED_ShowString(0U, 0U, "GRAY P1/2 EN:PB10");
     }
 
     switch (g_cal_state) {
@@ -1515,7 +1623,7 @@ static void print_help(void)
     uart_puts(track_backend_name());
     uart_puts("\r\n");
     uart_puts("#KEY KEY1=MID_START KEY2=RIGHT_CAL KEY3=LEFT_PAGE\r\n");
-    uart_puts("#WIRING RED_IR=NC VCC=UNKNOWN ADC_MAX=VDDA_3V3\r\n");
+    uart_puts("#WIRING RED=ADC0+ADC1 GRAY_EN=PB10 ADC_MAX=VDDA_3V3\r\n");
     uart_puts("#SAFETY motor run has absolute 2 s limit\r\n");
     uart_puts("#HELP w/s/a/d=move x=stop c=calStep 1=calWhite "
               "2=calBlack 3=table 4=once 5=stream h=help\r\n");
@@ -1570,8 +1678,7 @@ int main(void)
     TB6612_Init();
     TB6612_SetMotors(0, 0);
 
-    /* 红外阵列 EN 低有效。 */
-    /* PB24 is legacy gray EN; the new RED IR pin is unconnected and unowned. */
+    /* GRAY EN is low-active on PB10; RED analog outputs have no GPIO enable. */
     DL_GPIO_clearPins(GPIO_GRAY_EN_PORT, GPIO_GRAY_EN_PIN);
     track_adc_init();
     track_init();

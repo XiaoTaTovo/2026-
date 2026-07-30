@@ -171,6 +171,19 @@ static CarLineEstimate WideMarker(void)
     return line;
 }
 
+static CarLineEstimate ThreeChannelMarker(void)
+{
+    CarLineEstimate line = {0};
+
+    line.confidence = 2700U;
+    line.active_count = 3U;
+    line.active_mask = 0x1CU;
+    line.active_span = 3U;
+    line.pattern = CAR_LINE_PATTERN_NARROW_TRACK;
+    line.valid = true;
+    return line;
+}
+
 static CarLineEstimate UniformGrayBackground(void)
 {
     CarLineEstimate line = {0};
@@ -483,12 +496,19 @@ static void TestCurvatureWheelCommands(void)
     assert(Near(motor.left_mm_s, 350.0f, 0.01f));
     assert(Near(motor.right_mm_s, 350.0f, 0.01f));
 
-    odometry.center_distance_mm = 1500.0f;
+    odometry.center_distance_mm = 1497.0f;
     assert(CarRouteExecutor_Update(&executor, &config, 1020U,
                                    &odometry, &line, &motor, &cue,
                                    &faults) == CAR_OK);
-    assert(executor.index == 2U);
+    assert(executor.index == 1U);
+    assert(motor.enable);
+
+    odometry.center_distance_mm = 1500.0f;
     assert(CarRouteExecutor_Update(&executor, &config, 1040U,
+                                   &odometry, &line, &motor, &cue,
+                                   &faults) == CAR_OK);
+    assert(executor.index == 2U);
+    assert(CarRouteExecutor_Update(&executor, &config, 1060U,
                                    &odometry, &line, &motor, &cue,
                                    &faults) == CAR_OK);
     assert(motor.enable);
@@ -555,7 +575,9 @@ static void TestFinishMarkerWindow(void)
     CarOdometry odometry = {0};
     CarMotorCommand motor;
     CarCue cue;
-    CarLineEstimate marker = WideMarker();
+    CarLineEstimate marker = ThreeChannelMarker();
+    CarLineEstimate ordinary_line = NarrowLine(0);
+    CarLineEstimate wide_marker = WideMarker();
     CarLineEstimate gray_background = UniformGrayBackground();
     uint32_t faults;
     float arc_length = 3.14159265358979323846f *
@@ -574,6 +596,25 @@ static void TestFinishMarkerWindow(void)
            CAR_OK);
     assert(executor.marker_streak == 0U);
     assert(executor.track_phase == CAR_TRACK_PHASE_FOLLOW);
+    assert(faults == 0U);
+
+    faults = 0U;
+    odometry.center_distance_mm = expected;
+    EnterFinalArc(&executor, &route, odometry.center_distance_mm);
+    assert(CarRouteExecutor_Update(&executor, &config, 20U, &odometry,
+                                   &ordinary_line, &motor, &cue, &faults) ==
+           CAR_OK);
+    assert(executor.marker_streak == 0U);
+    assert(executor.track_phase == CAR_TRACK_PHASE_FOLLOW);
+    assert(faults == 0U);
+
+    faults = 0U;
+    odometry.center_distance_mm = expected;
+    EnterFinalArc(&executor, &route, odometry.center_distance_mm);
+    assert(CarRouteExecutor_Update(&executor, &config, 20U, &odometry,
+                                   &wide_marker, &motor, &cue, &faults) ==
+           CAR_OK);
+    assert(executor.marker_streak == 1U);
     assert(faults == 0U);
 
     faults = 0U;
@@ -603,8 +644,10 @@ static void TestFinishMarkerWindow(void)
     assert(CarRouteExecutor_Update(&executor, &config, 1000U, &odometry,
                                    &marker, &motor, &cue, &faults) ==
            CAR_OK);
-    assert(executor.index == 5U);
+    assert(executor.index == route.count);
+    assert(executor.finished);
     assert(!motor.enable);
+    assert(cue == CAR_CUE_FINISH);
     assert(executor.last_exit_reason == CAR_ROUTE_EXIT_FINISH_MARKER);
 
     faults = 0U;
@@ -694,6 +737,59 @@ static void TestStoppedTimeAcrossWrap(void)
     assert(output.run_time_ms == 51U);
 }
 
+static void TestOfficialFinishLatchesResultOnStopTick(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarApp app;
+    CarInputSnapshot input = {0};
+    CarOutputSnapshot output;
+    float arc_length = 3.14159265358979323846f *
+                       H2026_TRACK_ARC_RADIUS_MM;
+    float marker_distance = arc_length -
+                            config.finish_sensor_to_test_point_mm;
+
+    input.encoder.valid = true;
+    input.encoder.timestamp_ms = 100U;
+    input.imu.valid = true;
+    input.imu.timestamp_ms = 100U;
+    input.gray.valid = true;
+    input.gray.timestamp_ms = 100U;
+    for (uint8_t i = 0U; i < GRAY_ARRAY_CHANNELS; i++) {
+        input.gray.normalized[i] = 900U;
+    }
+
+    assert(CarApp_Init(&app, &config) == CAR_OK);
+    assert(CarApp_Arm(&app, H2026_MODE_B2, 100U, &input) == CAR_OK);
+    EnterFinalArc(&app.executor, &app.route, marker_distance);
+    app.odometry.center_distance_mm = marker_distance;
+
+    input.encoder.timestamp_ms = 120U;
+    input.imu.timestamp_ms = 120U;
+    input.gray.timestamp_ms = 120U;
+    assert(CarApp_Update(&app, 120U, &input, &output) == CAR_OK);
+    assert(app.executor.marker_streak == 1U);
+
+    app.odometry.center_distance_mm = marker_distance + 1.0f;
+    input.encoder.timestamp_ms = 140U;
+    input.imu.timestamp_ms = 140U;
+    input.gray.timestamp_ms = 140U;
+    assert(CarApp_Update(&app, 140U, &input, &output) == CAR_OK);
+    assert(app.executor.track_phase == CAR_TRACK_PHASE_FINISH_OFFSET);
+
+    app.odometry.center_distance_mm = marker_distance + 151.0f;
+    input.encoder.timestamp_ms = 1000U;
+    input.imu.timestamp_ms = 1000U;
+    input.gray.timestamp_ms = 1000U;
+    assert(CarApp_Update(&app, 1000U, &input, &output) == CAR_OK);
+    assert(app.executor.finished);
+    assert(!output.motor.enable);
+    assert(output.cue == CAR_CUE_FINISH);
+    assert(output.result_valid);
+    assert(output.result_time_ms == 900U);
+    assert(output.run_time_ms == 900U);
+    assert(!app.armed);
+}
+
 static void TestKeyEmergencyStopLatchesUntilReboot(void)
 {
     FakeDrive drive = {0};
@@ -746,6 +842,7 @@ int main(void)
     TestFinishMarkerWindow();
     TestLineLossBound();
     TestStoppedTimeAcrossWrap();
+    TestOfficialFinishLatchesResultOnStopTick();
     TestKeyEmergencyStopLatchesUntilReboot();
     puts("2026 H B2 control tests passed");
     return 0;

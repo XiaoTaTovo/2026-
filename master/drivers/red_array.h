@@ -8,7 +8,8 @@
 
 #define RED_ARRAY_CHANNELS (8U)
 #define RED_ARRAY_FULL_SCALE (1000U)
-#define RED_ARRAY_MIN_CALIBRATION_SPAN (100)
+/* RED is currently a weak-signal diagnostic path; keep this independent of GRAY. */
+#define RED_ARRAY_MIN_CALIBRATION_SPAN (50)
 
 /* The platform adapter supplies one complete eight-channel raw frame. */
 typedef bool (*RedArrayReadFrameFn)(
