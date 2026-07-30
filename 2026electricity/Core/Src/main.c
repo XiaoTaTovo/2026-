@@ -28,10 +28,14 @@
 /* USER CODE BEGIN Includes */
 
 #include "bsp_bluetooth.h"
+#include "bsp_uart_dma.h"
+#include "ball_observation_protocol.h"
 #include "pitch_axis_manual_control.h"
 #include "pitch_axis_manual_telemetry.h"
 #include "pitch_axis_self_test.h"
 #include "pitch_axis_self_test_telemetry.h"
+#include "pitch_axis_vision_control.h"
+#include "pitch_axis_vision_telemetry.h"
 #include "x42s_driver.h"
 
 /* USER CODE END Includes */
@@ -58,6 +62,13 @@
 static BspBluetooth bluetooth_port;
 static volatile BspBluetoothResult bluetooth_init_result;
 static volatile BspBluetoothResult bluetooth_start_result;
+static BspUartDmaPort vision_port;
+static BspUartDmaResult vision_init_result;
+static BspUartDmaResult vision_start_result;
+static BallObservationParser vision_parser;
+static PitchAxisVisionControl pitch_vision_control;
+static PitchAxisVisionTelemetry pitch_vision_telemetry;
+static bool pitch_vision_initialized;
 static X42sDriver pitch_x42;
 static X42sDriverResult pitch_x42_init_result;
 static X42sDriverResult pitch_x42_start_result = X42S_DRIVER_NOT_STARTED;
@@ -85,6 +96,27 @@ static const PitchAxisManualConfig pitch_manual_config = {
     .synchronize = false,
     .debounce_ms = 30U,
     .settle_ms = 1200U
+};
+static const PitchAxisVisionConfig pitch_vision_config = {
+    .target_position_0_1mm = 0,
+    .deadband_0_1mm = 5,
+    /* The camera must mark a detection valid, then this second gate rejects
+     * weak detections before they can become an EMM command candidate. */
+    .minimum_confidence_permille = 700U,
+    .maximum_observation_age_ms = 150U,
+    .control_period_ms = 50U,
+    /* MEASURED (single rough trial): 30 * 32 pulses produced about 1 mm.
+     * This remains a configurable estimate until repeated ruler calibration. */
+    .pulses_per_mm = 960U,
+    .minimum_command_pulses = 8U,
+    /* UNVERIFIED initial gains. The first firmware is dry-run only and will
+     * log candidates rather than transmit them to the motor. */
+    .kp_mm_per_mm = 0.10f,
+    .ki_per_s = 0.0f,
+    .kd_s = 0.0f,
+    .integral_limit_mm_s = 10.0f,
+    .output_limit_mm = 0.20f,
+    .positive_error_uses_positive_direction = true
 };
 
 /* USER CODE END PV */
@@ -147,6 +179,34 @@ int main(void)
     {
       (void)BspBluetooth_WriteString(&bluetooth_port, "BT_DMA_READY\r\n");
     }
+  }
+
+  vision_init_result = BspUartDma_Init(&vision_port, &huart6);
+  if (vision_init_result == BSP_UART_DMA_OK)
+  {
+    vision_start_result = BspUartDma_Start(&vision_port);
+  }
+  BallObservationParser_Init(&vision_parser);
+  pitch_vision_initialized = PitchAxisVisionControl_Init(
+      &pitch_vision_control,
+      &pitch_vision_config,
+      HAL_GetTick());
+  if ((vision_init_result == BSP_UART_DMA_OK) &&
+      (vision_start_result == BSP_UART_DMA_OK) &&
+      pitch_vision_initialized)
+  {
+    (void)PitchAxisVisionTelemetry_Init(
+        &pitch_vision_telemetry,
+        &bluetooth_port,
+        &vision_port,
+        &vision_parser,
+        &pitch_vision_control,
+        HAL_GetTick());
+    (void)BspBluetooth_WriteString(&bluetooth_port, "VISION_UART_DMA_READY\r\n");
+  }
+  else
+  {
+    (void)BspBluetooth_WriteString(&bluetooth_port, "VISION_INIT_ERROR\r\n");
   }
 
   pitch_x42_init_result = X42sDriver_Init(&pitch_x42, &huart3);
@@ -222,15 +282,20 @@ int main(void)
     /* USER CODE BEGIN 3 */
 
     uint8_t rx_data[64];
+    uint8_t vision_rx_data[64];
     size_t available;
     size_t read_length;
     size_t transfer_length;
+    size_t vision_read_length;
+    size_t vision_index;
     uint32_t now_ms;
     PitchAxisManualButtons buttons;
     PitchAxisSelfTestState self_test_state;
+    BallObservation observation;
 
     now_ms = HAL_GetTick();
     BspBluetooth_Service(&bluetooth_port);
+    BspUartDma_Service(&vision_port);
     buttons.key1_pressed =
         (HAL_GPIO_ReadPin(Key_1_GPIO_Port, Key_1_Pin) == GPIO_PIN_RESET);
     buttons.key2_pressed =
@@ -246,6 +311,32 @@ int main(void)
           &pitch_manual_control,
           now_ms,
           buttons);
+    }
+
+    do
+    {
+      vision_read_length = BspUartDma_Read(
+          &vision_port,
+          vision_rx_data,
+          sizeof(vision_rx_data));
+      for (vision_index = 0U; vision_index < vision_read_length; ++vision_index)
+      {
+        if (BallObservationParser_OnByte(
+                &vision_parser,
+                vision_rx_data[vision_index],
+                now_ms,
+                &observation))
+        {
+          PitchAxisVisionControl_OnObservation(
+              &pitch_vision_control,
+              &observation);
+        }
+      }
+    } while (vision_read_length == sizeof(vision_rx_data));
+    if (pitch_vision_initialized)
+    {
+      PitchAxisVisionControl_Service(&pitch_vision_control, now_ms);
+      PitchAxisVisionTelemetry_Service(&pitch_vision_telemetry, now_ms);
     }
 
     if (!pitch_manual_initialized ||

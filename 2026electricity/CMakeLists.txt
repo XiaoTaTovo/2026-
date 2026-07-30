@@ -50,6 +50,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     App/Src/pitch_axis_angle_self_test_telemetry.c
     App/Src/pitch_axis_manual_control.c
     App/Src/pitch_axis_manual_telemetry.c
+    App/Src/pitch_axis_vision_control.c
+    App/Src/pitch_axis_vision_telemetry.c
     Bsp/Src/bsp_bluetooth.c
     Bsp/Src/bsp_i2c.c
     Bsp/Src/bsp_uart_dma.c
