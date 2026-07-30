@@ -106,9 +106,9 @@ GPIO6.associatedPins[2].$name       = "AD2";
 GPIO6.associatedPins[2].pin.$assign = "PA26";
 GPIO6.associatedPins[3].$name       = "ERR";
 GPIO6.associatedPins[3].direction   = "INPUT";
-GPIO6.associatedPins[3].pin.$assign = "PB25";
+GPIO6.associatedPins[3].pin.$assign = "PB11";
 GPIO6.associatedPins[4].$name       = "EN";
-GPIO6.associatedPins[4].pin.$assign = "PB24";
+GPIO6.associatedPins[4].pin.$assign = "PB10";
 
 GPIO7.$name                          = "GPIO_IMU";
 GPIO7.associatedPins[0].$name        = "CS";

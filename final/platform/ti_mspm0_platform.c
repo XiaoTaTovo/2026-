@@ -229,13 +229,9 @@ void TiMspm0Platform_OnSysTick(void)
 }
 
 /*
- * Keep the reusable platform buildable beside a temporary standalone sensor
- * main that owns the same vector. The integrated H2026 main has no competing
- * definition, so this weak handler remains the active ADC completion ISR.
+ * The final firmware owns ADC0. This must be a strong definition so it
+ * replaces the startup file's weak Default_Handler alias.
  */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((weak))
-#endif
 void ADC_GRAY_INST_IRQHandler(void)
 {
     if (DL_ADC12_getPendingInterrupt(ADC_GRAY_INST) ==

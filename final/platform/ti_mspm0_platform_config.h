@@ -3,7 +3,7 @@
 
 /* Select exactly one eight-channel line sensor implementation per build. */
 #ifndef H2026_TRACK_SENSOR_SOURCE
-#define H2026_TRACK_SENSOR_SOURCE CAR_TRACK_SENSOR_RED_ARRAY//red指红外模块，gray指灰度模块
+#define H2026_TRACK_SENSOR_SOURCE CAR_TRACK_SENSOR_GRAY_ARRAY//red指红外模块，gray指灰度模块
 #endif
 
 /* Chassis measurements. Re-measure after changing wheels or encoders. */

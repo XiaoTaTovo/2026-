@@ -105,9 +105,9 @@ static void H2026_DrawStatus(const CarFirmware *firmware)
 
     (void)TB6612_DriveGetSpeedLoopStatus(
         (const TB6612Drive *)firmware->config.drive.context, &speed);
-    (void)snprintf(line, sizeof(line), "%s %s %s",
+    (void)snprintf(line, sizeof(line), "%s TASK%u %s",
                    H2026_TrackName(firmware),
-                   H2026_ModeName(firmware->config.mode),
+                   (unsigned)firmware->config.mode,
                    H2026_TaskStateName(firmware->app.task_state));
     (void)OLED_ShowString(0U, 0U, line);
     H2026_DrawCalibration(firmware);
