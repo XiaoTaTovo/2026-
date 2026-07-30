@@ -7,8 +7,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 APP="$(pwd)"
 URL="http://localhost:8000"
-
-BROWSER="$(command -v chromium || command -v chromium-browser || true)"
+BROWSER="/usr/lib/chromium/chromium"
 [ -z "${BROWSER}" ] && { echo "✖ 没装 chromium，先跑 ./install.sh"; exit 1; }
 
 LAUNCH="${APP}/scripts/kiosk-run.sh"
@@ -19,9 +18,9 @@ for i in \$(seq 1 60); do
   curl -sf ${URL}/api/status >/dev/null && break
   sleep 1
 done
-exec ${BROWSER} --kiosk --noerrdialogs --disable-infobars \\
+exec ${BROWSER} --kiosk --noerrdialogs --disable-infobars --disable-extensions \\
   --disable-session-crashed-bubble --disable-features=Translate \\
-  --check-for-update-interval=31536000 --autoplay-policy=no-user-gesture-required \\
+  --check-for-update-interval=31536000 --autoplay-policy=no-user-gesture-required --disable-translate --lang=zh-CN --password-store=basic --disable-gpu \\
   --app=${URL}
 EOF
 chmod +x "${LAUNCH}"

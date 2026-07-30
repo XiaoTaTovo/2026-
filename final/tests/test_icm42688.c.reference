@@ -1,0 +1,133 @@
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "drivers/icm42688.h"
+
+#define TEST_WHO_AM_I_REG (0x75U)
+#define TEST_ACCEL_DATA_REG (0x1FU)
+
+typedef struct {
+    uint8_t registers[256];
+    uint8_t address;
+    uint32_t transfer_count;
+    uint32_t fail_at_transfer;
+    bool selected;
+    bool address_phase;
+    bool reading;
+} FakeSpi;
+
+static bool FakeTransfer(uint8_t value,
+                         uint8_t *received,
+                         void *context)
+{
+    FakeSpi *spi = (FakeSpi *)context;
+
+    assert(spi != 0);
+    assert(received != 0);
+    assert(spi->selected);
+    spi->transfer_count++;
+    if ((spi->fail_at_transfer != 0U) &&
+        (spi->transfer_count == spi->fail_at_transfer)) {
+        return false;
+    }
+    if (spi->address_phase) {
+        spi->reading = (value & 0x80U) != 0U;
+        spi->address = (uint8_t)(value & 0x7FU);
+        spi->address_phase = false;
+        *received = 0U;
+    } else if (spi->reading) {
+        *received = spi->registers[spi->address++];
+    } else {
+        spi->registers[spi->address++] = value;
+        *received = 0U;
+    }
+    return true;
+}
+
+static void FakeSelect(bool active, void *context)
+{
+    FakeSpi *spi = (FakeSpi *)context;
+
+    spi->selected = active;
+    if (active) {
+        spi->address_phase = true;
+    }
+}
+
+static void FakeDelay(uint32_t delay_ms, void *context)
+{
+    (void)delay_ms;
+    (void)context;
+}
+
+static Icm42688 TestImu(FakeSpi *spi)
+{
+    const Icm42688Port port = {
+        FakeTransfer, FakeSelect, FakeDelay, spi
+    };
+    Icm42688 imu;
+
+    Icm42688_InitObject(&imu, &port);
+    return imu;
+}
+
+static void TestSuccessfulSample(void)
+{
+    FakeSpi spi = {0};
+    Icm42688 imu = TestImu(&spi);
+    Icm42688Sample sample;
+
+    spi.registers[TEST_WHO_AM_I_REG] = 0x47U;
+    assert(Icm42688_Initialize(&imu));
+    for (uint8_t i = 0U; i < 12U; i++) {
+        spi.registers[TEST_ACCEL_DATA_REG + i] = (uint8_t)(i + 1U);
+    }
+    assert(Icm42688_ReadSample(&imu, 123U, &sample));
+    assert(sample.valid);
+    assert(sample.timestamp_ms == 123U);
+    assert(sample.accel_x == (int16_t)0x0102);
+    assert(sample.gyro_z == (int16_t)0x0B0C);
+    assert(imu.read_errors == 0U);
+}
+
+static void TestInitializeTransferFailure(void)
+{
+    FakeSpi spi = {0};
+    Icm42688 imu = TestImu(&spi);
+
+    spi.fail_at_transfer = 1U;
+    assert(!Icm42688_Initialize(&imu));
+    assert(!imu.initialized);
+    assert(imu.read_errors == 1U);
+    assert(!spi.selected);
+}
+
+static void TestRuntimeTransferFailureInvalidatesSample(void)
+{
+    FakeSpi spi = {0};
+    Icm42688 imu = TestImu(&spi);
+    Icm42688Sample sample = {
+        .timestamp_ms = 999U,
+        .valid = true
+    };
+
+    spi.registers[TEST_WHO_AM_I_REG] = 0x47U;
+    assert(Icm42688_Initialize(&imu));
+    spi.fail_at_transfer = spi.transfer_count + 4U;
+    assert(!Icm42688_ReadSample(&imu, 1000U, &sample));
+    assert(!sample.valid);
+    assert(sample.timestamp_ms == 0U);
+    assert(imu.read_errors == 1U);
+    assert(!spi.selected);
+}
+
+int main(void)
+{
+    TestSuccessfulSample();
+    TestInitializeTransferFailure();
+    TestRuntimeTransferFailureInvalidatesSample();
+    puts("ICM42688 transfer-failure tests passed");
+    return 0;
+}

@@ -1,0 +1,37 @@
+#include <assert.h>
+#include <stdio.h>
+
+#include "core/safety_supervisor.h"
+
+int main(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarInputSnapshot input = {0};
+    uint32_t faults;
+
+    input.encoder.valid = true;
+    input.imu.valid = true;
+    input.encoder.timestamp_ms = 100U;
+    input.imu.timestamp_ms = 100U;
+    faults = CarSafety_Evaluate(&config, 120U, &input, true, false);
+    assert(faults == CAR_FAULT_NONE);
+
+    input.encoder.timestamp_ms = 121U;
+    input.imu.timestamp_ms = 121U;
+    faults = CarSafety_Evaluate(&config, 120U, &input, true, false);
+    assert(faults == CAR_FAULT_NONE);
+
+    input.encoder.timestamp_ms = UINT32_MAX - 5U;
+    input.imu.timestamp_ms = UINT32_MAX - 5U;
+    faults = CarSafety_Evaluate(&config, 5U, &input, true, false);
+    assert(faults == CAR_FAULT_NONE);
+
+    input.encoder.timestamp_ms = 100U;
+    input.imu.timestamp_ms = 100U;
+    faults = CarSafety_Evaluate(&config, 500U, &input, true, false);
+    assert((faults & CAR_FAULT_ENCODER_STALE) != 0U);
+    assert((faults & CAR_FAULT_IMU_STALE) != 0U);
+
+    puts("safety timestamp tests passed");
+    return 0;
+}

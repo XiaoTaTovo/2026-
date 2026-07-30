@@ -46,6 +46,7 @@ typedef struct {
     float line_kp;
     float line_ki;
     float line_kd;
+    float line_derivative_filter_tau_s;
     float line_integral_limit;
     float straight_line_max_correction_mm_s;
     float arc_line_max_correction_mm_s;
@@ -90,7 +91,8 @@ static inline CarConfig CarConfig_MakeDefault(void)
         .gray_finish_consecutive_frames = 2U,
         .line_kp = 0.025f,
         .line_ki = 0.0f,
-        .line_kd = 0.0f,
+        .line_kd = 0.0005f,
+        .line_derivative_filter_tau_s = 0.060f,
         .line_integral_limit = 5000.0f,
         .straight_line_max_correction_mm_s = 87.5f,
         .arc_line_max_correction_mm_s = 20.0f,

@@ -1,0 +1,36 @@
+# Local IDE and assistant state
+.codex/
+.theia/
+.idea/
+.vscode/
+cmake-build-*/
+
+# CMake, CCS and compiler outputs
+**/build/
+**/Debug/
+**/Release/
+*.o
+*.obj
+*.d
+*.su
+*.elf
+*.out
+*.map
+*.bin
+*.hex
+*.lst
+*.log
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Operating-system files
+Thumbs.db
+.DS_Store
+Desktop.ini

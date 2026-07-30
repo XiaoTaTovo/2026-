@@ -1,0 +1,82 @@
+#ifndef TI_MSPM0_PLATFORM_CONFIG_H
+#define TI_MSPM0_PLATFORM_CONFIG_H
+
+/* Select exactly one eight-channel line sensor implementation per build. */
+#ifndef H2026_TRACK_SENSOR_SOURCE
+#define H2026_TRACK_SENSOR_SOURCE CAR_TRACK_SENSOR_RED_ARRAY//red指红外模块，gray指灰度模块
+#endif
+
+/* Chassis measurements. Re-measure after changing wheels or encoders. */
+#define H2026_WHEEL_DIAMETER_MM (65.0f)
+#define H2026_TRACK_WIDTH_MM (115.0f)
+#define H2026_ENCODER_COUNTS_PER_WHEEL_REV (724.0f)
+#define H2026_ARC_EFFECTIVE_TRACK_WIDTH_MM (160.0f)
+
+/* TB6612 inner wheel-speed loop, 50 ms. */
+#define H2026_SPEED_LOOP_PERIOD_MS (50U)
+#define H2026_SPEED_KP_MILLI (250U)
+#define H2026_SPEED_KI_MILLI (600U)
+#define H2026_SPEED_KD_MILLI (0U)
+#define H2026_SPEED_LIMIT_PERCENT (60U)
+#define H2026_SPEED_FF_STATIC_MILLI (6000)
+#define H2026_SPEED_FF_RPM_MILLI (225U)
+#define H2026_SPEED_DEADBAND_RPM (2)
+
+/* Provisional until both encoder-disconnect tests pass with raised wheels. */
+#define H2026_MOTION_WATCHDOG_MIN_TARGET_RPM (10U)
+#define H2026_MOTION_WATCHDOG_TIMEOUT_MS (600U)
+
+/* ICM42688 chassis-yaw observation. */
+#define H2026_IMU_BIAS_DPS (-0.45f)
+#define H2026_IMU_USE_FIXED_BIAS (0U)
+#define H2026_IMU_CALIBRATION_SAMPLES (400U)
+#define H2026_IMU_YAW_SIGN (1)
+
+/* Official B2 route and outer line controller. */
+#define H2026_B2_STRAIGHT_SPEED_MM_S (350.0f)
+#define H2026_B2_ARC_CENTER_SPEED_MM_S (300.0f)
+#define H2026_BALL_TASK_TRACK_SPEED_MM_S (240.0f)
+#define H2026_MAX_WHEEL_SPEED_MM_S (350.0f)
+#define H2026_TRACK_WHEEL_ACCEL_LIMIT_MM_S2 (1500.0f)
+#define H2026_DISTANCE_TOLERANCE_MM (3.0f)
+#define H2026_STRAIGHT_TIMEOUT_MS (8000U)
+#define H2026_ARC_TIMEOUT_MS (8000U)
+
+#define H2026_LINE_KP (0.025f)
+#define H2026_LINE_KI (0.0f)
+#define H2026_LINE_KD (0.0005f)
+#define H2026_LINE_D_FILTER_TAU_S (0.060f)
+#define H2026_LINE_INTEGRAL_LIMIT (5000.0f)
+#define H2026_STRAIGHT_LINE_MAX_CORRECTION_MM_S (87.5f)
+#define H2026_ARC_LINE_MAX_CORRECTION_MM_S (20.0f)
+
+/* Eight-channel line classification and final marker. */
+#define H2026_GRAY_MIN_SIGNAL (80U)
+#define H2026_GRAY_MIN_CONFIDENCE (200U)
+#define H2026_GRAY_CENTER_OFFSET (0)
+#define H2026_GRAY_RELATIVE_DELTA (120U)
+#define H2026_GRAY_TRACK_MIN_CONFIDENCE (250U)
+#define H2026_GRAY_TRACK_ENTER_FRAMES (2U)
+#define H2026_GRAY_TRACK_LOST_FRAMES (3U)
+#define H2026_GRAY_TRACK_MAX_ACTIVE (4U)
+#define H2026_GRAY_TRACK_MAX_SPAN (4U)
+#define H2026_GRAY_WIDE_MIN_ACTIVE (6U)
+#define H2026_GRAY_WIDE_MIN_BACKGROUND (600U)
+#define H2026_FINISH_MIN_CONFIDENCE (1200U)
+#define H2026_FINISH_MIN_ACTIVE_MEAN (600U)
+/* The official A marker is 5 cm long; reject the ordinary 1-2 channel line. */
+#define H2026_FINISH_MIN_ACTIVE (3U)
+#define H2026_FINISH_CONSECUTIVE_FRAMES (2U)
+
+#define H2026_REQUIRED_LINE_SEARCH_MM (80.0f)
+#define H2026_REQUIRED_LINE_SEARCH_SPEED_MM_S (60.0f)
+#define H2026_FINISH_SENSOR_TO_TEST_POINT_MM (150.0f)
+#define H2026_FINISH_APPROACH_SPEED_MM_S (180.0f)
+
+/* Bounded peripheral waits. */
+#define H2026_GRAY_SETTLE_US (10U)
+#define H2026_GRAY_SAMPLES_PER_CHANNEL (4U)
+#define H2026_ADC_TIMEOUT_LOOPS (100000U)
+#define H2026_SPI_TIMEOUT_LOOPS (100000U)
+
+#endif

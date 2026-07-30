@@ -18,6 +18,30 @@ typedef struct {
     uint32_t service_count;
 } FakeDrive;
 
+typedef struct {
+    uint16_t values[GRAY_ARRAY_CHANNELS];
+    uint8_t selected;
+    uint32_t select_count;
+    uint32_t read_count;
+    bool fail;
+} FakeGrayPort;
+
+typedef struct {
+    uint16_t values[RED_ARRAY_CHANNELS];
+    uint32_t read_count;
+    bool fail;
+} FakeRedPort;
+
+static bool FakeDriveSetWheelSpeeds(int16_t left_mm_s,
+                                    int16_t right_mm_s,
+                                    void *context)
+{
+    (void)left_mm_s;
+    (void)right_mm_s;
+    (void)context;
+    return true;
+}
+
 static bool FakeDriveReadEncoder(CarEncoderSample *sample, void *context)
 {
     FakeDrive *drive = (FakeDrive *)context;
@@ -41,6 +65,72 @@ static void FakeDriveService(void *context)
     FakeDrive *drive = (FakeDrive *)context;
 
     drive->service_count++;
+}
+
+static bool FakeGraySelect(uint8_t channel, void *context)
+{
+    FakeGrayPort *port = (FakeGrayPort *)context;
+
+    if ((port == 0) || (channel >= GRAY_ARRAY_CHANNELS)) {
+        return false;
+    }
+    port->selected = channel;
+    port->select_count++;
+    return !port->fail;
+}
+
+static bool FakeGrayRead(uint16_t *value, void *context)
+{
+    FakeGrayPort *port = (FakeGrayPort *)context;
+
+    if ((port == 0) || (value == 0) || port->fail) {
+        return false;
+    }
+    *value = port->values[port->selected];
+    port->read_count++;
+    return true;
+}
+
+static void FakeDelayUs(uint32_t delay_us, void *context)
+{
+    (void)delay_us;
+    (void)context;
+}
+
+static bool FakeRedReadFrame(
+    uint16_t values[RED_ARRAY_CHANNELS], void *context)
+{
+    FakeRedPort *port = (FakeRedPort *)context;
+
+    if ((port == 0) || (values == 0) || port->fail) {
+        return false;
+    }
+    for (uint8_t i = 0U; i < RED_ARRAY_CHANNELS; i++) {
+        values[i] = port->values[i];
+    }
+    port->read_count++;
+    return true;
+}
+
+static CarFirmwareConfig FakeFirmwareConfig(FakeDrive *drive)
+{
+    CarFirmwareConfig config = {0};
+
+    config.car = CarConfig_MakeDefault();
+    config.mode = H2026_MODE_B2;
+    config.drive = (CarDrivePort){
+        FakeDriveSetWheelSpeeds,
+        FakeDriveReadEncoder,
+        FakeDriveStop,
+        FakeDriveService,
+        drive
+    };
+    config.yaw_sign = 1;
+    config.imu_calibration_samples = 1U;
+    config.imu_max_step_ms = 20U;
+    config.button_debounce_ms = 2U;
+    config.button_active_low = true;
+    return config;
 }
 
 static bool Near(float actual, float expected, float tolerance)
@@ -217,6 +307,161 @@ static void TestLineClassification(void)
     assert(line.track_cluster_count == 2U);
 }
 
+static void TestRedArrayDriver(void)
+{
+    FakeRedPort port = {0};
+    RedArray red;
+    CarGraySample sample;
+    uint16_t black[RED_ARRAY_CHANNELS];
+    uint16_t white[RED_ARRAY_CHANNELS];
+
+    for (uint8_t i = 0U; i < RED_ARRAY_CHANNELS; i++) {
+        black[i] = 100U;
+        white[i] = 1000U;
+        port.values[i] = 1000U;
+    }
+    port.values[3] = 100U;
+    port.values[4] = 550U;
+
+    RedArray_Init(&red, &(RedArrayPort){FakeRedReadFrame, &port, 2U});
+    white[0] = black[0] + RED_ARRAY_MIN_CALIBRATION_SPAN - 1U;
+    assert(!RedArray_SetCalibration(&red, black, white));
+    white[0] = black[0] + RED_ARRAY_MIN_CALIBRATION_SPAN;
+    assert(RedArray_SetCalibration(&red, black, white));
+    assert(RedArray_Read(&red, 25U));
+    assert(port.read_count == 2U);
+    assert(RedArray_GetLatest(&red, &sample));
+    assert(sample.timestamp_ms == 25U);
+    assert(sample.normalized[3] == RED_ARRAY_FULL_SCALE);
+    assert(sample.normalized[4] == (RED_ARRAY_FULL_SCALE / 2U));
+    assert(sample.normalized[2] == 0U);
+
+    port.fail = true;
+    assert(!RedArray_Read(&red, 30U));
+    assert(!RedArray_GetLatest(&red, &sample));
+    assert(red.read_errors == 1U);
+}
+
+static void TestFirmwareTrackSensorSelection(void)
+{
+    FakeDrive drive = {0};
+    FakeGrayPort gray_port = {0};
+    FakeRedPort red_port = {0};
+    CarFirmwareConfig config = FakeFirmwareConfig(&drive);
+    CarFirmware firmware;
+
+    config.gray = (GrayArrayPort){
+        FakeGraySelect, FakeGrayRead, FakeDelayUs, &gray_port, 0U, 1U
+    };
+    config.red = (RedArrayPort){FakeRedReadFrame, &red_port, 1U};
+    config.track_sensor_source = CAR_TRACK_SENSOR_RED_ARRAY;
+    config.gray_calibration_valid = true;
+    config.red_calibration_valid = true;
+    for (uint8_t i = 0U; i < GRAY_ARRAY_CHANNELS; i++) {
+        config.gray_black[i] = 300U;
+        config.gray_white[i] = 900U;
+        config.red_black[i] = 100U;
+        config.red_white[i] = 1000U;
+        gray_port.values[i] = 900U;
+        red_port.values[i] = 1000U;
+    }
+    red_port.values[5] = 100U;
+
+    assert(CarFirmware_Init(&firmware, &config, 0U) == CAR_OK);
+    assert(firmware.red.calibrated);
+    assert(!firmware.gray.calibrated);
+    CarFirmware_Tick(&firmware, 10U);
+    assert(red_port.read_count == 1U);
+    assert(gray_port.read_count == 0U);
+    assert(firmware.gray_sample.valid);
+    assert(firmware.gray_sample.normalized[5] == RED_ARRAY_FULL_SCALE);
+    assert(firmware.gray.raw[5] == 0U);
+
+    drive = (FakeDrive){0};
+    gray_port = (FakeGrayPort){0};
+    red_port = (FakeRedPort){0};
+    config = FakeFirmwareConfig(&drive);
+    config.gray = (GrayArrayPort){
+        FakeGraySelect, FakeGrayRead, FakeDelayUs, &gray_port, 0U, 1U
+    };
+    config.red = (RedArrayPort){FakeRedReadFrame, &red_port, 1U};
+    config.track_sensor_source = CAR_TRACK_SENSOR_GRAY_ARRAY;
+    config.gray_calibration_valid = true;
+    config.red_calibration_valid = true;
+    for (uint8_t i = 0U; i < GRAY_ARRAY_CHANNELS; i++) {
+        config.gray_black[i] = 100U;
+        config.gray_white[i] = 1000U;
+        config.red_black[i] = 300U;
+        config.red_white[i] = 900U;
+        gray_port.values[i] = 1000U;
+        red_port.values[i] = 900U;
+    }
+    gray_port.values[2] = 100U;
+
+    assert(CarFirmware_Init(&firmware, &config, 0U) == CAR_OK);
+    assert(firmware.gray.calibrated);
+    assert(!firmware.red.calibrated);
+    CarFirmware_Tick(&firmware, 10U);
+    assert(gray_port.select_count == GRAY_ARRAY_CHANNELS);
+    assert(gray_port.read_count == GRAY_ARRAY_CHANNELS);
+    assert(red_port.read_count == 0U);
+    assert(firmware.gray_sample.valid);
+    assert(firmware.gray_sample.normalized[2] == GRAY_ARRAY_FULL_SCALE);
+
+    config.track_sensor_source = (CarTrackSensorSource)99;
+    assert(CarFirmware_Init(&firmware, &config, 0U) == CAR_ERROR_ARG);
+}
+
+static void TestRuntimeCalibrationKeepsSourcesIndependent(void)
+{
+    FakeDrive drive = {0};
+    FakeGrayPort gray_port = {0};
+    FakeRedPort red_port = {0};
+    CarFirmwareConfig config = FakeFirmwareConfig(&drive);
+    CarFirmware firmware;
+
+    config.gray = (GrayArrayPort){
+        FakeGraySelect, FakeGrayRead, FakeDelayUs, &gray_port, 0U, 1U
+    };
+    config.red = (RedArrayPort){FakeRedReadFrame, &red_port, 1U};
+    config.track_sensor_source = CAR_TRACK_SENSOR_RED_ARRAY;
+    config.require_runtime_gray_calibration = true;
+    config.gray_calibration_valid = true;
+    for (uint8_t i = 0U; i < GRAY_ARRAY_CHANNELS; i++) {
+        config.gray_black[i] = 300U;
+        config.gray_white[i] = 900U;
+        red_port.values[i] = 1200U;
+    }
+
+    assert(CarFirmware_Init(&firmware, &config, 0U) == CAR_OK);
+    firmware.gray_cal_state = CAR_GRAY_CAL_CAPTURE_WHITE;
+    for (uint32_t now_ms = 10U; now_ms <= 160U; now_ms += 10U) {
+        CarFirmware_Tick(&firmware, now_ms);
+    }
+    assert(firmware.gray_cal_state == CAR_GRAY_CAL_WAIT_BLACK);
+
+    for (uint8_t i = 0U; i < RED_ARRAY_CHANNELS; i++) {
+        red_port.values[i] = 200U;
+        firmware.gray_cal_sum[i] = 0U;
+    }
+    firmware.gray_cal_frame_count = 0U;
+    firmware.gray_cal_state = CAR_GRAY_CAL_CAPTURE_BLACK;
+    for (uint32_t now_ms = 170U; now_ms <= 320U; now_ms += 10U) {
+        CarFirmware_Tick(&firmware, now_ms);
+    }
+
+    assert(firmware.gray_cal_state == CAR_GRAY_CAL_READY);
+    assert(firmware.red.calibrated);
+    assert(!firmware.gray.calibrated);
+    assert(firmware.config.red_calibration_valid);
+    for (uint8_t i = 0U; i < RED_ARRAY_CHANNELS; i++) {
+        assert(firmware.config.red_black[i] == 200U);
+        assert(firmware.config.red_white[i] == 1200U);
+        assert(firmware.config.gray_black[i] == 300U);
+        assert(firmware.config.gray_white[i] == 900U);
+    }
+}
+
 static void TestCurvatureWheelCommands(void)
 {
     CarConfig config = CarConfig_MakeDefault();
@@ -250,6 +495,55 @@ static void TestCurvatureWheelCommands(void)
     assert(Near(motor.left_mm_s, 348.0f, 0.05f));
     assert(Near(motor.right_mm_s, 252.0f, 0.05f));
     assert(motor.left_mm_s > motor.right_mm_s);
+    assert(faults == 0U);
+}
+
+static void TestFilteredLineDerivative(void)
+{
+    CarConfig config = CarConfig_MakeDefault();
+    CarRoute route;
+    CarRouteExecutor executor;
+    CarOdometry odometry;
+    CarMotorCommand motor;
+    CarCue cue;
+    CarLineEstimate line = NarrowLine(0);
+    CarLineEstimate none = NoLine();
+    uint32_t faults = 0U;
+
+    config.line_kp = 0.0f;
+    config.line_ki = 0.0f;
+    config.line_kd = 1.0f;
+    config.line_derivative_filter_tau_s = 0.060f;
+    config.straight_line_max_correction_mm_s = 5000.0f;
+    config.max_wheel_speed_mm_s = 5000.0f;
+    config.track_wheel_accel_limit_mm_s2 = 0.0f;
+    assert(H2026_BuildRoute(H2026_MODE_B2, &config, &route) == CAR_OK);
+    StartRoute(&executor, &route, &odometry);
+
+    assert(CarRouteExecutor_Update(&executor, &config, 20U, &odometry,
+                                   &line, &motor, &cue, &faults) == CAR_OK);
+    assert(CarRouteExecutor_Update(&executor, &config, 40U, &odometry,
+                                   &line, &motor, &cue, &faults) == CAR_OK);
+    assert(Near(executor.line_correction_mm_s, 0.0f, 0.01f));
+
+    line = NarrowLine(100);
+    assert(CarRouteExecutor_Update(&executor, &config, 60U, &odometry,
+                                   &line, &motor, &cue, &faults) == CAR_OK);
+    assert(Near(executor.line_derivative_filtered, 1250.0f, 0.1f));
+    assert(Near(executor.line_correction_mm_s, 1250.0f, 0.1f));
+    assert(CarRouteExecutor_Update(&executor, &config, 80U, &odometry,
+                                   &line, &motor, &cue, &faults) == CAR_OK);
+    assert(Near(executor.line_derivative_filtered, 937.5f, 0.1f));
+
+    assert(CarRouteExecutor_Update(&executor, &config, 100U, &odometry,
+                                   &none, &motor, &cue, &faults) == CAR_OK);
+    assert(Near(executor.line_derivative_filtered, 0.0f, 0.01f));
+    line = NarrowLine(300);
+    assert(CarRouteExecutor_Update(&executor, &config, 120U, &odometry,
+                                   &line, &motor, &cue, &faults) == CAR_OK);
+    assert(CarRouteExecutor_Update(&executor, &config, 140U, &odometry,
+                                   &line, &motor, &cue, &faults) == CAR_OK);
+    assert(Near(executor.line_correction_mm_s, 0.0f, 0.01f));
     assert(faults == 0U);
 }
 
@@ -444,7 +738,11 @@ int main(void)
 {
     TestModeAndRouteContract();
     TestLineClassification();
+    TestRedArrayDriver();
+    TestFirmwareTrackSensorSelection();
+    TestRuntimeCalibrationKeepsSourcesIndependent();
     TestCurvatureWheelCommands();
+    TestFilteredLineDerivative();
     TestFinishMarkerWindow();
     TestLineLossBound();
     TestStoppedTimeAcrossWrap();

@@ -1,0 +1,312 @@
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "firmware.h"
+#include "tb6612.h"
+#include "ti_msp_dl_config.h"
+#include "vofa_telemetry.h"
+
+/* White-box the bounded writer without adding a production test API. */
+#include "../vofa_telemetry.c"
+
+#define TEST_TX_CAPACITY (2048U)
+
+TestGpioRegs g_test_gpio_a;
+TestGpioRegs g_test_gpio_b;
+TestTimerARegs g_test_timer_a;
+TestUartRegs g_test_uart;
+
+static char g_tx_capture[TEST_TX_CAPACITY];
+static uint16_t g_tx_length;
+static uint32_t g_gpio_a_output;
+static uint32_t g_gpio_b_output;
+static uint32_t g_now_ms;
+static int32_t g_left_encoder_count;
+static int32_t g_right_encoder_count;
+static bool g_stop_called;
+
+void DL_TimerA_setCaptureCompareValue(TestTimerARegs *timer,
+                                      uint32_t value,
+                                      uint32_t index)
+{
+    assert(timer == &g_test_timer_a);
+    (void)value;
+    assert((index == GPIO_PWM_TB1_C1_IDX) ||
+           (index == GPIO_PWM_TB1_C2_IDX));
+}
+
+void DL_TimerA_startCounter(TestTimerARegs *timer)
+{
+    assert(timer == &g_test_timer_a);
+}
+
+void DL_GPIO_clearPins(TestGpioRegs *gpio, uint32_t pins)
+{
+    if (gpio == &g_test_gpio_a) {
+        g_gpio_a_output &= ~pins;
+    } else {
+        assert(gpio == &g_test_gpio_b);
+        g_gpio_b_output &= ~pins;
+    }
+}
+
+void DL_GPIO_setPins(TestGpioRegs *gpio, uint32_t pins)
+{
+    if (gpio == &g_test_gpio_a) {
+        g_gpio_a_output |= pins;
+    } else {
+        assert(gpio == &g_test_gpio_b);
+        g_gpio_b_output |= pins;
+    }
+}
+
+bool DL_UART_Main_isTXFIFOFull(TestUartRegs *uart)
+{
+    assert(uart == &g_test_uart);
+    return false;
+}
+
+void DL_UART_Main_transmitData(TestUartRegs *uart, uint8_t value)
+{
+    assert(uart == &g_test_uart);
+    assert(g_tx_length < TEST_TX_CAPACITY);
+    g_tx_capture[g_tx_length++] = (char)value;
+}
+
+void DL_UART_Main_disableInterrupt(TestUartRegs *uart, uint32_t interrupt)
+{
+    assert(uart == &g_test_uart);
+    assert(interrupt == DL_UART_MAIN_INTERRUPT_TX);
+}
+
+void DL_UART_Main_enableInterrupt(TestUartRegs *uart, uint32_t interrupt)
+{
+    assert(uart == &g_test_uart);
+    assert(interrupt == DL_UART_MAIN_INTERRUPT_TX);
+}
+
+uint32_t __get_PRIMASK(void)
+{
+    return 0U;
+}
+
+void __disable_irq(void)
+{
+}
+
+void __enable_irq(void)
+{
+}
+
+void __DMB(void)
+{
+}
+
+void delay_cycles(uint32_t cycles)
+{
+    assert(cycles == CPUCLK_FREQ / 1000000U);
+}
+
+int32_t Encoder_GetLeftCount(void)
+{
+    return g_left_encoder_count;
+}
+
+int32_t Encoder_GetRightCount(void)
+{
+    return g_right_encoder_count;
+}
+
+static uint32_t FakeNow(void *context)
+{
+    assert(context == &g_now_ms);
+    return g_now_ms;
+}
+
+static void FakeStop(void *context)
+{
+    assert(context == &g_stop_called);
+    g_stop_called = true;
+}
+
+static void ResetCapture(void)
+{
+    memset(g_tx_capture, 0, sizeof(g_tx_capture));
+    g_tx_length = 0U;
+}
+
+static TB6612Drive TestDrive(void)
+{
+    TB6612Drive drive;
+    const TB6612SpeedLoopConfig config = {
+        .wheel_diameter_mm = 65.0f,
+        .left_counts_per_rev = 724U,
+        .right_counts_per_rev = 724U,
+        .control_period_ms = 50U,
+        .kp_milli = 250U,
+        .ki_milli = 600U,
+        .feedforward_static_milli = 6000,
+        .feedforward_rpm_milli = 225U,
+        .error_deadband_rpm = 2,
+        .output_limit_percent = 60U,
+        .motion_watchdog_min_target_rpm = 10U,
+        .motion_watchdog_timeout_ms = 600U
+    };
+
+    TB6612_DriveInit(&drive, FakeNow, &g_now_ms);
+    assert(TB6612_DriveConfigureSpeedLoop(&drive, &config));
+    drive.target_left_rpm = INT32_MAX;
+    drive.target_right_rpm = INT32_MIN;
+    drive.measured_left_rpm = INT32_MIN;
+    drive.measured_right_rpm = INT32_MAX;
+    drive.left_delta_count = INT32_MIN;
+    drive.right_delta_count = INT32_MAX;
+    drive.last_sample_elapsed_ms = UINT32_MAX;
+    drive.update_count = UINT32_MAX;
+    return drive;
+}
+
+static void TestWriterExactFitAndOverflow(void)
+{
+    char buffer[3] = {'X', 'X', 'S'};
+    VofaTelemetryWriter writer;
+    uint32_t drops_before;
+
+    VofaTelemetry_Init();
+    ResetCapture();
+    writer = VofaTelemetry_BeginWrite(buffer, 2U);
+    VofaTelemetry_AppendText(&writer, "AB");
+    assert(!writer.overflow);
+    assert(writer.out == writer.end);
+    assert(buffer[2] == 'S');
+    assert(VofaTelemetry_EnqueueWriter(&writer));
+    assert(g_tx_length == 2U);
+    assert(memcmp(g_tx_capture, "AB", 2U) == 0);
+
+    VofaTelemetry_Init();
+    ResetCapture();
+    writer = VofaTelemetry_BeginWrite(buffer, 2U);
+    VofaTelemetry_AppendText(&writer, "ABC");
+    assert(writer.overflow);
+    assert(writer.out == writer.end);
+    assert(buffer[2] == 'S');
+    drops_before = g_tx_drop_count;
+    assert(!VofaTelemetry_EnqueueWriter(&writer));
+    assert(g_tx_drop_count == drops_before + 1U);
+    assert(g_tx_length == 0U);
+}
+
+static void TestFrameHas48BoundedFields(void)
+{
+    CarFirmware firmware = {0};
+    TB6612Drive drive = TestDrive();
+    uint8_t commas = 0U;
+
+    firmware.config.mode = H2026_MODE_B2;
+    firmware.config.drive.context = &drive;
+    firmware.hardware_faults = UINT32_MAX;
+    firmware.app.line.track_position = INT16_MIN;
+    firmware.app.line.track_confidence = UINT16_MAX;
+    firmware.app.line.track_active_count = UINT8_MAX;
+    firmware.app.line.track_active_mask = UINT8_MAX;
+    firmware.app.executor.marker_streak = UINT8_MAX;
+    firmware.app.executor.last_marker_confidence = UINT16_MAX;
+    firmware.app.executor.last_marker_active_count = UINT8_MAX;
+    firmware.output.result_time_ms = UINT32_MAX;
+    for (uint8_t i = 0U; i < GRAY_ARRAY_CHANNELS; i++) {
+        firmware.gray_sample.normalized[i] = UINT16_MAX;
+    }
+
+    VofaTelemetry_Init();
+    ResetCapture();
+    VofaTelemetry_SendFrame(&firmware, UINT32_MAX);
+
+    assert(g_tx_length > 2U);
+    assert(g_tx_length <= 512U);
+    assert(g_tx_capture[g_tx_length - 2U] == '\r');
+    assert(g_tx_capture[g_tx_length - 1U] == '\n');
+    for (uint16_t i = 0U; i < g_tx_length; i++) {
+        if (g_tx_capture[i] == ',') {
+            commas++;
+        }
+    }
+    assert(commas == 47U);
+}
+
+static void TestStopCommandLatchesEmergencyStop(void)
+{
+    static const char command[] = "STOP\n";
+    CarFirmware firmware = {0};
+
+    g_stop_called = false;
+    firmware.config.drive.stop = FakeStop;
+    firmware.config.drive.context = &g_stop_called;
+    firmware.app.executor.running = true;
+    firmware.drive_active = true;
+    firmware.output.motor.enable = true;
+
+    VofaTelemetry_Init();
+    ResetCapture();
+    for (uint8_t i = 0U; i < (uint8_t)(sizeof(command) - 1U); i++) {
+        VofaTelemetry_PushRxFromIsr((uint8_t)command[i]);
+    }
+    assert(VofaTelemetry_ProcessCommands(&firmware, 100U));
+    assert((firmware.hardware_faults & CAR_FAULT_EMERGENCY_STOP) != 0U);
+    assert(!firmware.drive_active);
+    assert(!firmware.output.motor.enable);
+    assert(g_stop_called);
+    assert(strstr(g_tx_capture, "#OK STOP_LATCHED RAM_ONLY\r\n") != 0);
+}
+
+static void TestDoneCompletesOnlyExternalTask(void)
+{
+    static const char command[] = "DONE\n";
+    CarFirmware firmware = {0};
+
+    g_stop_called = false;
+    firmware.initialized = true;
+    firmware.config.mode = H2026_MODE_B1;
+    firmware.config.drive.stop = FakeStop;
+    firmware.config.drive.context = &g_stop_called;
+    firmware.app.mode = H2026_MODE_B1;
+    firmware.app.task_state = H2026_TASK_RUNNING;
+    firmware.app.armed = true;
+    firmware.app.run_start_ms = 10U;
+
+    VofaTelemetry_Init();
+    ResetCapture();
+    for (uint8_t i = 0U; i < (uint8_t)(sizeof(command) - 1U); i++) {
+        VofaTelemetry_PushRxFromIsr((uint8_t)command[i]);
+    }
+    assert(VofaTelemetry_ProcessCommands(&firmware, 110U));
+    assert(CarApp_IsDone(&firmware.app));
+    assert(firmware.app.result_valid);
+    assert(firmware.app.result_time_ms == 100U);
+    assert(g_stop_called);
+    assert(strstr(g_tx_capture, "#OK DONE RAM_ONLY\r\n") != 0);
+
+    firmware.app.mode = H2026_MODE_B2;
+    firmware.app.task_state = H2026_TASK_RUNNING;
+    firmware.app.armed = true;
+    VofaTelemetry_Init();
+    ResetCapture();
+    for (uint8_t i = 0U; i < (uint8_t)(sizeof(command) - 1U); i++) {
+        VofaTelemetry_PushRxFromIsr((uint8_t)command[i]);
+    }
+    assert(VofaTelemetry_ProcessCommands(&firmware, 120U));
+    assert(strstr(g_tx_capture,
+                  "#ERR EXTERNAL_TASK_NOT_RUNNING\r\n") != 0);
+}
+
+int main(void)
+{
+    TestWriterExactFitAndOverflow();
+    TestFrameHas48BoundedFields();
+    TestStopCommandLatchesEmergencyStop();
+    TestDoneCompletesOnlyExternalTask();
+    puts("VOFA writer-bound, frame-bound, STOP, and DONE tests passed");
+    return 0;
+}

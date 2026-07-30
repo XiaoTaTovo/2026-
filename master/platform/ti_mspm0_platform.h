@@ -13,9 +13,9 @@
  * TB6612 direction/STBY: PA14/PA15, PA16/PA17, PA28
  * encoder A/B: PA7/PA22 and PA30/PA31
  * ICM42688 SPI/CS: PB9/PB8/PB7 and PB0
- * gray mux/ADC: PA24/PA25/PA26, PA27, PB24, PB25
+ * line-sensor mux/ADC: PA24/PA25/PA26, PA27; legacy gray EN/ERR: PB24/PB25
  * OLED I2C0: PA0/PA1
- * KEY1/KEY2/KEY3: PB23/PB26/PB27
+ * KEY1/KEY2/KEY3: PB23/PB26/PB27; KEY1 start/stop, KEY2 calibration
  * buzzer: PB5
  * tuning/telemetry UART3: PB2/PB3, 115200 8N1
  */
@@ -23,6 +23,8 @@
 typedef struct {
     uint32_t imu_spi_timeouts;
     uint32_t gray_adc_timeouts;
+    uint32_t gray_adc_isr_completions;
+    uint32_t gray_adc_poll_completions;
 } TiMspm0PlatformDiagnostics;
 
 void TiMspm0Platform_Init(void);

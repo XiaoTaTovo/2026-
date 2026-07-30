@@ -1,0 +1,10 @@
+# Code Composer Studio build outputs
+/Debug/
+/Release/
+
+# Local IDE and operating-system files
+/.metadata/
+/.clangd
+*.launch
+Thumbs.db
+.DS_Store

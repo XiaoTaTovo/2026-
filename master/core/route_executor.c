@@ -119,11 +119,25 @@ static float CarRoute_LinePid(CarRouteExecutor *executor,
 {
     float error = (float)position;
     float dt_s = (float)(now_ms - executor->line_previous_ms) / 1000.0f;
-    float derivative = 0.0f;
+    float derivative = executor->line_derivative_filtered;
 
     if ((dt_s > 0.0f) && (dt_s <= 0.25f)) {
-        derivative = (error - executor->line_previous_error) / dt_s;
         executor->line_integral += error * dt_s;
+        if (executor->line_derivative_initialized) {
+            float raw_derivative =
+                (error - executor->line_previous_error) / dt_s;
+            float tau_s = config->line_derivative_filter_tau_s;
+            float alpha = (tau_s > 0.0f) ?
+                dt_s / (tau_s + dt_s) : 1.0f;
+
+            derivative += alpha * (raw_derivative - derivative);
+        } else {
+            derivative = 0.0f;
+            executor->line_derivative_initialized = true;
+        }
+    } else {
+        derivative = 0.0f;
+        executor->line_derivative_initialized = true;
     }
     if (config->line_integral_limit > 0.0f) {
         executor->line_integral = CarRoute_Clamp(
@@ -131,6 +145,7 @@ static float CarRoute_LinePid(CarRouteExecutor *executor,
     } else {
         executor->line_integral = 0.0f;
     }
+    executor->line_derivative_filtered = derivative;
     executor->line_previous_error = error;
     executor->line_previous_ms = now_ms;
     return error * config->line_kp +
@@ -144,7 +159,9 @@ static void CarRoute_ResetLineState(CarRouteExecutor *executor,
 {
     executor->line_integral = 0.0f;
     executor->line_previous_error = 0.0f;
+    executor->line_derivative_filtered = 0.0f;
     executor->line_previous_ms = now_ms;
+    executor->line_derivative_initialized = false;
     executor->line_correction_mm_s = 0.0f;
     executor->track_enter_streak = 0U;
     executor->track_lost_streak = 0U;
@@ -289,7 +306,9 @@ static CarStatus CarRoute_UpdateTrack(CarRouteExecutor *executor,
     } else {
         executor->line_integral = 0.0f;
         executor->line_previous_error = 0.0f;
+        executor->line_derivative_filtered = 0.0f;
         executor->line_previous_ms = now_ms;
+        executor->line_derivative_initialized = false;
     }
 
     desired_left = CarRoute_Clamp(desired_left,

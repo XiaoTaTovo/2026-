@@ -1,6 +1,11 @@
 #ifndef TI_MSPM0_PLATFORM_CONFIG_H
 #define TI_MSPM0_PLATFORM_CONFIG_H
 
+/* Select exactly one eight-channel line sensor implementation per build. */
+#ifndef H2026_TRACK_SENSOR_SOURCE
+#define H2026_TRACK_SENSOR_SOURCE CAR_TRACK_SENSOR_RED_ARRAY//red指红外模块，gray指灰度模块
+#endif
+
 /* Chassis measurements. Re-measure after changing wheels or encoders. */
 #define H2026_WHEEL_DIAMETER_MM (65.0f)
 #define H2026_TRACK_WIDTH_MM (115.0f)
@@ -39,7 +44,8 @@
 
 #define H2026_LINE_KP (0.025f)
 #define H2026_LINE_KI (0.0f)
-#define H2026_LINE_KD (0.0f)
+#define H2026_LINE_KD (0.0005f)
+#define H2026_LINE_D_FILTER_TAU_S (0.060f)
 #define H2026_LINE_INTEGRAL_LIMIT (5000.0f)
 #define H2026_STRAIGHT_LINE_MAX_CORRECTION_MM_S (87.5f)
 #define H2026_ARC_LINE_MAX_CORRECTION_MM_S (20.0f)

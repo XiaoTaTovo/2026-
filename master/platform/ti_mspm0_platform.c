@@ -117,6 +117,7 @@ static bool TiGray_Select(uint8_t channel, void *context)
 static bool TiGray_ReadAdc(uint16_t *value, void *context)
 {
     uint32_t timeout = H2026_ADC_TIMEOUT_LOOPS;
+    bool completed_by_poll = false;
 
     (void)context;
     if (value == 0) {
@@ -125,20 +126,72 @@ static bool TiGray_ReadAdc(uint16_t *value, void *context)
     g_adc_ready = false;
     DL_ADC12_clearInterruptStatus(
         ADC_GRAY_INST, DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED);
+    /* TI SDK adc12_single_conversion: re-arm ENC for every single sample. */
+    DL_ADC12_enableConversions(ADC_GRAY_INST);
     DL_ADC12_startConversion(ADC_GRAY_INST);
     while (!g_adc_ready && (timeout > 0U)) {
+        if (DL_ADC12_getRawInterruptStatus(
+                ADC_GRAY_INST,
+                DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED) != 0U) {
+            completed_by_poll = true;
+            g_adc_ready = true;
+            break;
+        }
         timeout--;
     }
+    DL_ADC12_stopConversion(ADC_GRAY_INST);
     if (!g_adc_ready) {
-        DL_ADC12_stopConversion(ADC_GRAY_INST);
         DL_ADC12_clearInterruptStatus(
             ADC_GRAY_INST, DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED);
+        NVIC_ClearPendingIRQ(ADC_GRAY_INST_INT_IRQN);
         g_diagnostics.gray_adc_timeouts++;
         return false;
     }
-    DL_ADC12_stopConversion(ADC_GRAY_INST);
+    if (completed_by_poll) {
+        g_diagnostics.gray_adc_poll_completions++;
+    } else {
+        g_diagnostics.gray_adc_isr_completions++;
+    }
     *value = (uint16_t)DL_ADC12_getMemResult(
         ADC_GRAY_INST, ADC_GRAY_ADCMEM_GRAY_OUT);
+    DL_ADC12_clearInterruptStatus(
+        ADC_GRAY_INST, DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED);
+    NVIC_ClearPendingIRQ(ADC_GRAY_INST_INT_IRQN);
+    return true;
+}
+
+static bool TiRed_ReadFrame(
+    uint16_t values[RED_ARRAY_CHANNELS], void *context)
+{
+    if (values == 0) {
+        return false;
+    }
+
+    /*
+     * The verified red-array connector reuses the existing three-bit mux
+     * and single ADC signal. The module IR pin remains electrically unowned
+     * by firmware: no GPIO is configured or driven for it here.
+     */
+    for (uint8_t channel = 0U; channel < RED_ARRAY_CHANNELS; channel++) {
+        uint32_t sum = 0U;
+
+        if (!TiGray_Select(channel, context)) {
+            return false;
+        }
+        TiDelayUs(H2026_GRAY_SETTLE_US, context);
+        for (uint8_t sample = 0U;
+             sample < H2026_GRAY_SAMPLES_PER_CHANNEL;
+             sample++) {
+            uint16_t value;
+
+            if (!TiGray_ReadAdc(&value, context)) {
+                return false;
+            }
+            sum += value;
+        }
+        values[channel] = (uint16_t)(
+            sum / H2026_GRAY_SAMPLES_PER_CHANNEL);
+    }
     return true;
 }
 
@@ -151,7 +204,7 @@ static bool TiButton_Read(void *context)
 static bool TiGrayCalButton_Read(void *context)
 {
     (void)context;
-    return TiMspm0Platform_ReadKey3Level();
+    return TiMspm0Platform_ReadKey2Level();
 }
 
 static void TiBuzzer_Set(bool enabled, void *context)
@@ -169,6 +222,14 @@ void TiMspm0Platform_OnSysTick(void)
     g_millis++;
 }
 
+/*
+ * Keep the reusable platform buildable beside a temporary standalone sensor
+ * main that owns the same vector. The integrated H2026 main has no competing
+ * definition, so this weak handler remains the active ADC completion ISR.
+ */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
 void ADC_GRAY_INST_IRQHandler(void)
 {
     if (DL_ADC12_getPendingInterrupt(ADC_GRAY_INST) ==
@@ -225,6 +286,8 @@ void TiMspm0Platform_Init(void)
         DL_ADC12_SAMP_CONV_DATA_FORMAT_UNSIGNED);
     DL_ADC12_setSampleTime0(ADC_GRAY_INST, 8U);
     DL_ADC12_clearInterruptStatus(
+        ADC_GRAY_INST, DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED);
+    DL_ADC12_enableInterrupt(
         ADC_GRAY_INST, DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED);
     DL_ADC12_enableConversions(ADC_GRAY_INST);
     NVIC_ClearPendingIRQ(ADC_GRAY_INST_INT_IRQN);
@@ -283,6 +346,8 @@ CarStatus TiMspm0Platform_BuildConfig(CarFirmwareConfig *config,
     config->car.line_kp = H2026_LINE_KP;
     config->car.line_ki = H2026_LINE_KI;
     config->car.line_kd = H2026_LINE_KD;
+    config->car.line_derivative_filter_tau_s =
+        H2026_LINE_D_FILTER_TAU_S;
     config->car.line_integral_limit = H2026_LINE_INTEGRAL_LIMIT;
     config->car.straight_line_max_correction_mm_s =
         H2026_STRAIGHT_LINE_MAX_CORRECTION_MM_S;
@@ -338,6 +403,8 @@ CarStatus TiMspm0Platform_BuildConfig(CarFirmwareConfig *config,
         TiGray_Select, TiGray_ReadAdc, TiDelayUs, 0,
         H2026_GRAY_SETTLE_US, H2026_GRAY_SAMPLES_PER_CHANNEL
     };
+    config->track_sensor_source = H2026_TRACK_SENSOR_SOURCE;
+    config->red = (RedArrayPort){TiRed_ReadFrame, 0, 1U};
     config->button_read = TiButton_Read;
     config->gray_cal_button_read = TiGrayCalButton_Read;
     config->require_runtime_gray_calibration = H2026_ModeUsesLine(mode);
