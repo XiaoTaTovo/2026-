@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "dma.h"
 #include "i2c.h"
 #include "tim.h"
 #include "usart.h"
@@ -25,6 +26,13 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+
+#include "bsp_bluetooth.h"
+#include "pitch_axis_manual_control.h"
+#include "pitch_axis_manual_telemetry.h"
+#include "pitch_axis_self_test.h"
+#include "pitch_axis_self_test_telemetry.h"
+#include "x42s_driver.h"
 
 /* USER CODE END Includes */
 
@@ -46,6 +54,38 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+
+static BspBluetooth bluetooth_port;
+static volatile BspBluetoothResult bluetooth_init_result;
+static volatile BspBluetoothResult bluetooth_start_result;
+static X42sDriver pitch_x42;
+static X42sDriverResult pitch_x42_init_result;
+static X42sDriverResult pitch_x42_start_result = X42S_DRIVER_NOT_STARTED;
+static PitchAxisSelfTest pitch_self_test;
+static PitchAxisSelfTestResult pitch_self_test_init_result =
+    PITCH_AXIS_SELF_TEST_NOT_READY;
+static PitchAxisSelfTestResult pitch_self_test_start_result =
+    PITCH_AXIS_SELF_TEST_NOT_READY;
+static PitchAxisSelfTestTelemetry pitch_self_test_telemetry;
+static PitchAxisManualControl pitch_manual_control;
+static PitchAxisManualTelemetry pitch_manual_telemetry;
+static bool pitch_manual_initialized;
+static const PitchAxisManualConfig pitch_manual_config = {
+    .address = X42S_DEFAULT_ADDRESS,
+    .positive_direction = 0U,
+    .negative_direction = 1U,
+    .speed_rpm = 60U,
+    .acceleration = 100U,
+    .step_pulses = 32U,
+    /* Mode 0 accumulates each command from the previous input target.  The
+     * installed motor firmware treated mode 2 as an absolute target during
+     * the first hardware trial, so manual button steps use the vendor
+     * example's repeatable relative mode. */
+    .motion_mode = 0U,
+    .synchronize = false,
+    .debounce_ms = 30U,
+    .settle_ms = 1200U
+};
 
 /* USER CODE END PV */
 
@@ -89,6 +129,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_I2C1_Init();
   MX_I2C3_Init();
   MX_TIM3_Init();
@@ -97,6 +138,78 @@ int main(void)
   MX_USART3_UART_Init();
   MX_USART6_UART_Init();
   /* USER CODE BEGIN 2 */
+
+  bluetooth_init_result = BspBluetooth_Init(&bluetooth_port, &huart1);
+  if (bluetooth_init_result == BSP_BLUETOOTH_OK)
+  {
+    bluetooth_start_result = BspBluetooth_Start(&bluetooth_port);
+    if (bluetooth_start_result == BSP_BLUETOOTH_OK)
+    {
+      (void)BspBluetooth_WriteString(&bluetooth_port, "BT_DMA_READY\r\n");
+    }
+  }
+
+  pitch_x42_init_result = X42sDriver_Init(&pitch_x42, &huart3);
+  if (pitch_x42_init_result == X42S_DRIVER_OK)
+  {
+    pitch_x42_start_result = X42sDriver_Start(&pitch_x42);
+  }
+
+  pitch_manual_initialized = PitchAxisManualControl_Init(
+      &pitch_manual_control,
+      &pitch_x42,
+      &pitch_manual_config,
+      HAL_GetTick());
+  if (pitch_manual_initialized)
+  {
+    (void)PitchAxisManualTelemetry_Init(
+        &pitch_manual_telemetry,
+        &pitch_manual_control,
+        &bluetooth_port,
+        HAL_GetTick());
+  }
+
+  if (pitch_x42_start_result == X42S_DRIVER_OK)
+  {
+    pitch_self_test_init_result = PitchAxisSelfTest_Init(
+        &pitch_self_test,
+        &pitch_x42,
+        X42S_DEFAULT_ADDRESS,
+        PITCH_AXIS_SELF_TEST_DEFAULT_CYCLES,
+        PITCH_AXIS_SELF_TEST_DEFAULT_PERIOD_MS,
+        PITCH_AXIS_SELF_TEST_DEFAULT_START_DELAY_MS);
+    if (pitch_self_test_init_result == PITCH_AXIS_SELF_TEST_OK)
+    {
+      pitch_self_test_start_result = PitchAxisSelfTest_Start(
+          &pitch_self_test,
+          HAL_GetTick());
+    }
+  }
+
+  if ((pitch_self_test_start_result != PITCH_AXIS_SELF_TEST_OK) ||
+      !PitchAxisSelfTestTelemetry_Init(
+          &pitch_self_test_telemetry,
+          &pitch_self_test,
+          &bluetooth_port))
+  {
+    (void)BspBluetooth_WriteString(
+        &bluetooth_port,
+        "PITCH_READ1000_INIT_ERROR\r\n");
+  }
+
+  if (!pitch_manual_initialized)
+  {
+    (void)BspBluetooth_WriteString(
+        &bluetooth_port,
+        "PITCH_MANUAL_INIT_ERROR\r\n");
+  }
+  else if (pitch_self_test_start_result != PITCH_AXIS_SELF_TEST_OK)
+  {
+    PitchAxisManualControl_SetCommunicationResult(
+        &pitch_manual_control,
+        false,
+        HAL_GetTick());
+  }
 
   /* USER CODE END 2 */
 
@@ -107,6 +220,83 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+
+    uint8_t rx_data[64];
+    size_t available;
+    size_t read_length;
+    size_t transfer_length;
+    uint32_t now_ms;
+    PitchAxisManualButtons buttons;
+    PitchAxisSelfTestState self_test_state;
+
+    now_ms = HAL_GetTick();
+    BspBluetooth_Service(&bluetooth_port);
+    buttons.key1_pressed =
+        (HAL_GPIO_ReadPin(Key_1_GPIO_Port, Key_1_Pin) == GPIO_PIN_RESET);
+    buttons.key2_pressed =
+        (HAL_GPIO_ReadPin(Key_2_GPIO_Port, Key_2_Pin) == GPIO_PIN_RESET);
+    buttons.key3_pressed =
+        (HAL_GPIO_ReadPin(Key_3_GPIO_Port, Key_3_Pin) == GPIO_PIN_RESET);
+    buttons.key4_pressed =
+        (HAL_GPIO_ReadPin(Key_4_GPIO_Port, Key_4_Pin) == GPIO_PIN_RESET);
+
+    if (pitch_manual_initialized)
+    {
+      PitchAxisManualControl_Service(
+          &pitch_manual_control,
+          now_ms,
+          buttons);
+    }
+
+    if (!pitch_manual_initialized ||
+        ((PitchAxisManualControl_GetState(&pitch_manual_control) !=
+          PITCH_MANUAL_STATE_STOPPING) &&
+         (PitchAxisManualControl_GetState(&pitch_manual_control) !=
+          PITCH_MANUAL_STATE_FAULT_LATCHED)))
+    {
+      PitchAxisSelfTest_Service(&pitch_self_test, now_ms);
+    }
+
+    self_test_state = PitchAxisSelfTest_GetState(&pitch_self_test);
+    if (pitch_manual_initialized &&
+        (self_test_state == PITCH_AXIS_SELF_TEST_STATE_COMM_PASS))
+    {
+      PitchAxisManualControl_SetCommunicationResult(
+          &pitch_manual_control,
+          true,
+          now_ms);
+    }
+    else if (pitch_manual_initialized &&
+             (self_test_state == PITCH_AXIS_SELF_TEST_STATE_FAILED))
+    {
+      PitchAxisManualControl_SetCommunicationResult(
+          &pitch_manual_control,
+          false,
+          now_ms);
+    }
+
+    PitchAxisSelfTestTelemetry_Service(&pitch_self_test_telemetry);
+    if (pitch_manual_initialized)
+    {
+      PitchAxisManualTelemetry_Service(&pitch_manual_telemetry, now_ms);
+    }
+
+    available = BspBluetooth_Available(&bluetooth_port);
+    transfer_length = available;
+    if (transfer_length > sizeof(rx_data))
+    {
+      transfer_length = sizeof(rx_data);
+    }
+
+    if ((transfer_length > 0U) &&
+        (BspBluetooth_Read(
+             &bluetooth_port,
+             rx_data,
+             transfer_length,
+             &read_length) == BSP_BLUETOOTH_OK))
+    {
+      (void)read_length;
+    }
   }
   /* USER CODE END 3 */
 }
