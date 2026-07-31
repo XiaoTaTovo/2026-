@@ -160,41 +160,6 @@ static bool TiGray_ReadAdc(uint16_t *value, void *context)
     return true;
 }
 
-static bool TiRed_ReadFrame(
-    uint16_t values[RED_ARRAY_CHANNELS], void *context)
-{
-    if (values == 0) {
-        return false;
-    }
-
-    /*
-     * The verified red-array connector reuses the existing three-bit mux
-     * and single ADC signal. The module IR pin remains electrically unowned
-     * by firmware: no GPIO is configured or driven for it here.
-     */
-    for (uint8_t channel = 0U; channel < RED_ARRAY_CHANNELS; channel++) {
-        uint32_t sum = 0U;
-
-        if (!TiGray_Select(channel, context)) {
-            return false;
-        }
-        TiDelayUs(H2026_GRAY_SETTLE_US, context);
-        for (uint8_t sample = 0U;
-             sample < H2026_GRAY_SAMPLES_PER_CHANNEL;
-             sample++) {
-            uint16_t value;
-
-            if (!TiGray_ReadAdc(&value, context)) {
-                return false;
-            }
-            sum += value;
-        }
-        values[channel] = (uint16_t)(
-            sum / H2026_GRAY_SAMPLES_PER_CHANNEL);
-    }
-    return true;
-}
-
 static bool TiButton_Read(void *context)
 {
     (void)context;
@@ -403,12 +368,10 @@ CarStatus TiMspm0Platform_BuildConfig(CarFirmwareConfig *config,
         TiGray_Select, TiGray_ReadAdc, TiDelayUs, 0,
         H2026_GRAY_SETTLE_US, H2026_GRAY_SAMPLES_PER_CHANNEL
     };
-    config->track_sensor_source = H2026_TRACK_SENSOR_SOURCE;
-    config->red = (RedArrayPort){TiRed_ReadFrame, 0, 1U};
     config->button_read = TiButton_Read;
     config->gray_cal_button_read = TiGrayCalButton_Read;
     config->task_button_read = TiTaskButton_Read;
-    config->require_runtime_gray_calibration = true;
+    config->require_runtime_gray_calibration = H2026_ModeUsesLine(mode);
     config->buzzer_set = TiBuzzer_Set;
     config->yaw_axis = CAR_IMU_AXIS_Z;
     config->yaw_sign = H2026_IMU_YAW_SIGN;

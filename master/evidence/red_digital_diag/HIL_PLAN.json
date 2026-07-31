@@ -1,0 +1,289 @@
+{
+  "schema_version": "1.0",
+  "plan_id": "red-digital-diag-20260731-001",
+  "title": "MSPM0G3507 RED D5-D7 passive digital-input validation",
+  "artifact": {
+    "path": "C:/Users/taowz/Desktop/2026/code/master/Debug/empty_mspm0g3507_nortos_ticlang.out",
+    "sha256": "73645171B3F40028F4E581867F2184057F8C9FFF3A645E09ABE857E202E6A110",
+    "toolchain": "TI Arm Clang 5.1.1 LTS; SysConfig 1.28.0+4712",
+    "build_id": "red-digital-diag-v1-20260731"
+  },
+  "boundary": {
+    "workspace_roots": [
+      "C:/Users/taowz/Desktop/2026/code/master"
+    ],
+    "target": {
+      "vendor": "Texas Instruments",
+      "family": "MSPM0",
+      "part": "MSPM0G3507 LQFP-64",
+      "board_revision": "current user car; revision not marked",
+      "unique_id": "USER_CURRENT_CAR_MSPM0G3507_20260731"
+    },
+    "connections": {
+      "probe_id": "USB/VID_0451&PID_BEF3/NOSERIAL XDS110",
+      "serial_port": "COM7 Bluetooth SPP, 115200 8N1",
+      "power_source": "3.3 V module rail with common ground",
+      "instruments": [
+        "operator multimeter for D-pin voltage cross-check"
+      ]
+    },
+    "power_limits": {
+      "max_voltage_v": 3.3,
+      "max_current_a": 0.1
+    },
+    "fixtures": [
+      "8-channel infrared module at one fixed height above white/black paper"
+    ],
+    "loads": [
+      "D5, D6, or D7 connected one at a time to PB17, PB18, or PB19",
+      "motors electrically disabled with TB6612 STBY low"
+    ],
+    "safe_state": "Motor power disabled, TB6612 STBY low, IR disconnected, module at 3.3 V, and no more than one D output connected to the MCU.",
+    "hazards": [
+      {
+        "hazard": "Module or MCU input exceeds 3.3 V",
+        "mitigation": "Stop immediately and remove module power; verify the D pin with a multimeter before reconnecting."
+      },
+      {
+        "hazard": "Unexpected motor activation",
+        "mitigation": "Disconnect or independently disable motor power before programming and keep STBY low in firmware."
+      },
+      {
+        "hazard": "Pin conflict or multiple module outputs connected",
+        "mitigation": "Connect only the named D pin for the active test and keep D1-D4, D8, and IR disconnected."
+      }
+    ],
+    "resource_owners": {
+      "USER_CURRENT_CAR_MSPM0G3507_20260731": "operator",
+      "USB/VID_0451&PID_BEF3/NOSERIAL XDS110": "operator",
+      "COM7": "Codex passive capture after operator closes VOFA+"
+    }
+  },
+  "tools": [
+    {
+      "id": "windows-pnp",
+      "kind": "Windows PnP/CIM inventory",
+      "mode": "read_only",
+      "resource": "local Windows device inventory",
+      "allowed_operations": [
+        "enumerate present XDS110 and serial devices"
+      ],
+      "constraints": {
+        "timeout_s": 30,
+        "workspace_roots": [
+          "C:/Users/taowz/Desktop/2026/code/master"
+        ]
+      },
+      "denied_operations": [
+        "enable or disable device",
+        "open target session",
+        "reset or program target"
+      ]
+    },
+    {
+      "id": "dotnet-serial-readonly",
+      "kind": "System.IO.Ports passive serial capture",
+      "mode": "read_only",
+      "resource": "COM7",
+      "allowed_operations": [
+        "open COM7 with RTS and DTR disabled",
+        "read ASCII lines",
+        "close COM7"
+      ],
+      "constraints": {
+        "port": "COM7",
+        "baud": 115200,
+        "data_bits": 8,
+        "parity": "None",
+        "stop_bits": 1,
+        "rts": false,
+        "dtr": false,
+        "timeout_s": 15,
+        "max_response_bytes": 131072
+      },
+      "denied_operations": [
+        "serial writes",
+        "RTS or DTR toggling",
+        "target reset",
+        "target programming"
+      ]
+    }
+  ],
+  "approval": {
+    "policy": "Only passive discovery and serial reads are in this plan. Firmware programming, reset, halt, run control, breakpoints, and live register access remain disabled.",
+    "records": []
+  },
+  "rollback": {
+    "owner": "operator",
+    "trigger": "Any stop condition, unexpected output, invalid voltage, OLED freeze, reset, heat, or communication loss.",
+    "steps": [
+      "Remove module power.",
+      "Disconnect the active D pin from the MCU.",
+      "Disable the car and motor power.",
+      "Close COM7 and all CCS, DSLite, and VOFA+ sessions."
+    ],
+    "verified_safe_state": "Module is unpowered, D and IR pins are disconnected, motors are disabled, and no process owns COM7 or XDS110."
+  },
+  "stop_conditions": [
+    "Any input or module rail exceeds 3.3 V.",
+    "OLED heartbeat stops or the timestamp restarts unexpectedly.",
+    "Diagnostic faults or errors become nonzero.",
+    "The board or module heats, current exceeds 0.1 A, or a rail sags.",
+    "Any motor output or motion occurs.",
+    "More than one module D pin is connected.",
+    "COM7 data is malformed, missing, or owned by another process."
+  ],
+  "evidence": {
+    "directory": "C:/Users/taowz/Desktop/2026/code/master/evidence/red_digital_diag",
+    "immutable_raw": true,
+    "capture": [
+      "artifact and configuration SHA-256 values",
+      "read-only PnP inventory",
+      "manual programming result",
+      "OLED heartbeat observation",
+      "raw serial logs for every channel and paper state",
+      "multimeter readings and operator observations"
+    ]
+  },
+  "tests": [
+    {
+      "id": "G4-DISCOVER-001",
+      "gate": "G4",
+      "classification": "READ_ONLY",
+      "requirement": "The expected XDS110 and COM7 exist without opening a target session.",
+      "setup": [
+        "Do not connect a debugger or serial terminal.",
+        "Keep motors and module signal pins disconnected."
+      ],
+      "action": {
+        "tool": "windows-pnp",
+        "operation": "enumerate present XDS110 and serial devices",
+        "parameters": {}
+      },
+      "limits": {
+        "timeout_s": 30,
+        "attempts": 1,
+        "max_response_bytes": 65536
+      },
+      "expected": "One present XDS110 composite device and COM7 Bluetooth SPP are reported with status OK.",
+      "measurement": "Windows PnP and Win32_SerialPort inventory.",
+      "tolerance": "Exact VID/PID and port identity; no target state change.",
+      "repetitions": 1,
+      "evidence": [
+        "pnp inventory captured in task transcript"
+      ],
+      "rollback": [
+        "Close the inventory command."
+      ],
+      "stop_conditions": [
+        "Expected XDS110 or COM7 is absent.",
+        "Any inventory command requests target access."
+      ]
+    },
+    {
+      "id": "G6-SMOKE-001",
+      "gate": "G6",
+      "classification": "READ_ONLY",
+      "requirement": "The manually programmed diagnostic image runs continuously with motors disabled and valid GPIO configuration.",
+      "setup": [
+        "Operator manually programs the exact artifact hash outside this plan.",
+        "Close CCS debug, DSLite, VOFA+, and every other COM7 client.",
+        "Keep IR and all D pins disconnected; keep motor power disabled."
+      ],
+      "action": {
+        "tool": "dotnet-serial-readonly",
+        "operation": "read ASCII lines",
+        "parameters": {
+          "port": "COM7",
+          "baud": 115200,
+          "framing": "8N1",
+          "rts": false,
+          "dtr": false
+        }
+      },
+      "limits": {
+        "timeout_s": 15,
+        "attempts": 1,
+        "max_response_bytes": 131072
+      },
+      "expected": "RED_DIGITAL_DIAG_V1 banner, 50 ms monotonic timestamps, advancing OLED heartbeat, and errors=0 faults=0.",
+      "measurement": "Raw COM7 log plus operator observation of OLED and STBY-safe motor state.",
+      "tolerance": "At least 100 complete frames; no timestamp restart, malformed frame, diagnostic error, fault, or motor output.",
+      "repetitions": 1,
+      "evidence": [
+        "raw/smoke.csv",
+        "operator OLED and motor-safe observation"
+      ],
+      "rollback": [
+        "Close COM7.",
+        "Remove module and car power."
+      ],
+      "stop_conditions": [
+        "Banner differs from RED_DIGITAL_DIAG_V1.",
+        "Any errors or faults field is nonzero.",
+        "OLED heartbeat stops or timestamp restarts.",
+        "Motor output or motion occurs."
+      ]
+    },
+    {
+      "id": "G7-D5-D7-001",
+      "gate": "G7",
+      "classification": "READ_ONLY",
+      "requirement": "D5, D6, and D7 each produce stable, reproducible digital levels over white and black paper.",
+      "setup": [
+        "Complete G6 successfully.",
+        "Use one fixed module height and one fixed white/black paper pair.",
+        "Connect only D5 to PB17, D6 to PB18, or D7 to PB19 for the active channel.",
+        "Keep IR and every inactive D pin disconnected.",
+        "Measure the active D-pin voltage with a multimeter in both states."
+      ],
+      "action": {
+        "tool": "dotnet-serial-readonly",
+        "operation": "read ASCII lines",
+        "parameters": {
+          "port": "COM7",
+          "baud": 115200,
+          "framing": "8N1",
+          "states": [
+            "D5 white",
+            "D5 black",
+            "D6 white",
+            "D6 black",
+            "D7 white",
+            "D7 black"
+          ]
+        }
+      },
+      "limits": {
+        "timeout_s": 15,
+        "attempts": 1,
+        "max_response_bytes": 131072
+      },
+      "expected": "For each channel, at least 20 valid frames per paper state; the named GPIO value agrees with the corresponding DIN bit and the multimeter logic level.",
+      "measurement": "Six immutable raw captures plus multimeter readings and operator height/state labels.",
+      "tolerance": "At least 20 samples per state, zero GPIO/DIN disagreement, zero diagnostic errors/faults, and a stable black/white logic transition when the channel is functional.",
+      "repetitions": 6,
+      "evidence": [
+        "raw/D5_white.csv",
+        "raw/D5_black.csv",
+        "raw/D6_white.csv",
+        "raw/D6_black.csv",
+        "raw/D7_white.csv",
+        "raw/D7_black.csv",
+        "operator multimeter readings"
+      ],
+      "rollback": [
+        "Close COM7.",
+        "Remove module power before changing the connected D pin.",
+        "Disconnect the active D pin and keep IR disconnected."
+      ],
+      "stop_conditions": [
+        "Any voltage exceeds 3.3 V.",
+        "Any errors or faults field is nonzero.",
+        "OLED heartbeat stops, timestamp restarts, or a frame is malformed.",
+        "The module or MCU heats or the rail sags.",
+        "More than one D pin is connected."
+      ]
+    }
+  ]
+}

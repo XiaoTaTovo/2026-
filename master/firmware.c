@@ -8,20 +8,12 @@ static bool CarFirmware_GrayCalibrationReady(const CarFirmware *firmware)
 
 static const uint16_t *CarFirmware_TrackRaw(const CarFirmware *firmware)
 {
-    if (firmware->config.track_sensor_source ==
-        CAR_TRACK_SENSOR_RED_ARRAY) {
-        return firmware->red.raw;
-    }
     return firmware->gray.raw;
 }
 
-static int32_t CarFirmware_TrackMinimumCalibrationSpan(
-    const CarFirmware *firmware)
+static int32_t CarFirmware_GrayMinimumCalibrationSpan(void)
 {
-    return (firmware->config.track_sensor_source ==
-            CAR_TRACK_SENSOR_RED_ARRAY) ?
-        RED_ARRAY_MIN_CALIBRATION_SPAN :
-        GRAY_ARRAY_MIN_CALIBRATION_SPAN;
+    return GRAY_ARRAY_MIN_CALIBRATION_SPAN;
 }
 
 static bool CarFirmware_SetTrackCalibration(
@@ -29,29 +21,17 @@ static bool CarFirmware_SetTrackCalibration(
     const uint16_t black[GRAY_ARRAY_CHANNELS],
     const uint16_t white[GRAY_ARRAY_CHANNELS])
 {
-    if (firmware->config.track_sensor_source ==
-        CAR_TRACK_SENSOR_RED_ARRAY) {
-        return RedArray_SetCalibration(&firmware->red, black, white);
-    }
     return GrayArray_SetCalibration(&firmware->gray, black, white);
 }
 
 static bool CarFirmware_ReadTrack(CarFirmware *firmware, uint32_t now_ms)
 {
-    if (firmware->config.track_sensor_source ==
-        CAR_TRACK_SENSOR_RED_ARRAY) {
-        return RedArray_Read(&firmware->red, now_ms);
-    }
     return GrayArray_Read(&firmware->gray, now_ms);
 }
 
 static bool CarFirmware_GetLatestTrack(const CarFirmware *firmware,
                                        CarGraySample *sample)
 {
-    if (firmware->config.track_sensor_source ==
-        CAR_TRACK_SENSOR_RED_ARRAY) {
-        return RedArray_GetLatest(&firmware->red, sample);
-    }
     return GrayArray_GetLatest(&firmware->gray, sample);
 }
 
@@ -119,21 +99,10 @@ static void CarFirmware_AccumulateGrayCalibration(CarFirmware *firmware,
                                         firmware->gray_cal_black,
                                         firmware->gray_cal_white)) {
         for (uint8_t i = 0U; i < GRAY_ARRAY_CHANNELS; i++) {
-            if (firmware->config.track_sensor_source ==
-                CAR_TRACK_SENSOR_RED_ARRAY) {
-                firmware->config.red_black[i] = firmware->gray_cal_black[i];
-                firmware->config.red_white[i] = firmware->gray_cal_white[i];
-            } else {
-                firmware->config.gray_black[i] = firmware->gray_cal_black[i];
-                firmware->config.gray_white[i] = firmware->gray_cal_white[i];
-            }
+            firmware->config.gray_black[i] = firmware->gray_cal_black[i];
+            firmware->config.gray_white[i] = firmware->gray_cal_white[i];
         }
-        if (firmware->config.track_sensor_source ==
-            CAR_TRACK_SENSOR_RED_ARRAY) {
-            firmware->config.red_calibration_valid = true;
-        } else {
-            firmware->config.gray_calibration_valid = true;
-        }
+        firmware->config.gray_calibration_valid = true;
         firmware->gray_sample.valid = false;
         firmware->gray_cal_state = CAR_GRAY_CAL_READY;
         Buzzer_PlayCue(&firmware->buzzer, CAR_CUE_CHECKPOINT, now_ms);
@@ -145,8 +114,7 @@ static void CarFirmware_AccumulateGrayCalibration(CarFirmware *firmware,
     for (uint8_t i = 0U; i < GRAY_ARRAY_CHANNELS; i++) {
         int32_t span = (int32_t)firmware->gray_cal_white[i] -
                        (int32_t)firmware->gray_cal_black[i];
-        int32_t minimum_span =
-            CarFirmware_TrackMinimumCalibrationSpan(firmware);
+        int32_t minimum_span = CarFirmware_GrayMinimumCalibrationSpan();
 
         if ((span > -minimum_span) && (span < minimum_span)) {
             firmware->gray_cal_bad_channel = i;
@@ -225,6 +193,7 @@ static void CarFirmware_RunImu(CarFirmware *firmware, uint32_t now_ms)
 
     if (!Icm42688_ReadSample(&firmware->imu, now_ms, &raw)) {
         firmware->imu_sample.valid = false;
+        ChassisFeedforward_OnImuReadError(&firmware->feedforward);
         return;
     }
     gyro_dps = CarFirmware_SelectGyro(firmware, &raw);
@@ -234,6 +203,7 @@ static void CarFirmware_RunImu(CarFirmware *firmware, uint32_t now_ms)
         firmware->imu_sample.yaw_rate_dps =
             gyro_dps - firmware->yaw.bias_dps;
     }
+    ChassisFeedforward_OnImuSample(&firmware->feedforward, &raw);
 }
 
 static void CarFirmware_RunControl(CarFirmware *firmware, uint32_t now_ms)
@@ -291,6 +261,11 @@ static void CarFirmware_RunControl(CarFirmware *firmware, uint32_t now_ms)
     (void)CarApp_Update(&firmware->app, now_ms, &input,
                         &firmware->output);
     firmware->output.faults |= firmware->hardware_faults;
+    ChassisFeedforward_OnCommand(
+        &firmware->feedforward,
+        (firmware->output.motor.left_mm_s +
+         firmware->output.motor.right_mm_s) * 0.5f,
+        now_ms);
     if ((firmware->output.cue != CAR_CUE_NONE) &&
         (firmware->output.cue != firmware->last_output_cue)) {
         Buzzer_PlayCue(&firmware->buzzer, firmware->output.cue, now_ms);
@@ -309,9 +284,7 @@ CarStatus CarFirmware_Init(CarFirmware *firmware,
         (config->drive.set_wheel_speeds == 0) ||
         (config->drive.read_encoder == 0) ||
         (config->drive.stop == 0) || (config->drive.service == 0) ||
-        ((config->yaw_sign != 1) && (config->yaw_sign != -1)) ||
-        ((config->track_sensor_source != CAR_TRACK_SENSOR_GRAY_ARRAY) &&
-         (config->track_sensor_source != CAR_TRACK_SENSOR_RED_ARRAY))) {
+        ((config->yaw_sign != 1) && (config->yaw_sign != -1))) {
         return CAR_ERROR_ARG;
     }
     *firmware = (CarFirmware){0};
@@ -319,7 +292,6 @@ CarStatus CarFirmware_Init(CarFirmware *firmware,
     firmware->last_tick_ms = now_ms;
     Icm42688_InitObject(&firmware->imu, &config->imu);
     GrayArray_Init(&firmware->gray, &config->gray);
-    RedArray_Init(&firmware->red, &config->red);
     Button_Init(&firmware->button, config->button_read,
                 config->button_context, config->button_active_low,
                 config->button_debounce_ms);
@@ -335,23 +307,25 @@ CarStatus CarFirmware_Init(CarFirmware *firmware,
                          config->imu_max_step_ms,
                          config->yaw_bias_dps,
                          config->yaw_bias_fixed);
+    ChassisFeedforward_Init(&firmware->feedforward,
+                            &(ChassisFeedforwardConfig){
+                                .accel_axis = config->accel_axis,
+                                .accel_sign = config->accel_sign,
+                                .accel_lsb_per_g = config->accel_lsb_per_g,
+                                .stationary_calibration_samples =
+                                    config->accel_calibration_samples,
+                                .imu_filter_alpha = config->accel_filter_alpha
+                            });
     if (CarApp_Init(&firmware->app, &config->car) != CAR_OK) {
         return CAR_ERROR_ARG;
     }
     if (!Icm42688_Initialize(&firmware->imu)) {
         firmware->hardware_faults |= CAR_FAULT_IMU_INIT;
     }
-    if (config->track_sensor_source == CAR_TRACK_SENSOR_RED_ARRAY) {
-        track_setup_ok = config->red_calibration_valid &&
-            RedArray_SetCalibration(&firmware->red,
-                                    config->red_black,
-                                    config->red_white);
-    } else {
-        track_setup_ok = config->gray_calibration_valid &&
-            GrayArray_SetCalibration(&firmware->gray,
-                                     config->gray_black,
-                                     config->gray_white);
-    }
+    track_setup_ok = config->gray_calibration_valid &&
+        GrayArray_SetCalibration(&firmware->gray,
+                                 config->gray_black,
+                                 config->gray_white);
     if (!track_setup_ok && !config->require_runtime_gray_calibration &&
         H2026_ModeUsesLine(config->mode)) {
         firmware->hardware_faults |= CAR_FAULT_GRAY_NOT_CALIBRATED;
@@ -426,4 +400,20 @@ void CarFirmware_ForceStop(CarFirmware *firmware, uint32_t fault)
 const CarOutputSnapshot *CarFirmware_GetOutput(const CarFirmware *firmware)
 {
     return (firmware == 0) ? 0 : &firmware->output;
+}
+
+bool CarFirmware_GetFeedforward(const CarFirmware *firmware,
+                                uint32_t now_ms,
+                                ChassisFeedforwardSample *sample)
+{
+    float yaw_rate_dps = 0.0f;
+
+    if ((firmware == 0) || (sample == 0)) {
+        return false;
+    }
+    if (firmware->imu_sample.valid) {
+        yaw_rate_dps = firmware->imu_sample.yaw_rate_dps;
+    }
+    return ChassisFeedforward_GetSample(&firmware->feedforward, now_ms,
+                                        yaw_rate_dps, sample);
 }

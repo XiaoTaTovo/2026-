@@ -27,9 +27,12 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
+#include <stdio.h>
+
 #include "bsp_bluetooth.h"
 #include "bsp_uart_dma.h"
 #include "ball_observation_protocol.h"
+#include "chassis_feedforward_protocol.h"
 #include "pitch_axis_manual_control.h"
 #include "pitch_axis_manual_telemetry.h"
 #include "pitch_axis_self_test.h"
@@ -69,6 +72,13 @@ static BallObservationParser vision_parser;
 static PitchAxisVisionControl pitch_vision_control;
 static PitchAxisVisionTelemetry pitch_vision_telemetry;
 static bool pitch_vision_initialized;
+static BspUartDmaPort chassis_port;
+static BspUartDmaResult chassis_init_result;
+static BspUartDmaResult chassis_start_result;
+static ChassisFeedforwardParser chassis_parser;
+static ChassisFeedforwardSample chassis_sample;
+static ChassisFeedforwardEstimate chassis_estimate;
+static uint32_t chassis_last_telemetry_ms;
 static X42sDriver pitch_x42;
 static X42sDriverResult pitch_x42_init_result;
 static X42sDriverResult pitch_x42_start_result = X42S_DRIVER_NOT_STARTED;
@@ -129,6 +139,34 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+static void ChassisFeedforward_Report(uint32_t now_ms)
+{
+  char text[192];
+  uint32_t age_ms;
+
+  if ((uint32_t)(now_ms - chassis_last_telemetry_ms) < 500U)
+  {
+    return;
+  }
+  chassis_last_telemetry_ms = now_ms;
+  age_ms = chassis_sample.valid ? (uint32_t)(now_ms - chassis_sample.received_ms) :
+                                  0xFFFFFFFFU;
+  (void)snprintf(
+      text,
+      sizeof(text),
+      "CHASSIS_FF,state=LOCKED,frames=%lu,seq=%u,age=%lu,cmd=%d,imu=%d,est=%d,tilt_mrad=%d,crc=%lu,fmt=%lu\r\n",
+      (unsigned long)chassis_parser.accepted_frame_count,
+      (unsigned int)chassis_sample.sequence,
+      (unsigned long)age_ms,
+      (int)chassis_sample.command_accel_mm_s2,
+      (int)chassis_sample.imu_accel_mm_s2,
+      (int)chassis_estimate.estimated_accel_mm_s2,
+      (int)chassis_estimate.pitch_candidate_mrad,
+      (unsigned long)chassis_parser.crc_error_count,
+      (unsigned long)chassis_parser.format_error_count);
+  (void)BspBluetooth_WriteString(&bluetooth_port, text);
+}
 
 /* USER CODE END 0 */
 
@@ -209,6 +247,24 @@ int main(void)
     (void)BspBluetooth_WriteString(&bluetooth_port, "VISION_INIT_ERROR\r\n");
   }
 
+  chassis_init_result = BspUartDma_Init(&chassis_port, &huart2);
+  if (chassis_init_result == BSP_UART_DMA_OK)
+  {
+    chassis_start_result = BspUartDma_Start(&chassis_port);
+  }
+  ChassisFeedforwardParser_Init(&chassis_parser);
+  if ((chassis_init_result == BSP_UART_DMA_OK) &&
+      (chassis_start_result == BSP_UART_DMA_OK))
+  {
+    (void)BspBluetooth_WriteString(&bluetooth_port,
+                                   "CHASSIS_UART_DMA_READY\r\n");
+  }
+  else
+  {
+    (void)BspBluetooth_WriteString(&bluetooth_port,
+                                   "CHASSIS_UART_DMA_INIT_ERROR\r\n");
+  }
+
   pitch_x42_init_result = X42sDriver_Init(&pitch_x42, &huart3);
   if (pitch_x42_init_result == X42S_DRIVER_OK)
   {
@@ -283,11 +339,14 @@ int main(void)
 
     uint8_t rx_data[64];
     uint8_t vision_rx_data[64];
+    uint8_t chassis_rx_data[64];
     size_t available;
     size_t read_length;
     size_t transfer_length;
     size_t vision_read_length;
     size_t vision_index;
+    size_t chassis_read_length;
+    size_t chassis_index;
     uint32_t now_ms;
     PitchAxisManualButtons buttons;
     PitchAxisSelfTestState self_test_state;
@@ -296,6 +355,7 @@ int main(void)
     now_ms = HAL_GetTick();
     BspBluetooth_Service(&bluetooth_port);
     BspUartDma_Service(&vision_port);
+    BspUartDma_Service(&chassis_port);
     buttons.key1_pressed =
         (HAL_GPIO_ReadPin(Key_1_GPIO_Port, Key_1_Pin) == GPIO_PIN_RESET);
     buttons.key2_pressed =
@@ -333,6 +393,32 @@ int main(void)
         }
       }
     } while (vision_read_length == sizeof(vision_rx_data));
+    do
+    {
+      chassis_read_length = BspUartDma_Read(
+          &chassis_port,
+          chassis_rx_data,
+          sizeof(chassis_rx_data));
+      for (chassis_index = 0U;
+           chassis_index < chassis_read_length;
+           ++chassis_index)
+      {
+        ChassisFeedforwardSample decoded_sample;
+
+        if (ChassisFeedforwardParser_OnByte(
+                &chassis_parser,
+                chassis_rx_data[chassis_index],
+                now_ms,
+                &decoded_sample))
+        {
+          chassis_sample = decoded_sample;
+          ChassisFeedforwardEstimate_Update(
+              &chassis_estimate,
+              &chassis_sample);
+        }
+      }
+    } while (chassis_read_length == sizeof(chassis_rx_data));
+    ChassisFeedforward_Report(now_ms);
     if (pitch_vision_initialized)
     {
       PitchAxisVisionControl_Service(&pitch_vision_control, now_ms);

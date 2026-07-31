@@ -8,7 +8,12 @@
 
 #define RED_ARRAY_CHANNELS (8U)
 #define RED_ARRAY_FULL_SCALE (1000U)
-#define RED_ARRAY_MIN_CALIBRATION_SPAN (100)
+#define RED_ARRAY_MIN_CALIBRATION_SPAN (50)
+
+typedef enum {
+    RED_ARRAY_SIGNAL_ANALOG = 0,
+    RED_ARRAY_SIGNAL_DIGITAL
+} RedArraySignalType;
 
 /* The platform adapter supplies one complete eight-channel raw frame. */
 typedef bool (*RedArrayReadFrameFn)(
@@ -18,6 +23,9 @@ typedef struct {
     RedArrayReadFrameFn read_frame;
     void *context;
     uint8_t frames_to_average;
+    RedArraySignalType signal_type;
+    uint8_t digital_line_active_low_mask;
+    bool digital_reverse_order;
 } RedArrayPort;
 
 typedef struct {

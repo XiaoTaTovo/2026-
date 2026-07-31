@@ -47,6 +47,10 @@ bool RedArray_SetCalibration(
     if ((array == 0) || (black == 0) || (white == 0)) {
         return false;
     }
+    if (array->port.signal_type == RED_ARRAY_SIGNAL_DIGITAL) {
+        array->calibrated = true;
+        return true;
+    }
     for (uint8_t i = 0U; i < RED_ARRAY_CHANNELS; i++) {
         int32_t span = (int32_t)white[i] - (int32_t)black[i];
 
@@ -92,19 +96,42 @@ bool RedArray_Read(RedArray *array, uint32_t now_ms)
         for (uint8_t channel = 0U;
              channel < RED_ARRAY_CHANNELS;
              channel++) {
-            sums[channel] += frame[channel];
+            uint8_t target = array->port.digital_reverse_order ?
+                (uint8_t)((RED_ARRAY_CHANNELS - 1U) - channel) : channel;
+
+            if (array->port.signal_type == RED_ARRAY_SIGNAL_DIGITAL) {
+                bool electrical_high = frame[channel] != 0U;
+                bool line_active = electrical_high;
+
+                if ((array->port.digital_line_active_low_mask &
+                     (uint8_t)(1U << channel)) != 0U) {
+                    line_active = !electrical_high;
+                }
+                sums[target] += line_active ? 1U : 0U;
+            } else {
+                sums[channel] += frame[channel];
+            }
         }
     }
 
     for (uint8_t channel = 0U; channel < RED_ARRAY_CHANNELS; channel++) {
-        array->raw[channel] = (uint16_t)(sums[channel] / frame_count);
-        array->latest.normalized[channel] = array->calibrated ?
-            RedArray_NormalizeLine(array->raw[channel],
-                                   array->black[channel],
-                                   array->white[channel]) : 0U;
+        if (array->port.signal_type == RED_ARRAY_SIGNAL_DIGITAL) {
+            bool line_active = (sums[channel] * 2U) > frame_count;
+
+            array->raw[channel] = line_active ? 0U : RED_ARRAY_FULL_SCALE;
+            array->latest.normalized[channel] = line_active ?
+                RED_ARRAY_FULL_SCALE : 0U;
+        } else {
+            array->raw[channel] = (uint16_t)(sums[channel] / frame_count);
+            array->latest.normalized[channel] = array->calibrated ?
+                RedArray_NormalizeLine(array->raw[channel],
+                                       array->black[channel],
+                                       array->white[channel]) : 0U;
+        }
     }
     array->latest.timestamp_ms = now_ms;
-    array->latest.valid = array->calibrated;
+    array->latest.valid = (array->port.signal_type == RED_ARRAY_SIGNAL_DIGITAL) ||
+                          array->calibrated;
     return true;
 }
 

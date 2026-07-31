@@ -261,11 +261,57 @@ static void TestStopCommandLatchesEmergencyStop(void)
     assert(strstr(g_tx_capture, "#OK STOP_LATCHED RAM_ONLY\r\n") != 0);
 }
 
+static void PushCommand(const char *command)
+{
+    uint8_t index;
+
+    for (index = 0U; command[index] != '\0'; index++) {
+        VofaTelemetry_PushRxFromIsr((uint8_t)command[index]);
+    }
+}
+
+static void TestStoppedLineParameterUpdates(void)
+{
+    CarFirmware firmware = {0};
+    TB6612Drive drive = TestDrive();
+    TB6612SpeedLoopConfig speed = {0};
+
+    firmware.config.drive.context = &drive;
+    firmware.config.car.line_kp = 0.025f;
+    firmware.app.config.line_kp = 0.025f;
+    firmware.config.car.line_ki = 0.0f;
+    firmware.app.config.line_ki = 0.0f;
+    firmware.config.car.encoder_counts_per_wheel_rev = 724.0f;
+    firmware.app.config.encoder_counts_per_wheel_rev = 724.0f;
+
+    VofaTelemetry_Init();
+    ResetCapture();
+    PushCommand("SET LINEKI 0.003\n");
+    assert(VofaTelemetry_ProcessCommands(&firmware, 100U));
+    assert(firmware.config.car.line_ki > 0.0029f);
+    assert(firmware.app.config.line_ki > 0.0029f);
+    assert(!firmware.app.executor.line_derivative_initialized);
+    assert(VofaTelemetry_TakeParameterUpdateOk());
+    assert(!VofaTelemetry_TakeParameterUpdateOk());
+    assert(strstr(g_tx_capture, "#OK LINEKI RAM_ONLY\r\n") != 0);
+
+    ResetCapture();
+    PushCommand("ENCPR 800\n");
+    assert(VofaTelemetry_ProcessCommands(&firmware, 200U));
+    assert(firmware.config.car.encoder_counts_per_wheel_rev == 800.0f);
+    assert(firmware.app.config.encoder_counts_per_wheel_rev == 800.0f);
+    assert(TB6612_DriveGetSpeedLoopConfig(&drive, &speed));
+    assert(speed.left_counts_per_rev == 800U);
+    assert(speed.right_counts_per_rev == 800U);
+    assert(VofaTelemetry_TakeParameterUpdateOk());
+}
+
 int main(void)
 {
     TestWriterExactFitAndOverflow();
     TestFrameHas48BoundedFields();
     TestStopCommandLatchesEmergencyStop();
+    TestStoppedLineParameterUpdates();
     puts("VOFA writer, frame, and STOP-command tests passed");
     return 0;
 }

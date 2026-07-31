@@ -336,7 +336,14 @@ static void TestRedArrayDriver(void)
     port.values[3] = 100U;
     port.values[4] = 550U;
 
-    RedArray_Init(&red, &(RedArrayPort){FakeRedReadFrame, &port, 2U});
+    RedArray_Init(&red, &(RedArrayPort){
+        FakeRedReadFrame,
+        &port,
+        2U,
+        RED_ARRAY_SIGNAL_ANALOG,
+        0U,
+        false
+    });
     white[0] = black[0] + RED_ARRAY_MIN_CALIBRATION_SPAN - 1U;
     assert(!RedArray_SetCalibration(&red, black, white));
     white[0] = black[0] + RED_ARRAY_MIN_CALIBRATION_SPAN;
@@ -355,6 +362,54 @@ static void TestRedArrayDriver(void)
     assert(red.read_errors == 1U);
 }
 
+static void TestRedArrayDigitalDriver(void)
+{
+    FakeRedPort port = {0};
+    RedArray red;
+    CarGraySample sample;
+
+    for (uint8_t i = 0U; i < RED_ARRAY_CHANNELS; i++) {
+        port.values[i] = 1U;
+    }
+    port.values[2] = 0U;
+    port.values[5] = 0U;
+
+    RedArray_Init(&red, &(RedArrayPort){
+        FakeRedReadFrame,
+        &port,
+        5U,
+        RED_ARRAY_SIGNAL_DIGITAL,
+        0xFFU,
+        false
+    });
+    assert(RedArray_Read(&red, 40U));
+    assert(port.read_count == 5U);
+    assert(RedArray_GetLatest(&red, &sample));
+    assert(sample.timestamp_ms == 40U);
+    assert(sample.normalized[2] == RED_ARRAY_FULL_SCALE);
+    assert(sample.normalized[5] == RED_ARRAY_FULL_SCALE);
+    assert(sample.normalized[0] == 0U);
+    assert(red.raw[2] == 0U);
+    assert(red.raw[0] == RED_ARRAY_FULL_SCALE);
+
+    for (uint8_t i = 0U; i < RED_ARRAY_CHANNELS; i++) {
+        port.values[i] = 1U;
+    }
+    port.values[1] = 0U;
+    RedArray_Init(&red, &(RedArrayPort){
+        FakeRedReadFrame,
+        &port,
+        3U,
+        RED_ARRAY_SIGNAL_DIGITAL,
+        0xFFU,
+        true
+    });
+    assert(RedArray_Read(&red, 45U));
+    assert(RedArray_GetLatest(&red, &sample));
+    assert(sample.normalized[6] == RED_ARRAY_FULL_SCALE);
+    assert(sample.normalized[1] == 0U);
+}
+
 static void TestFirmwareTrackSensorSelection(void)
 {
     FakeDrive drive = {0};
@@ -366,7 +421,14 @@ static void TestFirmwareTrackSensorSelection(void)
     config.gray = (GrayArrayPort){
         FakeGraySelect, FakeGrayRead, FakeDelayUs, &gray_port, 0U, 1U
     };
-    config.red = (RedArrayPort){FakeRedReadFrame, &red_port, 1U};
+    config.red = (RedArrayPort){
+        FakeRedReadFrame,
+        &red_port,
+        1U,
+        RED_ARRAY_SIGNAL_ANALOG,
+        0U,
+        false
+    };
     config.track_sensor_source = CAR_TRACK_SENSOR_RED_ARRAY;
     config.gray_calibration_valid = true;
     config.red_calibration_valid = true;
@@ -397,7 +459,14 @@ static void TestFirmwareTrackSensorSelection(void)
     config.gray = (GrayArrayPort){
         FakeGraySelect, FakeGrayRead, FakeDelayUs, &gray_port, 0U, 1U
     };
-    config.red = (RedArrayPort){FakeRedReadFrame, &red_port, 1U};
+    config.red = (RedArrayPort){
+        FakeRedReadFrame,
+        &red_port,
+        1U,
+        RED_ARRAY_SIGNAL_ANALOG,
+        0U,
+        false
+    };
     config.track_sensor_source = CAR_TRACK_SENSOR_GRAY_ARRAY;
     config.gray_calibration_valid = true;
     config.red_calibration_valid = true;
@@ -436,7 +505,14 @@ static void TestRuntimeCalibrationKeepsSourcesIndependent(void)
     config.gray = (GrayArrayPort){
         FakeGraySelect, FakeGrayRead, FakeDelayUs, &gray_port, 0U, 1U
     };
-    config.red = (RedArrayPort){FakeRedReadFrame, &red_port, 1U};
+    config.red = (RedArrayPort){
+        FakeRedReadFrame,
+        &red_port,
+        1U,
+        RED_ARRAY_SIGNAL_ANALOG,
+        0U,
+        false
+    };
     config.track_sensor_source = CAR_TRACK_SENSOR_RED_ARRAY;
     config.require_runtime_gray_calibration = true;
     config.gray_calibration_valid = true;
@@ -835,6 +911,7 @@ int main(void)
     TestModeAndRouteContract();
     TestLineClassification();
     TestRedArrayDriver();
+    TestRedArrayDigitalDriver();
     TestFirmwareTrackSensorSelection();
     TestRuntimeCalibrationKeepsSourcesIndependent();
     TestCurvatureWheelCommands();

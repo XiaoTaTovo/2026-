@@ -1,0 +1,52 @@
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "core/chassis_feedforward.h"
+
+static uint16_t ReadLe16(const uint8_t *data)
+{
+    return (uint16_t)data[0] | ((uint16_t)data[1] << 8U);
+}
+
+int main(void)
+{
+    ChassisFeedforward state;
+    ChassisFeedforwardSample sample;
+    Icm42688Sample raw = {0};
+    uint8_t frame[CHASSIS_FEEDFORWARD_FRAME_SIZE];
+    uint16_t flags;
+
+    ChassisFeedforward_Init(&state, &(ChassisFeedforwardConfig){
+        .accel_axis = CHASSIS_FEEDFORWARD_AXIS_X,
+        .accel_sign = 1,
+        .accel_lsb_per_g = 2048.0f,
+        .stationary_calibration_samples = 2U,
+        .imu_filter_alpha = 1.0f
+    });
+    raw.accel_x = 100;
+    raw.valid = true;
+    ChassisFeedforward_OnImuSample(&state, &raw);
+    ChassisFeedforward_OnImuSample(&state, &raw);
+    assert(state.stationary_calibrated);
+    raw.accel_x = 200;
+    ChassisFeedforward_OnImuSample(&state, &raw);
+    ChassisFeedforward_OnCommand(&state, 0.0f, 100U);
+    ChassisFeedforward_OnCommand(&state, 40.0f, 120U);
+    assert(ChassisFeedforward_GetSample(&state, 120U, -2.0f, &sample));
+    assert(sample.command_accel_mm_s2 == 2000);
+    assert(sample.imu_accel_mm_s2 > 470);
+    assert(sample.imu_accel_mm_s2 < 490);
+    assert(sample.yaw_rate_0p1_dps == -20);
+    flags = ChassisFeedforward_MakeFlags(&sample, true, false);
+    assert((flags & CHASSIS_FEEDFORWARD_FLAG_IMU_ACCEL_VALID) != 0U);
+    assert(ChassisFeedforward_EncodeState(&sample, flags, 0x1234U, frame));
+    assert(frame[0] == 0xA5U);
+    assert(frame[1] == 0x5AU);
+    assert(ReadLe16(&frame[4]) == 0x1234U);
+    assert(ReadLe16(&frame[14]) == 2000U);
+    assert(ReadLe16(&frame[20]) ==
+           ChassisFeedforward_Crc16Modbus(&frame[2], 18U));
+    puts("chassis feedforward tests passed");
+    return 0;
+}

@@ -1,16 +1,11 @@
 #ifndef TI_MSPM0_PLATFORM_CONFIG_H
 #define TI_MSPM0_PLATFORM_CONFIG_H
 
-/* Select exactly one eight-channel line sensor implementation per build. */
-#ifndef H2026_TRACK_SENSOR_SOURCE
-#define H2026_TRACK_SENSOR_SOURCE CAR_TRACK_SENSOR_RED_ARRAY
-#endif
-
 /* Chassis measurements. Re-measure after changing wheels or encoders. */
 #define H2026_WHEEL_DIAMETER_MM (65.0f)
 #define H2026_TRACK_WIDTH_MM (120.0f)
 #define H2026_ENCODER_COUNTS_PER_WHEEL_REV (724.0f)
-#define H2026_ARC_EFFECTIVE_TRACK_WIDTH_MM (160.0f)
+#define H2026_ARC_EFFECTIVE_TRACK_WIDTH_MM (120.0f)
 
 /* TB6612 inner wheel-speed loop, 50 ms. */
 #define H2026_SPEED_LOOP_PERIOD_MS (50U)
@@ -32,6 +27,16 @@
 #define H2026_IMU_CALIBRATION_SAMPLES (400U)
 #define H2026_IMU_YAW_SIGN (1)
 
+/* Chassis longitudinal acceleration for the F407 pitch feedforward link.
+ * UNVERIFIED: X axis and positive direction must be confirmed by the single
+ * forward-push test before this value may drive a pitch command. The ±16 g
+ * scale follows the selected ICM42688 register setting. */
+#define H2026_IMU_ACCEL_AXIS (CAR_IMU_AXIS_X)
+#define H2026_IMU_ACCEL_SIGN (1)
+#define H2026_IMU_ACCEL_LSB_PER_G (2048.0f)
+#define H2026_IMU_ACCEL_CALIBRATION_SAMPLES (400U)
+#define H2026_IMU_ACCEL_FILTER_ALPHA (0.15f)
+
 /* Official B2 route and outer line controller. */
 #define H2026_B2_STRAIGHT_SPEED_MM_S (350.0f)
 #define H2026_B2_ARC_CENTER_SPEED_MM_S (300.0f)
@@ -48,7 +53,7 @@
 #define H2026_LINE_D_FILTER_TAU_S (0.060f)
 #define H2026_LINE_INTEGRAL_LIMIT (5000.0f)
 #define H2026_STRAIGHT_LINE_MAX_CORRECTION_MM_S (87.5f)
-#define H2026_ARC_LINE_MAX_CORRECTION_MM_S (20.0f)
+#define H2026_ARC_LINE_MAX_CORRECTION_MM_S (60.0f)
 
 /* Eight-channel line classification and final marker. */
 #define H2026_GRAY_MIN_SIGNAL (80U)
@@ -70,16 +75,12 @@
 
 #define H2026_REQUIRED_LINE_SEARCH_MM (80.0f)
 #define H2026_REQUIRED_LINE_SEARCH_SPEED_MM_S (60.0f)
-#define H2026_FINISH_SENSOR_TO_TEST_POINT_MM (100.0f)//灰度到测试点
-#define H2026_FINISH_APPROACH_SPEED_MM_S (180.0f)
+#define H2026_FINISH_SENSOR_TO_TEST_POINT_MM (30.0f)//灰度到测试点
+#define H2026_FINISH_APPROACH_SPEED_MM_S (80.0f)
 
 /* Bounded peripheral waits. */
 #define H2026_GRAY_SETTLE_US (10U)
 #define H2026_GRAY_SAMPLES_PER_CHANNEL (4U)
-/* RED-only mux settling; keep the GRAY timing contract unchanged. */
-#define H2026_RED_SETTLE_US (30U)
-#define H2026_RED_DISCARD_SAMPLES (1U)
-#define H2026_RED_SAMPLES_PER_CHANNEL (4U)
 #define H2026_ADC_TIMEOUT_LOOPS (100000U)
 #define H2026_SPI_TIMEOUT_LOOPS (100000U)
 

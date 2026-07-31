@@ -17,6 +17,8 @@ $tb6612Exe = Join-Path ([System.IO.Path]::GetTempPath()) `
     "h2026-tb6612-$token.exe"
 $vofaExe = Join-Path ([System.IO.Path]::GetTempPath()) `
     "h2026-vofa-$token.exe"
+$feedforwardExe = Join-Path ([System.IO.Path]::GetTempPath()) `
+    "h2026-feedforward-$token.exe"
 
 try {
     $sources = @(
@@ -115,6 +117,19 @@ try {
         throw "VOFA tests failed with exit code $LASTEXITCODE"
     }
 
+    & $Compiler @ExtraCompilerArgs -std=c11 -Wall -Wextra -Werror -pedantic `
+        "-I$projectDir" -x c `
+        (Join-Path $projectDir "core\chassis_feedforward.c") `
+        (Join-Path $projectDir "tests\test_chassis_feedforward.c.reference") `
+        -o $feedforwardExe
+    if ($LASTEXITCODE -ne 0) {
+        throw "Chassis-feedforward test compilation failed with exit code $LASTEXITCODE"
+    }
+    & $feedforwardExe
+    if ($LASTEXITCODE -ne 0) {
+        throw "Chassis-feedforward tests failed with exit code $LASTEXITCODE"
+    }
+
     Write-Host "HOST PASS: strict C11 tests completed"
 }
 finally {
@@ -124,4 +139,5 @@ finally {
     Remove-Item -LiteralPath $imuExe -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $tb6612Exe -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $vofaExe -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $feedforwardExe -Force -ErrorAction SilentlyContinue
 }

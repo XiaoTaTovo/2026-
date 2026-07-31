@@ -708,8 +708,415 @@
 // }
 
 #include "speed_tuning.h"
+#include "line8_gpio_diagnostic.h"
+#include "red_digital_diagnostic.h"
 
-#if !H2026_SPEED_TUNING_BUILD
+#if !H2026_LINE_TUNING_BUILD && H2026_LINE8_GPIO_DIAGNOSTIC_BUILD
+
+#include "ti_msp_dl_config.h"
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "OLED.h"
+#include "tb6612.h"
+
+#if !defined(GPIO_LINE8_X1_PORT) || !defined(GPIO_LINE8_X2_PORT) || \
+    !defined(GPIO_LINE8_X3_PORT) || !defined(GPIO_LINE8_X4_PORT) || \
+    !defined(GPIO_LINE8_X5_PORT) || !defined(GPIO_LINE8_X6_PORT) || \
+    !defined(GPIO_LINE8_X7_PORT) || !defined(GPIO_LINE8_X8_PORT)
+#error "LINE8 diagnostic requires all GPIO_LINE8_X1 through GPIO_LINE8_X8 pins"
+#endif
+
+#define LINE8_DIAG_SAMPLE_PERIOD_MS (50U)
+#define LINE8_DIAG_OLED_PERIOD_MS   (250U)
+#define LINE8_DIAG_UART_TIMEOUT     (100000U)
+
+static volatile uint32_t g_line8_diag_ms;
+static OLED_Status g_line8_diag_oled_status = OLED_STATUS_ERROR_NOT_INITIALIZED;
+
+static bool Line8Diag_UartPutc(char value)
+{
+    uint32_t timeout = LINE8_DIAG_UART_TIMEOUT;
+
+    while (DL_UART_Main_isTXFIFOFull(UART_VOFA_INST) && (timeout > 0U)) {
+        timeout--;
+    }
+    if (timeout == 0U) {
+        return false;
+    }
+    DL_UART_Main_transmitData(UART_VOFA_INST, (uint8_t)value);
+    return true;
+}
+
+static void Line8Diag_UartPuts(const char *text)
+{
+    while ((*text != '\0') && Line8Diag_UartPutc(*text)) {
+        text++;
+    }
+}
+
+static uint8_t Line8Diag_ReadLevels(void)
+{
+    uint8_t levels = 0U;
+
+    levels |= (DL_GPIO_readPins(GPIO_LINE8_X1_PORT, GPIO_LINE8_X1_PIN) != 0U) ?
+        (uint8_t)(1U << 0U) : 0U;
+    levels |= (DL_GPIO_readPins(GPIO_LINE8_X2_PORT, GPIO_LINE8_X2_PIN) != 0U) ?
+        (uint8_t)(1U << 1U) : 0U;
+    levels |= (DL_GPIO_readPins(GPIO_LINE8_X3_PORT, GPIO_LINE8_X3_PIN) != 0U) ?
+        (uint8_t)(1U << 2U) : 0U;
+    levels |= (DL_GPIO_readPins(GPIO_LINE8_X4_PORT, GPIO_LINE8_X4_PIN) != 0U) ?
+        (uint8_t)(1U << 3U) : 0U;
+    levels |= (DL_GPIO_readPins(GPIO_LINE8_X5_PORT, GPIO_LINE8_X5_PIN) != 0U) ?
+        (uint8_t)(1U << 4U) : 0U;
+    levels |= (DL_GPIO_readPins(GPIO_LINE8_X6_PORT, GPIO_LINE8_X6_PIN) != 0U) ?
+        (uint8_t)(1U << 5U) : 0U;
+    levels |= (DL_GPIO_readPins(GPIO_LINE8_X7_PORT, GPIO_LINE8_X7_PIN) != 0U) ?
+        (uint8_t)(1U << 6U) : 0U;
+    levels |= (DL_GPIO_readPins(GPIO_LINE8_X8_PORT, GPIO_LINE8_X8_PIN) != 0U) ?
+        (uint8_t)(1U << 7U) : 0U;
+    return levels;
+}
+
+static void Line8Diag_DrawOled(uint32_t now_ms, uint8_t levels)
+{
+    char line[22];
+
+    if ((g_line8_diag_oled_status != OLED_STATUS_OK) ||
+        !OLED_IsInitialized()) {
+        return;
+    }
+    (void)OLED_Clear();
+    (void)OLED_ShowString(0U, 0U, "LINE8 GPIO DIAG");
+    (void)snprintf(line, sizeof(line), "t:%08lu", (unsigned long)now_ms);
+    (void)OLED_ShowString(0U, 1U, line);
+    (void)snprintf(line, sizeof(line), "X1:%u X2:%u X3:%u X4:%u",
+                   (unsigned)((levels >> 0U) & 1U),
+                   (unsigned)((levels >> 1U) & 1U),
+                   (unsigned)((levels >> 2U) & 1U),
+                   (unsigned)((levels >> 3U) & 1U));
+    (void)OLED_ShowString(0U, 2U, line);
+    (void)snprintf(line, sizeof(line), "X5:%u X6:%u X7:%u X8:%u",
+                   (unsigned)((levels >> 4U) & 1U),
+                   (unsigned)((levels >> 5U) & 1U),
+                   (unsigned)((levels >> 6U) & 1U),
+                   (unsigned)((levels >> 7U) & 1U));
+    (void)OLED_ShowString(0U, 3U, line);
+    (void)snprintf(line, sizeof(line), "HIGH:%02X BLACK:%02X",
+                   (unsigned)levels, (unsigned)(uint8_t)~levels);
+    (void)OLED_ShowString(0U, 4U, line);
+    (void)OLED_ShowString(0U, 6U, "MOTOR DISABLED");
+    (void)OLED_Update();
+}
+
+void SysTick_Handler(void)
+{
+    g_line8_diag_ms++;
+}
+
+int main(void)
+{
+    uint32_t last_sample_ms = 0U;
+    uint32_t last_oled_ms = 0U;
+    OLED_Config oled_config = OLED_MakeSSD1306Config(OLED_DEFAULT_ADDR_7BIT);
+
+    SYSCFG_DL_init();
+    DL_WWDT_setCoreHaltBehavior(WWDT0_INST, DL_WWDT_CORE_HALT_STOP);
+    DL_SYSTICK_config(CPUCLK_FREQ / 1000U);
+    TB6612_Init();
+    TB6612_Stop();
+
+    g_line8_diag_oled_status = OLED_Init(&oled_config);
+    if (g_line8_diag_oled_status != OLED_STATUS_OK) {
+        oled_config = OLED_MakeSSD1306Config(0x3DU);
+        g_line8_diag_oled_status = OLED_Init(&oled_config);
+    }
+    Line8Diag_UartPuts("#LINE8_GPIO_DIAG_V1 motor=disabled low=black\\r\\n");
+    Line8Diag_UartPuts("#FIELDS t_ms,X1,X2,X3,X4,X5,X6,X7,X8,HIGH,BLACK\\r\\n");
+
+    while (1) {
+        uint32_t now_ms = g_line8_diag_ms;
+        uint8_t levels = Line8Diag_ReadLevels();
+
+        if ((uint32_t)(now_ms - last_sample_ms) >=
+            LINE8_DIAG_SAMPLE_PERIOD_MS) {
+            char line[128];
+
+            last_sample_ms = now_ms;
+            (void)snprintf(line, sizeof(line),
+                "%lu,%u,%u,%u,%u,%u,%u,%u,%u,%02X,%02X\\r\\n",
+                (unsigned long)now_ms,
+                (unsigned)((levels >> 0U) & 1U),
+                (unsigned)((levels >> 1U) & 1U),
+                (unsigned)((levels >> 2U) & 1U),
+                (unsigned)((levels >> 3U) & 1U),
+                (unsigned)((levels >> 4U) & 1U),
+                (unsigned)((levels >> 5U) & 1U),
+                (unsigned)((levels >> 6U) & 1U),
+                (unsigned)((levels >> 7U) & 1U),
+                (unsigned)levels, (unsigned)(uint8_t)~levels);
+            Line8Diag_UartPuts(line);
+        }
+        if ((uint32_t)(now_ms - last_oled_ms) >= LINE8_DIAG_OLED_PERIOD_MS) {
+            last_oled_ms = now_ms;
+            Line8Diag_DrawOled(now_ms, levels);
+        }
+        TB6612_Stop();
+        DL_WWDT_restart(WWDT0_INST);
+        __WFI();
+    }
+}
+
+#elif !H2026_LINE_TUNING_BUILD && H2026_RED_DIGITAL_DIAGNOSTIC_BUILD
+
+#include "ti_msp_dl_config.h"
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "OLED.h"
+#include "tb6612.h"
+
+#define RED_DIAG_SAMPLE_PERIOD_MS      (50U)
+#define RED_DIAG_OLED_RENDER_PERIOD_MS (250U)
+#define RED_DIAG_OLED_TX_PERIOD_MS     (5U)
+#define RED_DIAG_UART_TIMEOUT_LOOPS    (100000U)
+
+#define RED_DIAG_PIN_MASK (GPIO_RED_DIAG_D5_PIN | \
+                           GPIO_RED_DIAG_D6_PIN | \
+                           GPIO_RED_DIAG_D7_PIN)
+
+#define RED_DIAG_FAULT_PINMUX    (1U << 0)
+#define RED_DIAG_FAULT_DIRECTION (1U << 1)
+#define RED_DIAG_FAULT_PULL      (1U << 2)
+#define RED_DIAG_FAULT_STBY      (1U << 3)
+#define RED_DIAG_FAULT_OLED      (1U << 4)
+#define RED_DIAG_FAULT_UART      (1U << 5)
+
+static volatile uint32_t g_red_diag_ms;
+static uint32_t g_red_diag_error_count;
+static uint32_t g_red_diag_faults;
+static uint32_t g_red_diag_last_faults;
+static uint32_t g_red_diag_heartbeat;
+static uint32_t g_red_diag_oled_last_render_ms;
+static uint32_t g_red_diag_oled_last_tx_ms;
+static uint8_t g_red_diag_oled_tx_page = OLED_PAGE_COUNT;
+static OLED_Status g_red_diag_oled_status = OLED_STATUS_ERROR_NOT_INITIALIZED;
+
+static bool RedDiag_UartPutc(char value)
+{
+    uint32_t timeout = RED_DIAG_UART_TIMEOUT_LOOPS;
+
+    while (DL_UART_Main_isTXFIFOFull(UART_VOFA_INST) && (timeout > 0U)) {
+        timeout--;
+    }
+    if (timeout == 0U) {
+        g_red_diag_faults |= RED_DIAG_FAULT_UART;
+        g_red_diag_error_count++;
+        return false;
+    }
+    DL_UART_Main_transmitData(UART_VOFA_INST, (uint8_t)value);
+    return true;
+}
+
+static bool RedDiag_UartPuts(const char *text)
+{
+    while (*text != '\0') {
+        if (!RedDiag_UartPutc(*text++)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool RedDiag_PinmuxIsDigitalInput(uint32_t pincm)
+{
+    const uint32_t required = IOMUX_PINCM_PC_CONNECTED |
+                              IOMUX_PINCM_INENA_ENABLE;
+
+    return ((pincm & IOMUX_PINCM_PF_MASK) == 1U) &&
+           ((pincm & required) == required);
+}
+
+static uint32_t RedDiag_ReadFaults(uint32_t pincm_d5,
+                                   uint32_t pincm_d6,
+                                   uint32_t pincm_d7,
+                                   uint32_t doe_b)
+{
+    const uint32_t pull_mask = IOMUX_PINCM_PIPU_MASK |
+                               IOMUX_PINCM_PIPD_MASK;
+    uint32_t faults = g_red_diag_faults &
+                      (RED_DIAG_FAULT_OLED | RED_DIAG_FAULT_UART);
+
+    if (!RedDiag_PinmuxIsDigitalInput(pincm_d5) ||
+        !RedDiag_PinmuxIsDigitalInput(pincm_d6) ||
+        !RedDiag_PinmuxIsDigitalInput(pincm_d7)) {
+        faults |= RED_DIAG_FAULT_PINMUX;
+    }
+    if ((doe_b & RED_DIAG_PIN_MASK) != 0U) {
+        faults |= RED_DIAG_FAULT_DIRECTION;
+    }
+    if (((pincm_d5 | pincm_d6 | pincm_d7) & pull_mask) != 0U) {
+        faults |= RED_DIAG_FAULT_PULL;
+    }
+    if (((STBY_PORT->DOE31_0 & STBY_PIN_STBY_PIN) == 0U) ||
+        ((STBY_PORT->DOUT31_0 & STBY_PIN_STBY_PIN) != 0U)) {
+        faults |= RED_DIAG_FAULT_STBY;
+    }
+    return faults;
+}
+
+static void RedDiag_UpdateFaultCounter(uint32_t faults)
+{
+    if ((faults & ~g_red_diag_last_faults) != 0U) {
+        g_red_diag_error_count++;
+    }
+    g_red_diag_last_faults = faults;
+    g_red_diag_faults = faults;
+}
+
+static void RedDiag_InitOled(void)
+{
+    OLED_Config config = OLED_MakeSSD1306Config(OLED_DEFAULT_ADDR_7BIT);
+
+    g_red_diag_oled_status = OLED_Init(&config);
+    if (g_red_diag_oled_status == OLED_STATUS_ERROR_I2C_ADDRESS_NACK) {
+        config = OLED_MakeSSD1306Config(0x3DU);
+        g_red_diag_oled_status = OLED_Init(&config);
+    }
+    if (g_red_diag_oled_status != OLED_STATUS_OK) {
+        g_red_diag_faults |= RED_DIAG_FAULT_OLED;
+        g_red_diag_error_count++;
+    }
+}
+
+static void RedDiag_DrawOled(uint32_t levels_b,
+                             uint32_t din_b,
+                             uint32_t doe_b)
+{
+    char line[22];
+
+    (void)OLED_Clear();
+    (void)OLED_ShowString(0U, 0U, "RED DIGITAL DIAG");
+    (void)snprintf(line, sizeof(line), "HB:%08lu",
+                   (unsigned long)g_red_diag_heartbeat);
+    (void)OLED_ShowString(0U, 1U, line);
+    (void)snprintf(line, sizeof(line), "D5:%u PB17",
+                   (unsigned)((levels_b & GPIO_RED_DIAG_D5_PIN) != 0U));
+    (void)OLED_ShowString(0U, 2U, line);
+    (void)snprintf(line, sizeof(line), "D6:%u PB18",
+                   (unsigned)((levels_b & GPIO_RED_DIAG_D6_PIN) != 0U));
+    (void)OLED_ShowString(0U, 3U, line);
+    (void)snprintf(line, sizeof(line), "D7:%u PB19",
+                   (unsigned)((levels_b & GPIO_RED_DIAG_D7_PIN) != 0U));
+    (void)OLED_ShowString(0U, 4U, line);
+    (void)snprintf(line, sizeof(line), "DIN:%08lX", (unsigned long)din_b);
+    (void)OLED_ShowString(0U, 5U, line);
+    (void)snprintf(line, sizeof(line), "DOE:%08lX", (unsigned long)doe_b);
+    (void)OLED_ShowString(0U, 6U, line);
+    (void)snprintf(line, sizeof(line), "E:%lu F:%02lX SAFE",
+                   (unsigned long)g_red_diag_error_count,
+                   (unsigned long)g_red_diag_faults);
+    (void)OLED_ShowString(0U, 7U, line);
+}
+
+static void RedDiag_ServiceOled(uint32_t now_ms,
+                                uint32_t levels_b,
+                                uint32_t din_b,
+                                uint32_t doe_b)
+{
+    if ((g_red_diag_oled_status != OLED_STATUS_OK) ||
+        !OLED_IsInitialized()) {
+        return;
+    }
+    if ((g_red_diag_oled_tx_page >= OLED_PAGE_COUNT) &&
+        ((uint32_t)(now_ms - g_red_diag_oled_last_render_ms) >=
+         RED_DIAG_OLED_RENDER_PERIOD_MS)) {
+        g_red_diag_heartbeat++;
+        RedDiag_DrawOled(levels_b, din_b, doe_b);
+        g_red_diag_oled_last_render_ms = now_ms;
+        g_red_diag_oled_tx_page = 0U;
+    }
+    if ((g_red_diag_oled_tx_page >= OLED_PAGE_COUNT) ||
+        ((uint32_t)(now_ms - g_red_diag_oled_last_tx_ms) <
+         RED_DIAG_OLED_TX_PERIOD_MS)) {
+        return;
+    }
+    g_red_diag_oled_last_tx_ms = now_ms;
+    g_red_diag_oled_status = OLED_UpdatePages(g_red_diag_oled_tx_page, 1U);
+    if (g_red_diag_oled_status == OLED_STATUS_OK) {
+        g_red_diag_oled_tx_page++;
+    } else {
+        g_red_diag_faults |= RED_DIAG_FAULT_OLED;
+        g_red_diag_error_count++;
+        g_red_diag_oled_tx_page = OLED_PAGE_COUNT;
+    }
+}
+
+void SysTick_Handler(void)
+{
+    g_red_diag_ms++;
+}
+
+int main(void)
+{
+    uint32_t last_sample_ms = 0U;
+
+    SYSCFG_DL_init();
+    DL_WWDT_setCoreHaltBehavior(WWDT0_INST, DL_WWDT_CORE_HALT_STOP);
+    DL_SYSTICK_config(CPUCLK_FREQ / 1000U);
+
+    TB6612_Init();
+    TB6612_Stop();
+    RedDiag_InitOled();
+    (void)RedDiag_UartPuts(
+        "#RED_DIGITAL_DIAG_V1 period_ms=50 baud=115200 motor=disabled "
+        "ir=disconnected\r\n");
+    (void)RedDiag_UartPuts(
+        "#FIELDS t_ms,D5_PB17,D6_PB18,D7_PB19,DIN_B,DOE_B,"
+        "PINCM17,PINCM18,PINCM19,errors,faults\r\n");
+
+    while (1) {
+        uint32_t now_ms = g_red_diag_ms;
+        uint32_t levels_b = DL_GPIO_readPins(
+            GPIO_RED_DIAG_PORT, RED_DIAG_PIN_MASK);
+        uint32_t din_b = GPIO_RED_DIAG_PORT->DIN31_0;
+        uint32_t doe_b = GPIO_RED_DIAG_PORT->DOE31_0;
+        uint32_t pincm_d5 = IOMUX->SECCFG.PINCM[GPIO_RED_DIAG_D5_IOMUX];
+        uint32_t pincm_d6 = IOMUX->SECCFG.PINCM[GPIO_RED_DIAG_D6_IOMUX];
+        uint32_t pincm_d7 = IOMUX->SECCFG.PINCM[GPIO_RED_DIAG_D7_IOMUX];
+        uint32_t faults = RedDiag_ReadFaults(
+            pincm_d5, pincm_d6, pincm_d7, doe_b);
+
+        RedDiag_UpdateFaultCounter(faults);
+        if ((uint32_t)(now_ms - last_sample_ms) >=
+            RED_DIAG_SAMPLE_PERIOD_MS) {
+            char line[192];
+
+            last_sample_ms = now_ms;
+            (void)snprintf(line, sizeof(line),
+                "%lu,%u,%u,%u,%08lX,%08lX,%08lX,%08lX,%08lX,%lu,%02lX\r\n",
+                (unsigned long)now_ms,
+                (unsigned)((levels_b & GPIO_RED_DIAG_D5_PIN) != 0U),
+                (unsigned)((levels_b & GPIO_RED_DIAG_D6_PIN) != 0U),
+                (unsigned)((levels_b & GPIO_RED_DIAG_D7_PIN) != 0U),
+                (unsigned long)din_b, (unsigned long)doe_b,
+                (unsigned long)pincm_d5, (unsigned long)pincm_d6,
+                (unsigned long)pincm_d7,
+                (unsigned long)g_red_diag_error_count,
+                (unsigned long)g_red_diag_faults);
+            (void)RedDiag_UartPuts(line);
+        }
+        RedDiag_ServiceOled(now_ms, levels_b, din_b, doe_b);
+        DL_WWDT_restart(WWDT0_INST);
+        __WFI();
+    }
+}
+
+#elif !H2026_SPEED_TUNING_BUILD && !H2026_LINE_TUNING_BUILD
 /*
  * 最小验证单元：TB6612 开环 + 八路红外原始值/归一化值 + 按键黑白标定。
  *
@@ -1114,7 +1521,14 @@ static void track_init(void)
         gray_select, gray_read_adc, gray_delay_us, 0,
         GRAY_SETTLE_US, GRAY_SAMPLES_PER_CH
     };
-    const RedArrayPort red_port = {red_read_frame, 0, 1U};
+    const RedArrayPort red_port = {
+        red_read_frame,
+        0,
+        1U,
+        RED_ARRAY_SIGNAL_ANALOG,
+        0U,
+        false
+    };
 
     GrayArray_Init(&g_gray, &gray_port);
     RedArray_Init(&g_red, &red_port);

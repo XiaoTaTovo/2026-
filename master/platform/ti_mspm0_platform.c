@@ -163,143 +163,6 @@ static bool TiGray_ReadAdc(uint16_t *value, void *context)
     return true;
 }
 
-static bool TiRed_ReadOneFrame(uint16_t values[RED_ARRAY_CHANNELS])
-{
-    const uint32_t adc0_status =
-        DL_ADC12_INTERRUPT_MEM1_RESULT_LOADED |
-        DL_ADC12_INTERRUPT_MEM2_RESULT_LOADED |
-        DL_ADC12_INTERRUPT_MEM3_RESULT_LOADED;
-    const uint32_t adc1_status =
-        DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED |
-        DL_ADC12_INTERRUPT_MEM1_RESULT_LOADED |
-        DL_ADC12_INTERRUPT_MEM2_RESULT_LOADED |
-        DL_ADC12_INTERRUPT_MEM3_RESULT_LOADED |
-        DL_ADC12_INTERRUPT_MEM4_RESULT_LOADED;
-    uint32_t timeout = H2026_ADC_TIMEOUT_LOOPS;
-    bool adc0_complete = false;
-    bool adc1_complete = false;
-
-    if (values == 0) {
-        return false;
-    }
-
-    /* D3/D2/D7 are ADC0 MEM1/2/3; do not sample GRAY MEM0 here. */
-    DL_ADC12_setStartAddress(ADC_GRAY_INST, DL_ADC12_SEQ_START_ADDR_01);
-    DL_ADC12_setEndAddress(ADC_GRAY_INST, DL_ADC12_SEQ_END_ADDR_03);
-    DL_ADC12_setStartAddress(ADC_RED1_INST, DL_ADC12_SEQ_START_ADDR_00);
-    DL_ADC12_setEndAddress(ADC_RED1_INST, DL_ADC12_SEQ_END_ADDR_04);
-    DL_ADC12_clearInterruptStatus(ADC_GRAY_INST, adc0_status);
-    DL_ADC12_clearInterruptStatus(ADC_RED1_INST, adc1_status);
-    DL_ADC12_enableConversions(ADC_GRAY_INST);
-    DL_ADC12_enableConversions(ADC_RED1_INST);
-    DL_ADC12_startConversion(ADC_GRAY_INST);
-    DL_ADC12_startConversion(ADC_RED1_INST);
-
-    while ((!adc0_complete || !adc1_complete) && (timeout > 0U)) {
-        if (DL_ADC12_getRawInterruptStatus(
-                ADC_GRAY_INST,
-                DL_ADC12_INTERRUPT_MEM3_RESULT_LOADED) != 0U) {
-            adc0_complete = true;
-        }
-        if (DL_ADC12_getRawInterruptStatus(
-                ADC_RED1_INST,
-                DL_ADC12_INTERRUPT_MEM4_RESULT_LOADED) != 0U) {
-            adc1_complete = true;
-        }
-        timeout--;
-    }
-    DL_ADC12_stopConversion(ADC_GRAY_INST);
-    DL_ADC12_stopConversion(ADC_RED1_INST);
-
-    if (!adc0_complete || !adc1_complete) {
-        DL_ADC12_clearInterruptStatus(ADC_GRAY_INST, adc0_status);
-        DL_ADC12_clearInterruptStatus(ADC_RED1_INST, adc1_status);
-        g_diagnostics.red_adc_timeouts++;
-        return false;
-    }
-
-    values[0] = (uint16_t)DL_ADC12_getMemResult(
-        ADC_RED1_INST, ADC_RED1_ADCMEM_RED_D0);
-    values[1] = (uint16_t)DL_ADC12_getMemResult(
-        ADC_RED1_INST, ADC_RED1_ADCMEM_RED_D1);
-    values[2] = (uint16_t)DL_ADC12_getMemResult(
-        ADC_GRAY_INST, ADC_GRAY_ADCMEM_RED_D2);
-    values[3] = (uint16_t)DL_ADC12_getMemResult(
-        ADC_GRAY_INST, ADC_GRAY_ADCMEM_RED_D3);
-    values[4] = (uint16_t)DL_ADC12_getMemResult(
-        ADC_RED1_INST, ADC_RED1_ADCMEM_RED_D4);
-    values[5] = (uint16_t)DL_ADC12_getMemResult(
-        ADC_RED1_INST, ADC_RED1_ADCMEM_RED_D5);
-    values[6] = (uint16_t)DL_ADC12_getMemResult(
-        ADC_RED1_INST, ADC_RED1_ADCMEM_RED_D6);
-    values[7] = (uint16_t)DL_ADC12_getMemResult(
-        ADC_GRAY_INST, ADC_GRAY_ADCMEM_RED_D7);
-    DL_ADC12_clearInterruptStatus(ADC_GRAY_INST, adc0_status);
-    DL_ADC12_clearInterruptStatus(ADC_RED1_INST, adc1_status);
-    g_diagnostics.red_adc_poll_completions++;
-    return true;
-}
-
-static bool TiRed_ReadFrame(
-    uint16_t values[RED_ARRAY_CHANNELS], void *context)
-{
-    uint32_t sums[RED_ARRAY_CHANNELS] = {0U};
-    uint8_t sample_count = H2026_RED_SAMPLES_PER_CHANNEL;
-    bool result = false;
-
-    (void)context;
-    if (values == 0) {
-        return false;
-    }
-
-    if (sample_count == 0U) {
-        return false;
-    }
-
-    /* ADC0 MEM0 interrupt belongs to GRAY; RED waits for both final slots. */
-    g_adc_ready = false;
-    DL_ADC12_disableInterrupt(
-        ADC_GRAY_INST, DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED);
-    NVIC_ClearPendingIRQ(ADC_GRAY_INST_INT_IRQN);
-
-    for (uint8_t discard = 0U;
-         discard < H2026_RED_DISCARD_SAMPLES;
-         discard++) {
-        uint16_t ignored[RED_ARRAY_CHANNELS];
-
-        if (!TiRed_ReadOneFrame(ignored)) {
-            goto cleanup;
-        }
-    }
-    for (uint8_t sample = 0U; sample < sample_count; sample++) {
-        uint16_t frame[RED_ARRAY_CHANNELS];
-
-        if (!TiRed_ReadOneFrame(frame)) {
-            goto cleanup;
-        }
-        for (uint8_t channel = 0U;
-             channel < RED_ARRAY_CHANNELS;
-             channel++) {
-            sums[channel] += frame[channel];
-        }
-    }
-    for (uint8_t channel = 0U; channel < RED_ARRAY_CHANNELS; channel++) {
-        values[channel] = (uint16_t)(sums[channel] / sample_count);
-    }
-    result = true;
-
-cleanup:
-    /* Restore the independent GRAY MEM0 path for a later source switch. */
-    DL_ADC12_setStartAddress(ADC_GRAY_INST, DL_ADC12_SEQ_START_ADDR_00);
-    DL_ADC12_setEndAddress(ADC_GRAY_INST, DL_ADC12_SEQ_END_ADDR_00);
-    DL_ADC12_clearInterruptStatus(
-        ADC_GRAY_INST, DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED);
-    DL_ADC12_enableInterrupt(
-        ADC_GRAY_INST, DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED);
-    NVIC_ClearPendingIRQ(ADC_GRAY_INST_INT_IRQN);
-    return result;
-}
-
 static bool TiButton_Read(void *context)
 {
     (void)context;
@@ -327,14 +190,6 @@ void TiMspm0Platform_OnSysTick(void)
     g_millis++;
 }
 
-/*
- * Keep the reusable platform buildable beside a temporary standalone sensor
- * main that owns the same vector. The integrated H2026 main has no competing
- * definition, so this weak handler remains the active ADC completion ISR.
- */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((weak))
-#endif
 void ADC_GRAY_INST_IRQHandler(void)
 {
     if (DL_ADC12_getPendingInterrupt(ADC_GRAY_INST) ==
@@ -381,13 +236,12 @@ void TiMspm0Platform_Init(void)
     TB6612_Init();
     Encoder_Init();
 
-    /* SysConfig owns both ADC sequence layouts and their analog pinmux. */
+    /* SysConfig owns the GRAY ADC input and its pinmux. */
     DL_ADC12_clearInterruptStatus(
         ADC_GRAY_INST, DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED);
     DL_ADC12_enableInterrupt(
         ADC_GRAY_INST, DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED);
     DL_ADC12_enableConversions(ADC_GRAY_INST);
-    DL_ADC12_enableConversions(ADC_RED1_INST);
     NVIC_ClearPendingIRQ(ADC_GRAY_INST_INT_IRQN);
     NVIC_EnableIRQ(ADC_GRAY_INST_INT_IRQN);
 }
@@ -503,8 +357,6 @@ CarStatus TiMspm0Platform_BuildConfig(CarFirmwareConfig *config,
         TiGray_Select, TiGray_ReadAdc, TiDelayUs, 0,
         H2026_GRAY_SETTLE_US, H2026_GRAY_SAMPLES_PER_CHANNEL
     };
-    config->track_sensor_source = H2026_TRACK_SENSOR_SOURCE;
-    config->red = (RedArrayPort){TiRed_ReadFrame, 0, 1U};
     config->button_read = TiButton_Read;
     config->gray_cal_button_read = TiGrayCalButton_Read;
     config->require_runtime_gray_calibration = H2026_ModeUsesLine(mode);
@@ -515,7 +367,13 @@ CarStatus TiMspm0Platform_BuildConfig(CarFirmwareConfig *config,
     config->yaw_bias_fixed = H2026_IMU_USE_FIXED_BIAS != 0U;
     config->imu_calibration_samples = H2026_IMU_CALIBRATION_SAMPLES;
     config->imu_max_step_ms = 20U;
-    config->button_debounce_ms = 20U;
+    config->accel_axis = (ChassisFeedforwardAxis)H2026_IMU_ACCEL_AXIS;
+    config->accel_sign = H2026_IMU_ACCEL_SIGN;
+    config->accel_lsb_per_g = H2026_IMU_ACCEL_LSB_PER_G;
+    config->accel_calibration_samples =
+        H2026_IMU_ACCEL_CALIBRATION_SAMPLES;
+    config->accel_filter_alpha = H2026_IMU_ACCEL_FILTER_ALPHA;
+    config->button_debounce_ms = 8U;
     config->button_active_low = true;
 
     {

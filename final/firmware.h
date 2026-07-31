@@ -12,12 +12,6 @@
 #include "drivers/drive_port.h"
 #include "drivers/gray_array.h"
 #include "drivers/icm42688.h"
-#include "drivers/red_array.h"
-
-typedef enum {
-    CAR_TRACK_SENSOR_GRAY_ARRAY = 0,
-    CAR_TRACK_SENSOR_RED_ARRAY
-} CarTrackSensorSource;
 
 typedef enum {
     CAR_IMU_AXIS_X = 0,
@@ -50,8 +44,6 @@ typedef struct {
     CarDrivePort drive;
     Icm42688Port imu;
     GrayArrayPort gray;
-    RedArrayPort red;
-    CarTrackSensorSource track_sensor_source;
     ButtonReadFn button_read;
     void *button_context;
     ButtonReadFn gray_cal_button_read;
@@ -74,16 +66,12 @@ typedef struct {
     bool gray_calibration_valid;
     uint16_t gray_black[GRAY_ARRAY_CHANNELS];
     uint16_t gray_white[GRAY_ARRAY_CHANNELS];
-    bool red_calibration_valid;
-    uint16_t red_black[RED_ARRAY_CHANNELS];
-    uint16_t red_white[RED_ARRAY_CHANNELS];
 } CarFirmwareConfig;
 
 typedef struct {
     CarFirmwareConfig config;
     Icm42688 imu;
     GrayArray gray;
-    RedArray red;
     Button button;
     Button gray_cal_button;
     Button task_button;

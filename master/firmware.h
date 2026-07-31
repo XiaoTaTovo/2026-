@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "app/car_app.h"
+#include "core/chassis_feedforward.h"
 #include "core/scheduler.h"
 #include "core/yaw_estimator.h"
 #include "drivers/button.h"
@@ -12,12 +13,6 @@
 #include "drivers/drive_port.h"
 #include "drivers/gray_array.h"
 #include "drivers/icm42688.h"
-#include "drivers/red_array.h"
-
-typedef enum {
-    CAR_TRACK_SENSOR_GRAY_ARRAY = 0,
-    CAR_TRACK_SENSOR_RED_ARRAY
-} CarTrackSensorSource;
 
 typedef enum {
     CAR_IMU_AXIS_X = 0,
@@ -50,8 +45,6 @@ typedef struct {
     CarDrivePort drive;
     Icm42688Port imu;
     GrayArrayPort gray;
-    RedArrayPort red;
-    CarTrackSensorSource track_sensor_source;
     ButtonReadFn button_read;
     void *button_context;
     ButtonReadFn gray_cal_button_read;
@@ -66,26 +59,28 @@ typedef struct {
     bool yaw_bias_fixed;
     uint16_t imu_calibration_samples;
     uint32_t imu_max_step_ms;
+    ChassisFeedforwardAxis accel_axis;
+    int8_t accel_sign;
+    float accel_lsb_per_g;
+    uint16_t accel_calibration_samples;
+    float accel_filter_alpha;
     uint16_t button_debounce_ms;
     bool button_active_low;
 
     bool gray_calibration_valid;
     uint16_t gray_black[GRAY_ARRAY_CHANNELS];
     uint16_t gray_white[GRAY_ARRAY_CHANNELS];
-    bool red_calibration_valid;
-    uint16_t red_black[RED_ARRAY_CHANNELS];
-    uint16_t red_white[RED_ARRAY_CHANNELS];
 } CarFirmwareConfig;
 
 typedef struct {
     CarFirmwareConfig config;
     Icm42688 imu;
     GrayArray gray;
-    RedArray red;
     Button button;
     Button gray_cal_button;
     Buzzer buzzer;
     CarYawEstimator yaw;
+    ChassisFeedforward feedforward;
     CarApp app;
 
     CarPeriodicTask imu_task;
@@ -125,5 +120,8 @@ CarStatus CarFirmware_Init(CarFirmware *firmware,
 void CarFirmware_Tick(CarFirmware *firmware, uint32_t now_ms);
 void CarFirmware_ForceStop(CarFirmware *firmware, uint32_t fault);
 const CarOutputSnapshot *CarFirmware_GetOutput(const CarFirmware *firmware);
+bool CarFirmware_GetFeedforward(const CarFirmware *firmware,
+                                uint32_t now_ms,
+                                ChassisFeedforwardSample *sample);
 
 #endif

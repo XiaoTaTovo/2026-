@@ -2,7 +2,11 @@
 #define SPEED_TUNING_H
 
 #ifndef H2026_SPEED_TUNING_BUILD
-#define H2026_SPEED_TUNING_BUILD (1)
+#define H2026_SPEED_TUNING_BUILD (0)
+#endif
+
+#ifndef H2026_LINE_TUNING_BUILD
+#define H2026_LINE_TUNING_BUILD (1)
 #endif
 
 #endif

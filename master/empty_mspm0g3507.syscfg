@@ -15,7 +15,6 @@
  */
 const ADC12         = scripting.addModule("/ti/driverlib/ADC12", {}, false);
 const ADC121        = ADC12.addInstance();
-const ADC122        = ADC12.addInstance();
 const GPIO          = scripting.addModule("/ti/driverlib/GPIO", {}, false);
 const GPIO1         = GPIO.addInstance();
 const GPIO2         = GPIO.addInstance();
@@ -44,59 +43,19 @@ const ProjectConfig = scripting.addModule("/ti/project_config/ProjectConfig");
 /**
  * Write custom configuration values to the imported modules.
  */
-/* ADC0 serves GRAY MEM0 and RED's three ADC0-connected channels. */
+/* ADC0 serves the GRAY multiplexer output only. */
 ADC121.$name                             = "ADC_GRAY";
 ADC121.sampleTime0                       = "40 us";
 ADC121.sampClkDiv                        = "DL_ADC12_CLOCK_DIVIDE_8";
 ADC121.samplingOperationMode              = "sequence";
-ADC121.endAdd                             = 3;
+ADC121.endAdd                             = 0;
 ADC121.enabledInterrupts                 = ["DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED"];
 ADC121.adcMem0_name                      = "GRAY_OUT";
 ADC121.adcMem0chansel                    = "DL_ADC12_INPUT_CHAN_0";
-ADC121.adcMem1_name                      = "RED_D3";
-ADC121.adcMem1chansel                    = "DL_ADC12_INPUT_CHAN_4";
-ADC121.adcMem2_name                      = "RED_D2";
-ADC121.adcMem2chansel                    = "DL_ADC12_INPUT_CHAN_5";
-ADC121.adcMem3_name                      = "RED_D7";
-ADC121.adcMem3chansel                    = "DL_ADC12_INPUT_CHAN_6";
 ADC121.peripheral.$assign                = "ADC0";
 ADC121.peripheral.adcPin0.$assign        = "PA27";
 ADC121.adcPin0Config.hideOutputInversion = scripting.forceWrite(false);
 ADC121.adcPin0Config.$name               = "GPIO_ADC_GRAY_OUT";
-ADC121.peripheral.adcPin4.$assign        = "PB25";
-ADC121.adcPin4Config.$name               = "GPIO_ADC_RED_D3";
-ADC121.peripheral.adcPin5.$assign        = "PB24";
-ADC121.adcPin5Config.$name               = "GPIO_ADC_RED_D2";
-ADC121.peripheral.adcPin6.$assign        = "PB20";
-ADC121.adcPin6Config.$name               = "GPIO_ADC_RED_D7";
-
-/* ADC1 owns RED's remaining five independent analog outputs. */
-ADC122.$name                             = "ADC_RED1";
-ADC122.sampleTime0                       = "40 us";
-ADC122.sampClkDiv                        = "DL_ADC12_CLOCK_DIVIDE_8";
-ADC122.samplingOperationMode              = "sequence";
-ADC122.endAdd                             = 4;
-ADC122.adcMem0_name                      = "RED_D0";
-ADC122.adcMem0chansel                    = "DL_ADC12_INPUT_CHAN_3";
-ADC122.adcMem1_name                      = "RED_D1";
-ADC122.adcMem1chansel                    = "DL_ADC12_INPUT_CHAN_7";
-ADC122.adcMem2_name                      = "RED_D4";
-ADC122.adcMem2chansel                    = "DL_ADC12_INPUT_CHAN_4";
-ADC122.adcMem3_name                      = "RED_D5";
-ADC122.adcMem3chansel                    = "DL_ADC12_INPUT_CHAN_5";
-ADC122.adcMem4_name                      = "RED_D6";
-ADC122.adcMem4chansel                    = "DL_ADC12_INPUT_CHAN_6";
-ADC122.peripheral.$assign                = "ADC1";
-ADC122.peripheral.adcPin3.$assign        = "PA18";
-ADC122.adcPin3Config.$name               = "GPIO_ADC_RED_D0";
-ADC122.peripheral.adcPin7.$assign        = "PA21";
-ADC122.adcPin7Config.$name               = "GPIO_ADC_RED_D1";
-ADC122.peripheral.adcPin4.$assign        = "PB17";
-ADC122.adcPin4Config.$name               = "GPIO_ADC_RED_D4";
-ADC122.peripheral.adcPin5.$assign        = "PB18";
-ADC122.adcPin5Config.$name               = "GPIO_ADC_RED_D5";
-ADC122.peripheral.adcPin6.$assign        = "PB19";
-ADC122.adcPin6Config.$name               = "GPIO_ADC_RED_D6";
 
 const Board = scripting.addModule("/ti/driverlib/Board", {}, false);
 
