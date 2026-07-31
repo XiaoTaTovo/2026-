@@ -70,7 +70,7 @@ static void service_until_complete(PitchAxisSelfTestTelemetry *telemetry)
 
     for (iteration = 0U; iteration < 30U; ++iteration)
     {
-        PitchAxisSelfTestTelemetry_Service(telemetry);
+        PitchAxisSelfTestTelemetry_Service(telemetry, iteration);
     }
 }
 
@@ -118,13 +118,19 @@ static void test_failure_reason_is_reported(void)
     PitchAxisSelfTest self_test;
     PitchAxisSelfTestTelemetry telemetry;
     BspBluetooth output;
+    X42sDriver driver;
 
     memset(&self_test, 0, sizeof(self_test));
     memset(&output, 0, sizeof(output));
+    memset(&driver, 0, sizeof(driver));
     self_test.initialized = true;
     self_test.state = PITCH_AXIS_SELF_TEST_STATE_FAILED;
     self_test.failure = PITCH_AXIS_SELF_TEST_FAILURE_STATUS_TIMEOUT;
     self_test.report.target_cycles = 1000U;
+    self_test.driver = &driver;
+    driver.transport.tx_bytes = 3U;
+    driver.status_request_count = 1U;
+    driver.status_timeout_count = 1U;
 
     reset_output();
     assert(PitchAxisSelfTestTelemetry_Init(
@@ -135,6 +141,10 @@ static void test_failure_reason_is_reported(void)
 
     assert(strstr(g_output, "PITCH_READ1000_RESULT=FAIL\r\n") != NULL);
     assert(strstr(g_output, "PITCH_READ1000_FAILURE=STATUS_TIMEOUT\r\n") != NULL);
+    assert(strstr(
+        g_output,
+        "PITCH_X42_UART,tx=3,rx=0,dma_start_errors=0,uart_errors=0,"
+        "hal=0x00000000,status_requests=1,status_timeouts=1\r\n") != NULL);
     assert(strstr(g_output, "PITCH_COMMUNICATION_GATE=FAIL\r\n") != NULL);
 }
 
@@ -156,11 +166,11 @@ static void test_output_backpressure_retries(void)
         &telemetry,
         &self_test,
         &output));
-    PitchAxisSelfTestTelemetry_Service(&telemetry);
+    PitchAxisSelfTestTelemetry_Service(&telemetry, 0U);
     assert(g_output_length == 0U);
 
     g_output_ready = true;
-    PitchAxisSelfTestTelemetry_Service(&telemetry);
+    PitchAxisSelfTestTelemetry_Service(&telemetry, 1U);
     assert(strstr(g_output, "PITCH_READ1000_START=1000\r\n") != NULL);
 }
 

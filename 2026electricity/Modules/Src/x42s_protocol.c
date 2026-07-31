@@ -6,6 +6,7 @@
 #define X42S_READ_POSITION_FUNCTION 0x36U
 #define X42S_ENABLE_FUNCTION 0xF3U
 #define X42S_ENABLE_AUXILIARY 0xABU
+#define X42S_EMM_VELOCITY_FUNCTION 0xF6U
 #define X42S_EMM_POSITION_FUNCTION 0xFDU
 #define X42S_STOP_FUNCTION 0xFEU
 #define X42S_STOP_AUXILIARY 0x98U
@@ -217,6 +218,43 @@ X42sProtocolResult X42sProtocol_BuildEmmEnable(
     frame[3] = enable ? 1U : 0U;
     frame[4] = synchronize ? 1U : 0U;
     frame[5] = X42S_FIXED_CHECKSUM;
+    return X42S_PROTOCOL_OK;
+}
+
+X42sProtocolResult X42sProtocol_BuildEmmVelocity(
+    uint8_t address,
+    uint8_t direction,
+    uint16_t speed_rpm,
+    uint8_t acceleration,
+    bool synchronize,
+    uint8_t *frame,
+    size_t capacity)
+{
+    if (frame == NULL)
+    {
+        return X42S_PROTOCOL_INVALID_ARGUMENT;
+    }
+    if (capacity < X42S_EMM_VELOCITY_REQUEST_SIZE)
+    {
+        return X42S_PROTOCOL_BUFFER_TOO_SMALL;
+    }
+    if (address == X42S_BROADCAST_ADDRESS)
+    {
+        return X42S_PROTOCOL_INVALID_ADDRESS;
+    }
+    if ((direction > 1U) || (speed_rpm > X42S_EMM_MAX_SPEED_RPM))
+    {
+        return X42S_PROTOCOL_VALUE_OUT_OF_RANGE;
+    }
+
+    frame[0] = address;
+    frame[1] = X42S_EMM_VELOCITY_FUNCTION;
+    frame[2] = direction;
+    frame[3] = (uint8_t)(speed_rpm >> 8U);
+    frame[4] = (uint8_t)speed_rpm;
+    frame[5] = acceleration;
+    frame[6] = synchronize ? 1U : 0U;
+    frame[7] = X42S_FIXED_CHECKSUM;
     return X42S_PROTOCOL_OK;
 }
 

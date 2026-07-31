@@ -12,6 +12,7 @@ typedef struct
     BspBluetooth *output;
     const PitchAxisSelfTest *self_test;
     uint32_t progress_reported;
+    uint32_t next_failure_repeat_ms;
     uint8_t summary_line;
     bool start_announced;
     bool summary_started;
@@ -25,6 +26,7 @@ bool PitchAxisSelfTestTelemetry_Init(
     BspBluetooth *output);
 
 void PitchAxisSelfTestTelemetry_Service(
-    PitchAxisSelfTestTelemetry *telemetry);
+    PitchAxisSelfTestTelemetry *telemetry,
+    uint32_t now_ms);
 
 #endif

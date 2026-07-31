@@ -35,6 +35,33 @@ static int16_t round_to_i16(float value)
     return (int16_t)((value >= 0.0f) ? (value + 0.5f) : (value - 0.5f));
 }
 
+static bool valid_config(const PitchAxisVisionConfig *config)
+{
+    return (config != NULL) &&
+        (config->minimum_safe_position_0_1mm <
+         config->maximum_safe_position_0_1mm) &&
+        (config->target_position_0_1mm >=
+         config->minimum_safe_position_0_1mm) &&
+        (config->target_position_0_1mm <=
+         config->maximum_safe_position_0_1mm) &&
+        (config->edge_recovery_margin_0_1mm >= 0) &&
+        (((int32_t)config->edge_recovery_margin_0_1mm * 2) <
+         ((int32_t)config->maximum_safe_position_0_1mm -
+          (int32_t)config->minimum_safe_position_0_1mm)) &&
+        (config->deadband_0_1mm >= 0) &&
+        (config->velocity_deadband_0_1mm_s >= 0) &&
+        (config->control_period_ms != 0U) &&
+        (config->maximum_observation_age_ms != 0U) &&
+        (config->minimum_speed_rpm != 0U) &&
+        (config->maximum_speed_rpm >= config->minimum_speed_rpm) &&
+        (config->kp_rpm_per_mm >= 0.0f) &&
+        (config->ki_rpm_per_mm_s >= 0.0f) &&
+        (config->kd_rpm_per_mm_s >= 0.0f) &&
+        (config->integral_limit_rpm >= 0.0f) &&
+        (config->velocity_filter_alpha > 0.0f) &&
+        (config->velocity_filter_alpha <= 1.0f);
+}
+
 static uint32_t observation_age_ms(
     const BallObservation *observation,
     uint32_t now_ms)
@@ -49,11 +76,23 @@ static uint32_t observation_age_ms(
     return receive_age + capture_age;
 }
 
-static void clear_pid_terms(PitchAxisVisionControl *control)
+static void clear_control_state(PitchAxisVisionControl *control)
 {
-    control->integral_mm_s = 0.0f;
     control->previous_error_mm = 0.0f;
-    control->first_control = true;
+    control->integral_error_mm_s = 0.0f;
+    control->filtered_error_velocity_mm_s = 0.0f;
+    control->previous_sample_ms = 0U;
+    control->have_previous_sample = false;
+    control->report.ball_velocity_0_1mm_s = 0;
+    control->report.p_term_0_01rpm = 0;
+    control->report.i_term_0_01rpm = 0;
+    control->report.d_term_0_01rpm = 0;
+    control->report.unsaturated_output_0_01rpm = 0;
+    control->report.control_output_0_01rpm = 0;
+    control->report.output_saturated = false;
+    control->report.command_speed_rpm = 0U;
+    control->report.command_positive_direction = false;
+    control->report.command_ready = false;
 }
 
 bool PitchAxisVisionControl_Init(
@@ -61,14 +100,7 @@ bool PitchAxisVisionControl_Init(
     const PitchAxisVisionConfig *config,
     uint32_t now_ms)
 {
-    if ((control == NULL) || (config == NULL) ||
-        (config->deadband_0_1mm < 0) ||
-        (config->control_period_ms == 0U) ||
-        (config->pulses_per_mm == 0U) ||
-        (config->minimum_command_pulses == 0U) ||
-        (config->maximum_observation_age_ms == 0U) ||
-        (config->integral_limit_mm_s < 0.0f) ||
-        (config->output_limit_mm <= 0.0f))
+    if ((control == NULL) || !valid_config(config))
     {
         return false;
     }
@@ -76,10 +108,51 @@ bool PitchAxisVisionControl_Init(
     memset(control, 0, sizeof(*control));
     control->config = *config;
     control->last_control_ms = now_ms;
-    control->first_control = true;
     control->report.state = PITCH_VISION_STATE_WAITING_FOR_FRAME;
     control->initialized = true;
     return true;
+}
+
+bool PitchAxisVisionControl_GetConfig(
+    const PitchAxisVisionControl *control,
+    PitchAxisVisionConfig *config)
+{
+    if ((control == NULL) || (config == NULL) || !control->initialized)
+    {
+        return false;
+    }
+
+    *config = control->config;
+    return true;
+}
+
+bool PitchAxisVisionControl_UpdateConfig(
+    PitchAxisVisionControl *control,
+    const PitchAxisVisionConfig *config,
+    uint32_t now_ms)
+{
+    if ((control == NULL) || !control->initialized || !valid_config(config))
+    {
+        return false;
+    }
+
+    control->config = *config;
+    control->last_control_ms = now_ms;
+    clear_control_state(control);
+    return true;
+}
+
+void PitchAxisVisionControl_ResetController(
+    PitchAxisVisionControl *control,
+    uint32_t now_ms)
+{
+    if ((control == NULL) || !control->initialized)
+    {
+        return;
+    }
+
+    control->last_control_ms = now_ms;
+    clear_control_state(control);
 }
 
 void PitchAxisVisionControl_OnObservation(
@@ -91,7 +164,9 @@ void PitchAxisVisionControl_OnObservation(
         return;
     }
 
-    control->report.observation = *observation;
+    control->pending_observation = *observation;
+    control->pending_observation_present = true;
+    control->pending_observation_generation++;
     control->report.observation_present = true;
     control->report.command_ready = false;
     if (control->have_last_received_sequence &&
@@ -104,8 +179,7 @@ void PitchAxisVisionControl_OnObservation(
     if (!observation->valid)
     {
         control->report.invalid_observation_count++;
-        control->report.state = PITCH_VISION_STATE_REJECT_INVALID;
-        clear_pid_terms(control);
+        clear_control_state(control);
     }
     else
     {
@@ -114,6 +188,7 @@ void PitchAxisVisionControl_OnObservation(
             control->config.minimum_confidence_permille)
         {
             control->report.low_confidence_count++;
+            clear_control_state(control);
         }
     }
 }
@@ -125,10 +200,19 @@ void PitchAxisVisionControl_Service(
     const PitchAxisVisionConfig *config;
     BallObservation *observation;
     float error_mm;
-    float output_mm;
-    float derivative_mm_per_s = 0.0f;
-    float dt_s;
-    uint32_t pulses;
+    float error_velocity_mm_s = 0.0f;
+    float ball_velocity_mm_s;
+    float p_output_rpm;
+    float i_output_rpm;
+    float d_output_rpm;
+    float unsaturated_output_rpm;
+    float output_rpm;
+    float integral_candidate_mm_s;
+    float sample_delta_s = 0.0f;
+    float speed_rpm;
+    uint32_t sample_ms;
+    uint32_t sample_delta_ms;
+    bool new_observation;
 
     if ((control == NULL) || !control->initialized)
     {
@@ -142,33 +226,61 @@ void PitchAxisVisionControl_Service(
         return;
     }
 
-    dt_s = (float)(now_ms - control->last_control_ms) / 1000.0f;
     control->last_control_ms = now_ms;
+    control->report.decision_ready = false;
     control->report.command_ready = false;
     config = &control->config;
-    observation = &control->report.observation;
+    observation = &control->pending_observation;
 
-    if (!control->report.observation_present)
+    if (!control->pending_observation_present)
     {
         control->report.state = PITCH_VISION_STATE_WAITING_FOR_FRAME;
         control->report.observation_fresh = false;
-        clear_pid_terms(control);
+        control->report.ball_position_outside_limits = false;
+        clear_control_state(control);
         return;
     }
 
+    control->report.observation = *observation;
+    control->report.ball_position_outside_limits = observation->valid &&
+        ((observation->x_0_1mm < config->minimum_safe_position_0_1mm) ||
+         (observation->x_0_1mm > config->maximum_safe_position_0_1mm));
     control->report.observation_age_ms = observation_age_ms(observation, now_ms);
+    new_observation =
+        control->pending_observation_generation !=
+        control->last_decision_generation;
+    if (control->report.observation_age_ms >
+        control->report.maximum_observation_age_ms)
+    {
+        control->report.maximum_observation_age_ms =
+            control->report.observation_age_ms;
+    }
     if (!observation->valid)
     {
         control->report.state = PITCH_VISION_STATE_REJECT_INVALID;
         control->report.observation_fresh = false;
-        clear_pid_terms(control);
+        clear_control_state(control);
+        if (new_observation)
+        {
+            control->last_decision_generation =
+                control->pending_observation_generation;
+            control->report.decision_sequence = observation->sequence;
+            control->report.decision_ready = true;
+        }
         return;
     }
     if (observation->confidence_permille < config->minimum_confidence_permille)
     {
         control->report.state = PITCH_VISION_STATE_REJECT_LOW_CONFIDENCE;
         control->report.observation_fresh = false;
-        clear_pid_terms(control);
+        clear_control_state(control);
+        if (new_observation)
+        {
+            control->last_decision_generation =
+                control->pending_observation_generation;
+            control->report.decision_sequence = observation->sequence;
+            control->report.decision_ready = true;
+        }
         return;
     }
     if (control->report.observation_age_ms > config->maximum_observation_age_ms)
@@ -176,10 +288,17 @@ void PitchAxisVisionControl_Service(
         if (control->report.state != PITCH_VISION_STATE_REJECT_STALE)
         {
             control->report.stale_observation_count++;
+            control->report.decision_sequence = observation->sequence;
+            control->report.decision_ready = true;
         }
         control->report.state = PITCH_VISION_STATE_REJECT_STALE;
         control->report.observation_fresh = false;
-        clear_pid_terms(control);
+        clear_control_state(control);
+        if (new_observation)
+        {
+            control->last_decision_generation =
+                control->pending_observation_generation;
+        }
         return;
     }
 
@@ -188,58 +307,120 @@ void PitchAxisVisionControl_Service(
     error_mm = ((float)config->target_position_0_1mm -
                 (float)observation->x_0_1mm) / 10.0f;
     control->report.error_0_1mm = round_to_i16(error_mm * 10.0f);
+    control->report.edge_recovery_candidate =
+        (observation->x_0_1mm <=
+         (config->minimum_safe_position_0_1mm +
+          config->edge_recovery_margin_0_1mm)) ||
+        (observation->x_0_1mm >=
+         (config->maximum_safe_position_0_1mm -
+          config->edge_recovery_margin_0_1mm));
+    control->report.edge_recovery_direction = (error_mm >= 0.0f) ?
+        config->positive_error_uses_positive_direction :
+        !config->positive_error_uses_positive_direction;
 
-    if (fabsf(error_mm) <= ((float)config->deadband_0_1mm / 10.0f))
-    {
-        control->integral_mm_s = 0.0f;
-        control->previous_error_mm = error_mm;
-        control->first_control = false;
-        control->report.output_0_001mm = 0;
-        control->report.command_pulses = 0U;
-        return;
-    }
-
-    if (!control->first_control && (dt_s > 0.0f))
-    {
-        derivative_mm_per_s =
-            (error_mm - control->previous_error_mm) / dt_s;
-    }
-
-    control->integral_mm_s = clamp_float(
-        control->integral_mm_s + error_mm * dt_s,
-        -config->integral_limit_mm_s,
-        config->integral_limit_mm_s);
-    output_mm = config->kp_mm_per_mm * error_mm +
-                config->ki_per_s * control->integral_mm_s +
-                config->kd_s * derivative_mm_per_s;
-    output_mm = clamp_float(
-        output_mm,
-        -config->output_limit_mm,
-        config->output_limit_mm);
-    control->previous_error_mm = error_mm;
-    control->first_control = false;
-    control->report.output_0_001mm = round_to_i16(output_mm * 1000.0f);
-
-    if (control->have_last_command_sequence &&
+    if (!new_observation ||
+        (control->have_last_command_sequence &&
         (observation->sequence == control->last_command_sequence))
+       )
     {
+        if (new_observation)
+        {
+            control->last_decision_generation =
+                control->pending_observation_generation;
+        }
         return;
     }
-
-    pulses = (uint32_t)(fabsf(output_mm) *
-                        (float)config->pulses_per_mm + 0.5f);
-    if ((pulses != 0U) && (pulses < config->minimum_command_pulses))
-    {
-        pulses = config->minimum_command_pulses;
-    }
-
+    control->last_decision_generation =
+        control->pending_observation_generation;
     control->last_command_sequence = observation->sequence;
     control->have_last_command_sequence = true;
-    control->report.command_pulses = pulses;
+    control->report.decision_sequence = observation->sequence;
+    control->report.decision_ready = true;
+
+    sample_ms = observation->tx_uptime_ms - observation->capture_age_ms;
+    if (control->have_previous_sample)
+    {
+        sample_delta_ms = sample_ms - control->previous_sample_ms;
+        if ((sample_delta_ms >= 20U) && (sample_delta_ms <= 500U))
+        {
+            sample_delta_s = (float)sample_delta_ms / 1000.0f;
+            float raw_error_velocity =
+                (error_mm - control->previous_error_mm) * 1000.0f /
+                (float)sample_delta_ms;
+            error_velocity_mm_s =
+                config->velocity_filter_alpha * raw_error_velocity +
+                (1.0f - config->velocity_filter_alpha) *
+                    control->filtered_error_velocity_mm_s;
+        }
+    }
+    control->filtered_error_velocity_mm_s = error_velocity_mm_s;
+    control->previous_error_mm = error_mm;
+    control->previous_sample_ms = sample_ms;
+    control->have_previous_sample = true;
+    ball_velocity_mm_s = -error_velocity_mm_s;
+    control->report.ball_velocity_0_1mm_s =
+        round_to_i16(ball_velocity_mm_s * 10.0f);
+
+    integral_candidate_mm_s = control->integral_error_mm_s;
+    if ((config->ki_rpm_per_mm_s > 0.0f) && (sample_delta_s > 0.0f))
+    {
+        integral_candidate_mm_s += error_mm * sample_delta_s;
+        i_output_rpm = config->ki_rpm_per_mm_s * integral_candidate_mm_s;
+        i_output_rpm = clamp_float(
+            i_output_rpm,
+            -config->integral_limit_rpm,
+            config->integral_limit_rpm);
+        integral_candidate_mm_s = i_output_rpm /
+            config->ki_rpm_per_mm_s;
+    }
+    else
+    {
+        integral_candidate_mm_s = 0.0f;
+        i_output_rpm = 0.0f;
+    }
+    control->integral_error_mm_s = integral_candidate_mm_s;
+
+    p_output_rpm = config->kp_rpm_per_mm * error_mm;
+    d_output_rpm = config->kd_rpm_per_mm_s * error_velocity_mm_s;
+    unsaturated_output_rpm = p_output_rpm + i_output_rpm + d_output_rpm;
+    control->report.p_term_0_01rpm = round_to_i16(p_output_rpm * 100.0f);
+    control->report.i_term_0_01rpm = round_to_i16(i_output_rpm * 100.0f);
+    control->report.d_term_0_01rpm = round_to_i16(d_output_rpm * 100.0f);
+    control->report.unsaturated_output_0_01rpm =
+        round_to_i16(unsaturated_output_rpm * 100.0f);
+
+    if ((fabsf(error_mm) <= ((float)config->deadband_0_1mm / 10.0f)) &&
+        (fabsf(ball_velocity_mm_s) <=
+         ((float)config->velocity_deadband_0_1mm_s / 10.0f)))
+    {
+        control->integral_error_mm_s = 0.0f;
+        control->report.i_term_0_01rpm = 0;
+        control->report.control_output_0_01rpm = 0;
+        control->report.command_speed_rpm = 0U;
+        control->report.output_saturated = false;
+        return;
+    }
+
+    output_rpm = unsaturated_output_rpm;
+    output_rpm = clamp_float(
+        output_rpm,
+        -(float)config->maximum_speed_rpm,
+        (float)config->maximum_speed_rpm);
+    control->report.output_saturated =
+        fabsf(output_rpm - unsaturated_output_rpm) > 0.0001f;
+    control->report.control_output_0_01rpm =
+        round_to_i16(output_rpm * 100.0f);
+    speed_rpm = fabsf(output_rpm);
+    if ((speed_rpm > 0.0f) &&
+        (speed_rpm < (float)config->minimum_speed_rpm))
+    {
+        speed_rpm = (float)config->minimum_speed_rpm;
+    }
+    control->report.command_speed_rpm = (uint16_t)(speed_rpm + 0.5f);
     control->report.command_positive_direction =
-        (output_mm >= 0.0f) ? config->positive_error_uses_positive_direction :
-                             !config->positive_error_uses_positive_direction;
-    if (pulses != 0U)
+        (output_rpm >= 0.0f) ? config->positive_error_uses_positive_direction :
+                              !config->positive_error_uses_positive_direction;
+    if (control->report.command_speed_rpm != 0U)
     {
         control->report.command_ready = true;
         control->report.command_candidate_count++;
@@ -255,5 +436,20 @@ bool PitchAxisVisionControl_GetReport(
         return false;
     }
     *report = control->report;
+    return true;
+}
+
+bool PitchAxisVisionControl_TakeDecision(
+    PitchAxisVisionControl *control,
+    PitchAxisVisionReport *report)
+{
+    if ((control == NULL) || (report == NULL) || !control->initialized ||
+        !control->report.decision_ready)
+    {
+        return false;
+    }
+
+    *report = control->report;
+    control->report.decision_ready = false;
     return true;
 }
