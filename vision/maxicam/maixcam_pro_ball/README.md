@@ -1,39 +1,73 @@
-# MaixCAM Pro H 题球位检测交接包
+# MaixCAM Pro 钢球 YOLO 识别
 
-本目录是一版可直接交给视觉队友继续填实物参数的最小实现：已有 YOLO 负责找球，局部背景差/阈值、连通域和圆度负责细化质心，最后沿摆杆轴换算为毫米并发送固定 20 字节 UART 帧。
+本目录从最小 YOLO11 示例开始，逐项增加功能。每一阶段先在真机验证，再进入下一阶段。
 
-详细协议、主控接入、STOP/FIX/IMPROVE 和验收表见：
+## 当前入口
 
-`../../docs/2026-07-29-H题MaixCAM-Pro球位协议与主控接入.md`
+运行 `main.py`。
 
-## 已确认与未确认
+当前构建号：`yolo-performance-r12`。
 
-- 实物：MaixCAM Pro，系统 `maixcam-pro-2026-01-24-maixpy-v4.12.5`，MaixPy `4.12.5`，摄像头 ID `ov_os04a10`。
-- 官方 MaixPy API：`camera.Camera`、`nn.YOLOv5/YOLOv8/YOLO11`、`uart.UART.write`、`time.ticks_ms/ticks_diff`。
-- UNKNOWN：镜头焦距/FOV、模型种类和 `.mud` 路径、球类别号、模型输入分辨率、UART 实际电平、曝光/增益、杆端标定点。
+当前只包含：
 
-## 队友只需做的事
+- 加载 `/root/models/steel_ball3_int8.mud`。
+- 按模型输入尺寸创建摄像头。
+- 执行 YOLO11 检测。
+- 绘制检测框、类别和置信度。
+- 显示完整相机画面。
+- 通过 `app.need_exit()` 正常退出。
+- 使用 OpenCV 在 HSV 空间提取高亮、低饱和度区域。
+- 通过面积、长宽比和填充率筛选细长白色水管。
+- 用蓝色矩形显示当前最佳水管候选。
+- 根据水管长轴和宽度生成动态逻辑 ROI，黄色矩形显示其外接范围。
+- 只把球心位于水管 ROI 内的 YOLO 结果作为有效钢球。
+- 水管 A 端为横管左端，B 端为右端；显示钢球从 A 到 B 的相对位置百分比。
+- 水管实测长度为 `250 mm`，以中点为坐标零点：A 端 `-125 mm`，B 端 `+125 mm`。
+- 屏幕显示实测 FPS，并提供曝光、水管阈值、YOLO 置信度和退出按钮。
 
-1. 把适配 MaixCAM Pro/MaixPy 4.12.5 的模型放到板上，填写 `config.py` 的 `MODEL_KIND`、`MODEL_PATH`、`BALL_CLASS_ID`。
-2. 用万用表或逻辑分析仪确认 MaixCAM Pro UART 和 MSPM0 都是兼容的 3.3 V 逻辑，再把 `UART_LEVEL_CONFIRMED=True`。不要把 5 V TTL 直接接入。
-3. 固定最终相机和分辨率，拍空槽图；在同一张图上量负端与官方 `+5 cm` 方向端的归一化像素坐标，填写 `ROD_NEG_END_NORM/ROD_POS_END_NORM`，再把 `CALIBRATION_CONFIRMED=True`。
-4. 从 5000 us、gain 100 起步，一次只改一个量；确认球在全杆范围不过曝、不拖影后冻结参数。
-5. 运行 `main.py`。预览左上角显示 `v/r/x`，其中 `x` 的单位是 0.1 mm；无效时固定为 `-32768`。
+动态 ROI 目前用于结果筛选，不裁剪 YOLO 输入图像。程序每帧发送固定 20 字节 UART 观察帧：`A5 5A` 帧头、版本、序号、时间戳、有效位、原因码、0.1 mm 坐标、置信度、采图延迟和 CRC16-Modbus。
 
-UART1 默认使用 MaixCAM Pro `A19(TX)`、`A18(RX)` 和 `/dev/ttyS1`，`115200 8N1`。单向发球位时必须连接 `A19 -> MSPM0 RX` 和共地，A18 可不接。
+UART 使用 `/dev/ttyS1`、`115200 8N1`。现有接线为 `A19(TX) -> STM32F407 UART_RX` 并共地；`A18(RX)` 保留映射。
 
-## 文件
+## 首次运行检查
 
-- `config.py`：所有需要队友填写的现场参数。
-- `algorithm.py`：可在 PC 上测试的一维标定和局部质心修正。
-- `ball_protocol.py`：无 MaixPy 依赖的冻结协议及黄金帧。
-- `main.py`：MaixPy 4.12.5 入口。
-- `../tests/test_maixcam_ball.py`：协议、CRC、标定和合成圆斑测试。
+终端应出现：
 
-运行 PC 侧测试：
-
-```powershell
-cd vision
-.\.venv\Scripts\python.exe -m pytest tests\test_maixcam_ball.py -q -p no:cacheprovider
+```text
+ready: build=yolo-performance-r12 model=/root/models/steel_ball3_int8.mud input=宽x高 uart=/dev/ttyS1@115200
 ```
 
+记录实际 `input=宽x高`，并测试钢球位于画面左端、中间和右端时是否都能稳定出现红框。
+
+## 屏幕控制
+
+- `E-` / `E+`：切换为手动曝光并以 `1000 us` 为步长调整。
+- `A`：恢复自动曝光。
+- `V-` / `V+`：调整水管 HSV 最低亮度阈值。
+- `S-` / `S+`：调整水管 HSV 最大饱和度阈值。
+- `C-` / `C+`：以 `0.05` 为步长调整 YOLO 置信度阈值。
+- `R`：请求一次新的水管 A/B 标定；成功锁定后按钮变绿，再按一次解除锁定。
+- `M`：临时显示水管二值掩膜；5 秒后自动回到相机原图，也可再次按下提前退出。
+- `X`：退出程序。
+
+启动时保持自动曝光。按下 `E-` 或 `E+` 后使用手动曝光和固定增益 `100`。
+
+水管未锁定时，CV 水管定位每 `10` 帧更新一次，其余帧复用上次结果。水管未找到、显示掩膜或修改曝光、`V`、`S` 后会立即重新检测。掩膜预览最多运行 5 秒，防止正式运行时每帧执行水管 CV。
+
+按下 `R` 后，下一次检测到的完整水管 A/B 端点将被锁定。锁定期间完全停止水管 CV，直接复用锁定结果。此模式要求摄像头和水管相对位置固定；重新调整相机、水管、曝光或 HSV 阈值后程序会解除锁定，必须重新标定。
+
+YOLO 和 UART 每个视觉帧运行一次，板载屏幕每 `2` 帧刷新一次。程序自身不创建 RTSP、HTTP 或其他网络图传；正式控制时还应关闭 MaixVision 等外部实时图传，只保留板载屏幕。
+
+## 迭代顺序
+
+1. 最小 YOLO 检测基线。
+2. OpenCV 定位白色水管，只显示诊断结果。
+3. 增加 FPS 和各阶段耗时。
+4. 增加手动曝光调节并锁定现场参数。
+5. 只保留钢球类别，并用水管区域排除管外误检。
+6. 增加丢失、歧义和异常框处理。
+7. 增加位置滤波。
+8. 标定管道两端并换算毫米坐标。
+9. 在真机上抓取 UART 原始字节，验证 STM32F407 的帧头同步、CRC 和有效位处理。
+
+不要在同一轮同时增加多个阶段，否则真机出现问题时难以定位原因。
