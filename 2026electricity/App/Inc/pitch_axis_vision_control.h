@@ -33,6 +33,9 @@ typedef struct
     float ki_rpm_per_mm_s;
     float kd_rpm_per_mm_s;
     float integral_limit_rpm;
+    int16_t integral_separation_band_0_1mm;
+    int16_t approach_band_0_1mm;
+    uint16_t approach_speed_limit_rpm;
     float velocity_filter_alpha;
     bool positive_error_uses_positive_direction;
 } PitchAxisVisionConfig;
@@ -56,6 +59,8 @@ typedef struct
     int16_t d_term_0_01rpm;
     int16_t unsaturated_output_0_01rpm;
     int16_t control_output_0_01rpm;
+    bool integral_active;
+    bool approach_limited;
     bool output_saturated;
     uint32_t observation_age_ms;
     uint32_t maximum_observation_age_ms;
@@ -78,6 +83,7 @@ typedef struct
     float integral_error_mm_s;
     float filtered_error_velocity_mm_s;
     uint32_t previous_sample_ms;
+    uint32_t last_trusted_observation_rx_ms;
     uint32_t last_control_ms;
     uint8_t last_command_sequence;
     uint8_t last_received_sequence;
@@ -86,6 +92,7 @@ typedef struct
     bool have_last_command_sequence;
     bool have_last_received_sequence;
     bool have_previous_sample;
+    bool have_trusted_observation;
     bool pending_observation_present;
     bool initialized;
 } PitchAxisVisionControl;

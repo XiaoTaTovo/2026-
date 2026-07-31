@@ -224,6 +224,9 @@ static PitchAxisVisionConfig default_vision_config(void)
     config.kp_rpm_per_mm = 0.03f;
     config.kd_rpm_per_mm_s = 0.01f;
     config.integral_limit_rpm = 1.0f;
+    config.integral_separation_band_0_1mm = 150;
+    config.approach_band_0_1mm = 60;
+    config.approach_speed_limit_rpm = 1U;
     config.velocity_filter_alpha = 0.25f;
     return config;
 }
@@ -274,7 +277,7 @@ static void initialize(
     vision->config = default_vision_config();
     velocity->config = default_velocity_config();
     velocity->report.state = PITCH_VELOCITY_TEST_STATE_DISABLED_READY;
-    assert(PitchPidDebug_Init(debug, bluetooth, vision, velocity, 0U));
+    assert(PitchPidDebug_Init(debug, bluetooth, vision, velocity, NULL, 0U));
     debug->boot_report_pending = false;
 }
 
@@ -306,10 +309,15 @@ static void test_live_pid_and_automatic_limit_settings(void)
     velocity.report.state = PITCH_VELOCITY_TEST_STATE_RUNNING_AUTOMATIC;
     velocity.report.automatic_armed = true;
     velocity.report.automatic_motion_active = true;
-    feed("SET KP=0.125\r\nSET MAXRPM=30\r\nSET AUTOMAX=2\r\nSET LOSSMS=250\r\nSET EDGEMARGIN=200\r\nSET RESCUERPM=20\r\nSET RESCUEMS=1500\r\nSET RESCUE=1\r\nSET ACCEL=0\r\n");
+    feed("SET KP=0.125\r\nSET ILIM=12.000\r\nSET IBAND=150\r\nSET APPBAND=60\r\nSET APPMAX=1\r\nSET MAXRPM=30\r\nSET AUTOMAX=2\r\nSET LOSSMS=250\r\nSET EDGEMARGIN=200\r\nSET RESCUERPM=20\r\nSET RESCUEMS=1500\r\nSET RESCUE=1\r\nSET ACCEL=0\r\n");
     service_until_input_drained(&debug, 10U);
     assert(vision.config.kp_rpm_per_mm > 0.124f);
     assert(vision.config.kp_rpm_per_mm < 0.126f);
+    assert(vision.config.integral_limit_rpm > 11.999f);
+    assert(vision.config.integral_limit_rpm < 12.001f);
+    assert(vision.config.integral_separation_band_0_1mm == 150);
+    assert(vision.config.approach_band_0_1mm == 60);
+    assert(vision.config.approach_speed_limit_rpm == 1U);
     assert(vision.config.maximum_speed_rpm == 30U);
     assert(velocity.config.automatic_max_speed_rpm == 2U);
     assert(velocity.config.automatic_vision_loss_grace_ms == 250U);
@@ -319,6 +327,7 @@ static void test_live_pid_and_automatic_limit_settings(void)
     assert(velocity.config.automatic_edge_recovery_max_ms == 1500U);
     assert(velocity.config.acceleration == 0U);
     assert(strstr(g_tx, "PID_SET_OK,name=KP,value=0.125") != NULL);
+    assert(strstr(g_tx, "PID_SET_OK,name=IBAND,value=150") != NULL);
     assert(strstr(g_tx, "PID_SET_OK,name=AUTOMAX,value=2") != NULL);
     assert(strstr(g_tx, "PID_SET_OK,name=ACCEL,value=0") != NULL);
 
@@ -391,6 +400,7 @@ static void test_bare_arm_timeout_and_resume_reset(void)
     assert(g_arm_calls == 0U);
     PitchPidDebug_Service(&debug, 31U);
     assert(g_arm_calls == 1U);
+    assert(g_reset_calls == 1U);
 
     velocity.report.automatic_armed = false;
     velocity.report.automatic_hold = true;
@@ -398,7 +408,7 @@ static void test_bare_arm_timeout_and_resume_reset(void)
     feed("RESUME\r\n");
     PitchPidDebug_Service(&debug, 40U);
     assert(!velocity.report.automatic_hold);
-    assert(g_reset_calls == 1U);
+    assert(g_reset_calls == 2U);
     assert(strstr(g_tx, "PID_RESUME_READY\r\n") != NULL);
 }
 
@@ -426,6 +436,39 @@ static void test_zero_and_position_loop_settings(void)
     assert(strstr(g_tx, "POSITION_ZERO_REQUESTED") != NULL);
 }
 
+static void test_task_parameters_and_status(void)
+{
+    PitchPidDebug debug;
+    BspBluetooth bluetooth;
+    PitchAxisVisionControl vision;
+    PitchAxisVelocityTest velocity;
+    PitchTaskController tasks;
+    PitchTaskControllerConfig task_config = {
+        -50, 500U, 100U, 100U, 100U, 30U
+    };
+    PitchTaskControllerConfig readback;
+
+    initialize(&debug, &bluetooth, &vision, &velocity);
+    assert(PitchTaskController_Init(
+        &tasks, &vision, &velocity, &task_config, 0U));
+    debug.tasks = &tasks;
+    feed("SET CENTER=-40\r\nSET T3OFFSET=480\r\nSET T3TOL=80\r\nSET T3VMAX=90\r\nSET T3DWELL=120\r\nPID?\r\n");
+    service_until_input_drained(&debug, 10U);
+
+    assert(PitchTaskController_GetConfig(&tasks, &readback));
+    assert(readback.center_position_0_1mm == -40);
+    assert(readback.task3_offset_0_1mm == 480U);
+    assert(readback.task3_tolerance_0_1mm == 80U);
+    assert(readback.task3_velocity_limit_0_1mm_s == 90U);
+    assert(readback.task3_turnaround_dwell_ms == 120U);
+    assert(strstr(g_tx, "PID_SET_OK,name=CENTER,value=-40") != NULL);
+    assert(strstr(g_tx, "PITCH_TASK,task=2,state=IDLE") != NULL);
+    assert(strstr(g_tx, ",task=2,task_state=IDLE") != NULL);
+    assert(strstr(
+        g_tx,
+        ",center=-40,t3offset=480,t3tol=80,t3vmax=90,t3dwell=120") != NULL);
+}
+
 int main(void)
 {
     test_ping_pid_on_and_status();
@@ -434,6 +477,7 @@ int main(void)
     test_fragmented_db_is_not_disarm();
     test_bare_arm_timeout_and_resume_reset();
     test_zero_and_position_loop_settings();
+    test_task_parameters_and_status();
     puts("PITCH_PID_DEBUG_TEST=PASS");
     return 0;
 }

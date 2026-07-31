@@ -19,6 +19,9 @@ static const PitchAxisVisionConfig config = {
     .minimum_speed_rpm = 1U,
     .maximum_speed_rpm = 5U,
     .kp_rpm_per_mm = 0.03f,
+    .integral_separation_band_0_1mm = 0,
+    .approach_band_0_1mm = 0,
+    .approach_speed_limit_rpm = 0U,
     .kd_rpm_per_mm_s = 0.01f,
     .velocity_filter_alpha = 0.25f,
     .positive_error_uses_positive_direction = false
@@ -206,6 +209,59 @@ static void test_runtime_pid_config_and_integral_term(void)
     assert(report.d_term_0_01rpm == 0);
     assert(report.control_output_0_01rpm == 35);
 
+    tuned.integral_separation_band_0_1mm = 50; /* 5 mm */
+    assert(PitchAxisVisionControl_UpdateConfig(&control, &tuned, 100U));
+    frame = observation(-100, 900U, 3U, 100U); /* 10 mm: clear I */
+    PitchAxisVisionControl_OnObservation(&control, &frame);
+    PitchAxisVisionControl_Service(&control, 150U);
+    assert(PitchAxisVisionControl_GetReport(&control, &report));
+    assert(report.i_term_0_01rpm == 0);
+    assert(!report.integral_active);
+
+    frame = observation(-50, 900U, 4U, 150U); /* 5 mm: allow I */
+    PitchAxisVisionControl_OnObservation(&control, &frame);
+    PitchAxisVisionControl_Service(&control, 200U);
+    assert(PitchAxisVisionControl_GetReport(&control, &report));
+    assert(report.integral_active);
+    assert(report.i_term_0_01rpm != 0);
+
+    frame = observation(-100, 900U, 5U, 200U);
+    PitchAxisVisionControl_OnObservation(&control, &frame);
+    PitchAxisVisionControl_Service(&control, 250U);
+    assert(PitchAxisVisionControl_GetReport(&control, &report));
+    assert(!report.integral_active);
+    assert(report.i_term_0_01rpm == 0);
+
+    tuned.approach_band_0_1mm = 60;
+    tuned.approach_speed_limit_rpm = 1U;
+    tuned.kp_rpm_per_mm = 0.5f;
+    assert(PitchAxisVisionControl_UpdateConfig(&control, &tuned, 250U));
+    frame = observation(-50, 900U, 6U, 250U);
+    PitchAxisVisionControl_OnObservation(&control, &frame);
+    PitchAxisVisionControl_Service(&control, 300U);
+    assert(PitchAxisVisionControl_GetReport(&control, &report));
+    assert(!report.approach_limited);
+    assert(report.command_speed_rpm == 3U);
+
+    frame = observation(-40, 900U, 7U, 300U);
+    PitchAxisVisionControl_OnObservation(&control, &frame);
+    PitchAxisVisionControl_Service(&control, 350U);
+    assert(PitchAxisVisionControl_GetReport(&control, &report));
+    assert(report.approach_limited);
+    assert(report.command_speed_rpm == 1U);
+
+    tuned.kd_rpm_per_mm_s = 1.0f;
+    assert(PitchAxisVisionControl_UpdateConfig(&control, &tuned, 350U));
+    frame = observation(-60, 900U, 8U, 350U);
+    PitchAxisVisionControl_OnObservation(&control, &frame);
+    PitchAxisVisionControl_Service(&control, 400U);
+    frame = observation(-20, 900U, 9U, 400U);
+    PitchAxisVisionControl_OnObservation(&control, &frame);
+    PitchAxisVisionControl_Service(&control, 450U);
+    assert(PitchAxisVisionControl_GetReport(&control, &report));
+    assert(report.control_output_0_01rpm < 0); /* reverse braking */
+    assert(!report.approach_limited);
+
     tuned.kp_rpm_per_mm = 0.05f;
     assert(PitchAxisVisionControl_UpdateConfig(&control, &tuned, 100U));
     assert(PitchAxisVisionControl_GetConfig(&control, &readback));
@@ -215,6 +271,99 @@ static void test_runtime_pid_config_and_integral_term(void)
     assert(PitchAxisVisionControl_GetReport(&control, &report));
     assert(report.i_term_0_01rpm == 0);
     assert(!report.command_ready);
+}
+
+static void test_transient_rejection_preserves_integral_without_derivative_kick(void)
+{
+    PitchAxisVisionControl control;
+    PitchAxisVisionReport report;
+    PitchAxisVisionConfig tuned = config;
+    BallObservation frame;
+
+    tuned.deadband_0_1mm = 0;
+    tuned.kp_rpm_per_mm = 0.0f;
+    tuned.ki_rpm_per_mm_s = 0.1f;
+    tuned.kd_rpm_per_mm_s = 1.0f;
+    tuned.integral_limit_rpm = 2.0f;
+    tuned.integral_separation_band_0_1mm = 200;
+    assert(PitchAxisVisionControl_Init(&control, &tuned, 0U));
+
+    frame = observation(-100, 900U, 1U, 0U);
+    PitchAxisVisionControl_OnObservation(&control, &frame);
+    PitchAxisVisionControl_Service(&control, 50U);
+    frame = observation(-100, 900U, 2U, 50U);
+    PitchAxisVisionControl_OnObservation(&control, &frame);
+    PitchAxisVisionControl_Service(&control, 100U);
+    assert(PitchAxisVisionControl_GetReport(&control, &report));
+    assert(report.i_term_0_01rpm == 5);
+
+    frame = observation(BALL_OBSERVATION_INVALID_POSITION, 0U, 3U, 100U);
+    frame.valid = false;
+    frame.reason = BALL_OBSERVATION_REASON_NO_BALL;
+    PitchAxisVisionControl_OnObservation(&control, &frame);
+    PitchAxisVisionControl_Service(&control, 150U);
+    assert(PitchAxisVisionControl_GetReport(&control, &report));
+    assert(report.state == PITCH_VISION_STATE_REJECT_INVALID);
+    assert(report.i_term_0_01rpm == 0);
+
+    frame = observation(-100, 900U, 4U, 150U);
+    PitchAxisVisionControl_OnObservation(&control, &frame);
+    PitchAxisVisionControl_Service(&control, 200U);
+    assert(PitchAxisVisionControl_GetReport(&control, &report));
+    assert(report.i_term_0_01rpm == 5);
+    assert(report.d_term_0_01rpm == 0);
+
+    frame = observation(BALL_OBSERVATION_INVALID_POSITION, 0U, 5U, 350U);
+    frame.valid = false;
+    frame.reason = BALL_OBSERVATION_REASON_NO_BALL;
+    PitchAxisVisionControl_OnObservation(&control, &frame);
+    PitchAxisVisionControl_Service(&control, 400U);
+    frame = observation(-100, 900U, 6U, 400U);
+    PitchAxisVisionControl_OnObservation(&control, &frame);
+    PitchAxisVisionControl_Service(&control, 450U);
+    assert(PitchAxisVisionControl_GetReport(&control, &report));
+    assert(report.i_term_0_01rpm == 0);
+    assert(report.d_term_0_01rpm == 0);
+}
+
+static void test_deadband_preserves_integral_hold_bias(void)
+{
+    PitchAxisVisionControl control;
+    PitchAxisVisionReport report;
+    PitchAxisVisionConfig tuned = config;
+    BallObservation frame;
+
+    tuned.deadband_0_1mm = 20;
+    tuned.velocity_deadband_0_1mm_s = 50;
+    tuned.kp_rpm_per_mm = 0.0f;
+    tuned.ki_rpm_per_mm_s = 0.1f;
+    tuned.kd_rpm_per_mm_s = 0.0f;
+    tuned.integral_limit_rpm = 2.0f;
+    tuned.integral_separation_band_0_1mm = 100;
+    tuned.velocity_filter_alpha = 1.0f;
+    assert(PitchAxisVisionControl_Init(&control, &tuned, 0U));
+
+    frame = observation(-50, 900U, 1U, 0U);
+    PitchAxisVisionControl_OnObservation(&control, &frame);
+    PitchAxisVisionControl_Service(&control, 50U);
+    frame = observation(-50, 900U, 2U, 50U);
+    PitchAxisVisionControl_OnObservation(&control, &frame);
+    PitchAxisVisionControl_Service(&control, 100U);
+    assert(PitchAxisVisionControl_GetReport(&control, &report));
+    assert(report.i_term_0_01rpm != 0);
+
+    frame = observation(0, 900U, 3U, 100U);
+    PitchAxisVisionControl_OnObservation(&control, &frame);
+    PitchAxisVisionControl_Service(&control, 150U);
+    frame = observation(0, 900U, 4U, 150U);
+    PitchAxisVisionControl_OnObservation(&control, &frame);
+    PitchAxisVisionControl_Service(&control, 200U);
+    assert(PitchAxisVisionControl_GetReport(&control, &report));
+    assert(report.error_0_1mm == 0);
+    assert(report.ball_velocity_0_1mm_s == 0);
+    assert(report.i_term_0_01rpm != 0);
+    assert(report.control_output_0_01rpm == report.i_term_0_01rpm);
+    assert(report.command_ready);
 }
 
 static void test_edge_recovery_candidate_uses_position_direction(void)
@@ -281,6 +430,8 @@ int main(void)
     test_invalid_and_low_confidence_rejection();
     test_runtime_ball_position_limits();
     test_runtime_pid_config_and_integral_term();
+    test_transient_rejection_preserves_integral_without_derivative_kick();
+    test_deadband_preserves_integral_hold_bias();
     test_edge_recovery_candidate_uses_position_direction();
     test_decision_is_consumed_once_before_next_control_period();
     puts("PITCH_AXIS_VISION_CONTROL_TEST=PASS");

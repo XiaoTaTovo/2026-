@@ -217,12 +217,36 @@ static uint32_t enable_test(
     PitchAxisVelocityTestReport report;
 
     PitchAxisVelocityTest_SetCommunicationResult(test, true, now_ms);
+    assert(PitchAxisVelocityTest_GetReport(test, &report));
+    assert(!report.enabled);
+    assert(!report.automatic_armed);
+    assert(report.state == PITCH_VELOCITY_TEST_STATE_DISABLED_READY);
+    assert(PitchAxisVelocityTest_SetAutomaticArmed(test, true, now_ms));
     service(test, now_ms + 1U, false, false, false, false);
     assert(PitchAxisVelocityTest_GetReport(test, &report));
     assert(report.enabled);
     assert(report.state == PITCH_VELOCITY_TEST_STATE_ENABLED_STOPPED);
     assert(report.automatic_armed);
     return now_ms + 1U;
+}
+
+static void test_self_test_pass_waits_for_explicit_start(void)
+{
+    UART_HandleTypeDef uart;
+    X42sDriver driver;
+    PitchAxisVelocityTest test;
+    PitchAxisVelocityTestReport report;
+
+    initialize(&driver, &uart, &test, 0U);
+    PitchAxisVelocityTest_SetCommunicationResult(&test, true, 10U);
+    service(&test, 11U, false, false, false, false);
+
+    assert(PitchAxisVelocityTest_GetReport(&test, &report));
+    assert(report.communication_ready);
+    assert(!report.enabled);
+    assert(!report.automatic_armed);
+    assert(report.state == PITCH_VELOCITY_TEST_STATE_DISABLED_READY);
+    assert(report.command_count == 0U);
 }
 
 static void complete_timed_motion(
@@ -939,6 +963,7 @@ static void test_edge_recovery_timeout_stops_then_retries(void)
 
 int main(void)
 {
+    test_self_test_pass_waits_for_explicit_start();
     test_gate_enable_and_timed_positive_motion();
     test_negative_motion_and_stop_button();
     test_rejected_velocity_ack_latches_stop();

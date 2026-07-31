@@ -270,9 +270,9 @@ void PitchAxisVelocityTest_Service(
     uint32_t now_ms,
     PitchAxisVelocityTestButtons buttons);
 
-/* Automatic control is armed after a successful communication self-test.
- * KEY1 remains in the input structure for wiring compatibility but has no
- * enable/disable side effect. */
+/* Explicitly arms automatic control after a successful communication
+ * self-test. If the motor is disabled, enable is requested first and ARM is
+ * completed only after the enable acknowledgement. */
 bool PitchAxisVelocityTest_SetAutomaticArmed(
     PitchAxisVelocityTest *test,
     bool armed,

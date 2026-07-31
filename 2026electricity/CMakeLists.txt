@@ -55,6 +55,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     App/Src/pitch_axis_vision_control.c
     App/Src/pitch_axis_vision_telemetry.c
     App/Src/pitch_pid_debug.c
+    App/Src/pitch_task_controller.c
+    App/Src/pitch_status_display.c
     Bsp/Src/bsp_bluetooth.c
     Bsp/Src/bsp_i2c.c
     Bsp/Src/bsp_uart_dma.c

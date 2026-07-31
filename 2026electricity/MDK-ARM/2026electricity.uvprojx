@@ -494,6 +494,16 @@
               <FileType>1</FileType>
               <FilePath>../App/Src/pitch_pid_debug.c</FilePath>
             </File>
+            <File>
+              <FileName>pitch_task_controller.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../App/Src/pitch_task_controller.c</FilePath>
+            </File>
+            <File>
+              <FileName>pitch_status_display.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../App/Src/pitch_status_display.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

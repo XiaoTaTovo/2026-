@@ -58,6 +58,11 @@ static bool valid_config(const PitchAxisVisionConfig *config)
         (config->ki_rpm_per_mm_s >= 0.0f) &&
         (config->kd_rpm_per_mm_s >= 0.0f) &&
         (config->integral_limit_rpm >= 0.0f) &&
+        (config->integral_separation_band_0_1mm >= 0) &&
+        (config->approach_band_0_1mm >= 0) &&
+        ((config->approach_band_0_1mm == 0) ||
+         ((config->approach_speed_limit_rpm >= config->minimum_speed_rpm) &&
+          (config->approach_speed_limit_rpm <= config->maximum_speed_rpm))) &&
         (config->velocity_filter_alpha > 0.0f) &&
         (config->velocity_filter_alpha <= 1.0f);
 }
@@ -76,10 +81,15 @@ static uint32_t observation_age_ms(
     return receive_age + capture_age;
 }
 
-static void clear_control_state(PitchAxisVisionControl *control)
+static void suspend_control_state(
+    PitchAxisVisionControl *control,
+    bool clear_integral)
 {
     control->previous_error_mm = 0.0f;
-    control->integral_error_mm_s = 0.0f;
+    if (clear_integral)
+    {
+        control->integral_error_mm_s = 0.0f;
+    }
     control->filtered_error_velocity_mm_s = 0.0f;
     control->previous_sample_ms = 0U;
     control->have_previous_sample = false;
@@ -89,10 +99,30 @@ static void clear_control_state(PitchAxisVisionControl *control)
     control->report.d_term_0_01rpm = 0;
     control->report.unsaturated_output_0_01rpm = 0;
     control->report.control_output_0_01rpm = 0;
+    control->report.integral_active = false;
+    control->report.approach_limited = false;
     control->report.output_saturated = false;
     control->report.command_speed_rpm = 0U;
     control->report.command_positive_direction = false;
     control->report.command_ready = false;
+}
+
+static void clear_control_state(PitchAxisVisionControl *control)
+{
+    suspend_control_state(control, true);
+    control->have_trusted_observation = false;
+    control->last_trusted_observation_rx_ms = 0U;
+}
+
+static bool trusted_observation_timed_out(
+    const PitchAxisVisionControl *control,
+    const BallObservation *observation)
+{
+    return control->have_trusted_observation &&
+        time_elapsed(
+            observation->rx_complete_ms,
+            control->last_trusted_observation_rx_ms,
+            control->config.maximum_observation_age_ms);
 }
 
 bool PitchAxisVisionControl_Init(
@@ -179,7 +209,9 @@ void PitchAxisVisionControl_OnObservation(
     if (!observation->valid)
     {
         control->report.invalid_observation_count++;
-        clear_control_state(control);
+        suspend_control_state(
+            control,
+            trusted_observation_timed_out(control, observation));
     }
     else
     {
@@ -188,7 +220,15 @@ void PitchAxisVisionControl_OnObservation(
             control->config.minimum_confidence_permille)
         {
             control->report.low_confidence_count++;
-            clear_control_state(control);
+            suspend_control_state(
+                control,
+                trusted_observation_timed_out(control, observation));
+        }
+        else
+        {
+            control->last_trusted_observation_rx_ms =
+                observation->rx_complete_ms;
+            control->have_trusted_observation = true;
         }
     }
 }
@@ -237,7 +277,7 @@ void PitchAxisVisionControl_Service(
         control->report.state = PITCH_VISION_STATE_WAITING_FOR_FRAME;
         control->report.observation_fresh = false;
         control->report.ball_position_outside_limits = false;
-        clear_control_state(control);
+        suspend_control_state(control, false);
         return;
     }
 
@@ -259,7 +299,9 @@ void PitchAxisVisionControl_Service(
     {
         control->report.state = PITCH_VISION_STATE_REJECT_INVALID;
         control->report.observation_fresh = false;
-        clear_control_state(control);
+        suspend_control_state(
+            control,
+            trusted_observation_timed_out(control, observation));
         if (new_observation)
         {
             control->last_decision_generation =
@@ -273,7 +315,9 @@ void PitchAxisVisionControl_Service(
     {
         control->report.state = PITCH_VISION_STATE_REJECT_LOW_CONFIDENCE;
         control->report.observation_fresh = false;
-        clear_control_state(control);
+        suspend_control_state(
+            control,
+            trusted_observation_timed_out(control, observation));
         if (new_observation)
         {
             control->last_decision_generation =
@@ -293,7 +337,7 @@ void PitchAxisVisionControl_Service(
         }
         control->report.state = PITCH_VISION_STATE_REJECT_STALE;
         control->report.observation_fresh = false;
-        clear_control_state(control);
+        suspend_control_state(control, true);
         if (new_observation)
         {
             control->last_decision_generation =
@@ -362,9 +406,17 @@ void PitchAxisVisionControl_Service(
         round_to_i16(ball_velocity_mm_s * 10.0f);
 
     integral_candidate_mm_s = control->integral_error_mm_s;
-    if ((config->ki_rpm_per_mm_s > 0.0f) && (sample_delta_s > 0.0f))
+    control->report.integral_active = false;
+    if ((config->ki_rpm_per_mm_s > 0.0f) &&
+        ((config->integral_separation_band_0_1mm == 0) ||
+         (fabsf(error_mm) <=
+          ((float)config->integral_separation_band_0_1mm / 10.0f))))
     {
-        integral_candidate_mm_s += error_mm * sample_delta_s;
+        control->report.integral_active = true;
+        if (sample_delta_s > 0.0f)
+        {
+            integral_candidate_mm_s += error_mm * sample_delta_s;
+        }
         i_output_rpm = config->ki_rpm_per_mm_s * integral_candidate_mm_s;
         i_output_rpm = clamp_float(
             i_output_rpm,
@@ -393,21 +445,60 @@ void PitchAxisVisionControl_Service(
         (fabsf(ball_velocity_mm_s) <=
          ((float)config->velocity_deadband_0_1mm_s / 10.0f)))
     {
-        control->integral_error_mm_s = 0.0f;
-        control->report.i_term_0_01rpm = 0;
-        control->report.control_output_0_01rpm = 0;
-        control->report.command_speed_rpm = 0U;
+        output_rpm = clamp_float(
+            i_output_rpm,
+            -(float)config->maximum_speed_rpm,
+            (float)config->maximum_speed_rpm);
+        control->report.control_output_0_01rpm =
+            round_to_i16(output_rpm * 100.0f);
+        speed_rpm = fabsf(output_rpm);
+        if ((speed_rpm > 0.0f) &&
+            (speed_rpm < (float)config->minimum_speed_rpm))
+        {
+            speed_rpm = (float)config->minimum_speed_rpm;
+        }
+        control->report.command_speed_rpm = (uint16_t)(speed_rpm + 0.5f);
+        control->report.command_positive_direction =
+            (output_rpm >= 0.0f) ?
+                config->positive_error_uses_positive_direction :
+                !config->positive_error_uses_positive_direction;
+        control->report.approach_limited = false;
         control->report.output_saturated = false;
+        if (control->report.command_speed_rpm != 0U)
+        {
+            control->report.command_ready = true;
+            control->report.command_candidate_count++;
+        }
         return;
     }
 
     output_rpm = unsaturated_output_rpm;
+    control->report.approach_limited = false;
+    if ((config->approach_band_0_1mm > 0) &&
+        (fabsf(error_mm) <=
+         ((float)config->approach_band_0_1mm / 10.0f)))
+    {
+        bool moving_toward_target =
+            (error_mm * ball_velocity_mm_s) > 0.0f;
+        bool accelerating_toward_target =
+            (error_mm * output_rpm) > 0.0f;
+        if (moving_toward_target && accelerating_toward_target)
+        {
+            float limited_output = clamp_float(
+                output_rpm,
+                -(float)config->approach_speed_limit_rpm,
+                (float)config->approach_speed_limit_rpm);
+            control->report.approach_limited =
+                fabsf(limited_output - output_rpm) > 0.0001f;
+            output_rpm = limited_output;
+        }
+    }
     output_rpm = clamp_float(
         output_rpm,
         -(float)config->maximum_speed_rpm,
         (float)config->maximum_speed_rpm);
-    control->report.output_saturated =
-        fabsf(output_rpm - unsaturated_output_rpm) > 0.0001f;
+    control->report.output_saturated = control->report.approach_limited ||
+        (fabsf(output_rpm - unsaturated_output_rpm) > 0.0001f);
     control->report.control_output_0_01rpm =
         round_to_i16(output_rpm * 100.0f);
     speed_rpm = fabsf(output_rpm);

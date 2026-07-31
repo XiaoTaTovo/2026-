@@ -69,6 +69,9 @@ void DMA2_Stream7_IRQHandler(void);
 void USART6_IRQHandler(void);
 /* USER CODE BEGIN EFP */
 
+void I2C1_EV_IRQHandler(void);
+void I2C1_ER_IRQHandler(void);
+
 /* USER CODE END EFP */
 
 #ifdef __cplusplus

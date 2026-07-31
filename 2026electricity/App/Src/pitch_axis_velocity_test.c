@@ -961,12 +961,11 @@ static void service_automatic_control(
                 }
                 return;
             }
-            if (motion_active && !stop_pending &&
-                !test->report.automatic_edge_recovery_active)
-            {
-                request_automatic_stop(test, now_ms);
-                return;
-            }
+            /* Keep the last accepted position target during the grace window.
+             * A single weak/late frame must not turn the outer command into a
+             * stop-and-hold at the current ball position.  If the loss lasts
+             * through the configured grace period, the branch above disarms
+             * and requests a real stop. */
         }
         else
         {
@@ -1487,6 +1486,7 @@ bool PitchAxisVelocityTest_SetAutomaticArmed(
 
     if (!armed)
     {
+        test->automatic_start_pending = false;
         if (!test->report.automatic_armed)
         {
             return true;
@@ -1504,6 +1504,13 @@ bool PitchAxisVelocityTest_SetAutomaticArmed(
     if (test->report.automatic_armed)
     {
         return true;
+    }
+    if (!test->report.enabled &&
+        (test->report.state == PITCH_VELOCITY_TEST_STATE_DISABLED_READY))
+    {
+        test->automatic_start_pending = true;
+        request_enable(test, true, now_ms);
+        return !test->report.fault_latched;
     }
     if (test->report.automatic_hold ||
         !test->report.enabled ||
@@ -1780,10 +1787,8 @@ void PitchAxisVelocityTest_SetCommunicationResult(
         0U,
         0);
 
-    /* Self-test success is the only automatic-start trigger. The enable
-     * command remains asynchronous; ARM follows only after its ACK. */
-    test->automatic_start_pending = true;
-    request_enable(test, true, now_ms);
+    /* A passed self-test only unlocks the axis. KEY1 or a Bluetooth debug
+     * command must explicitly request motor enable and automatic control. */
 }
 
 void PitchAxisVelocityTest_Service(
