@@ -109,12 +109,25 @@ static const PitchAxisVelocityTestConfig pitch_velocity_test_config = {
     .run_ms = 300U,
     .synchronize = false,
     .debounce_ms = 30U,
-    .automatic_max_speed_rpm = 30U,
+    .automatic_max_speed_rpm = 120U,
+    /* The final self-test position is the relative mechanical zero. Direction
+     * 0 increased the raw position in the measured key test. */
+    .automatic_position_tracking_enabled = true,
+    .automatic_direction0_increases_raw = true,
+    /* Preliminary calibration: 300 ms at 10 RPM moved about 0.1 mm. */
+    .automatic_position_raw_per_mm = 27760U,
+    /* The outer PD output is a virtual tilt demand, not motor speed. */
+    .automatic_tilt_scale_um_per_outer_rpm = 67U,
+    .automatic_tilt_limit_um = 2000U,
+    .automatic_position_deadband_um = 30U,
+    .automatic_position_slow_zone_um = 300U,
+    .automatic_position_min_speed_rpm = 10U,
+    .automatic_position_poll_period_ms = 20U,
     .automatic_decision_timeout_ms = 500U,
     /* Stop immediately on a bad frame, but keep ARM permission briefly so
      * isolated detector misses can recover without operator intervention. */
-    .automatic_vision_loss_grace_ms = 2500U,
-    .automatic_edge_recovery_enabled = true,
+    .automatic_vision_loss_grace_ms = 500U,
+    .automatic_edge_recovery_enabled = false,
     .automatic_edge_recovery_speed_rpm = 20U,
     /* Stop and acknowledge every pulse, then retry until vision returns. */
     .automatic_edge_recovery_max_ms = 1500U,
@@ -134,13 +147,13 @@ static const PitchAxisVisionConfig pitch_vision_config = {
     .minimum_confidence_permille = 350U,
     .maximum_observation_age_ms = 150U,
     .control_period_ms = 50U,
-    .minimum_speed_rpm = 5U,
+    .minimum_speed_rpm = 1U,
     .maximum_speed_rpm = 30U,
     /* Initial centre-hold PD tune. Ki remains disabled until P/D and the
      * direction-change dynamics have been measured on hardware. */
-    .kp_rpm_per_mm = 0.50f,
+    .kp_rpm_per_mm = 0.35f,
     .ki_rpm_per_mm_s = 0.0f,
-    .kd_rpm_per_mm_s = 0.50f,
+    .kd_rpm_per_mm_s = 0.08f,
     .integral_limit_rpm = 1.0f,
     .velocity_filter_alpha = 0.15f,
     .positive_error_uses_positive_direction = true
@@ -456,6 +469,8 @@ int main(void)
         automatic_decision.motor_direction =
             vision_report.command_positive_direction ? 1U : 0U;
         automatic_decision.speed_rpm = vision_report.command_speed_rpm;
+        automatic_decision.outer_control_0_01rpm =
+            vision_report.control_output_0_01rpm;
         automatic_decision.edge_recovery_candidate =
             vision_report.edge_recovery_candidate;
         automatic_decision.edge_recovery_direction =

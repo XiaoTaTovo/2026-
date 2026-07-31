@@ -7,8 +7,9 @@
 #include "x42s_driver.h"
 
 #define PITCH_AXIS_VELOCITY_TEST_EVENT_QUEUE_SIZE 32U
-/* The supervised 50 RPM trial is bounded separately by the 3 s motion budget. */
-#define PITCH_AXIS_VELOCITY_TEST_HARD_AUTO_MAX_RPM 50U
+/* Position feedback and a relative soft limit bound automatic travel. */
+#define PITCH_AXIS_VELOCITY_TEST_HARD_AUTO_MAX_RPM 300U
+#define PITCH_AXIS_VELOCITY_TEST_HARD_EDGE_RECOVERY_MAX_RPM 50U
 #define PITCH_AXIS_VELOCITY_TEST_HARD_MAX_VISION_LOSS_GRACE_MS 5000U
 #define PITCH_AXIS_VELOCITY_TEST_HARD_MAX_EDGE_RECOVERY_MS 3000U
 
@@ -56,7 +57,8 @@ typedef enum
     PITCH_VELOCITY_TEST_FAILURE_COMMAND_REJECTED,
     PITCH_VELOCITY_TEST_FAILURE_PROTOCOL,
     PITCH_VELOCITY_TEST_FAILURE_UART,
-    PITCH_VELOCITY_TEST_FAILURE_RX_OVERFLOW
+    PITCH_VELOCITY_TEST_FAILURE_RX_OVERFLOW,
+    PITCH_VELOCITY_TEST_FAILURE_POSITION_LIMIT
 } PitchAxisVelocityTestFailure;
 
 typedef enum
@@ -98,7 +100,8 @@ typedef enum
     PITCH_VELOCITY_TEST_EVENT_AUTOMATIC_VELOCITY_SENT,
     PITCH_VELOCITY_TEST_EVENT_AUTOMATIC_STOP_SENT,
     PITCH_VELOCITY_TEST_EVENT_BALL_ESCAPE_HOLD,
-    PITCH_VELOCITY_TEST_EVENT_RESUME_READY
+    PITCH_VELOCITY_TEST_EVENT_RESUME_READY,
+    PITCH_VELOCITY_TEST_EVENT_POSITION_ZERO
 } PitchAxisVelocityTestEventType;
 
 typedef struct
@@ -120,6 +123,15 @@ typedef struct
     bool synchronize;
     uint32_t debounce_ms;
     uint16_t automatic_max_speed_rpm;
+    bool automatic_position_tracking_enabled;
+    bool automatic_direction0_increases_raw;
+    uint32_t automatic_position_raw_per_mm;
+    uint16_t automatic_tilt_scale_um_per_outer_rpm;
+    uint16_t automatic_tilt_limit_um;
+    uint16_t automatic_position_deadband_um;
+    uint16_t automatic_position_slow_zone_um;
+    uint16_t automatic_position_min_speed_rpm;
+    uint32_t automatic_position_poll_period_ms;
     uint32_t automatic_decision_timeout_ms;
     uint32_t automatic_vision_loss_grace_ms;
     bool automatic_edge_recovery_enabled;
@@ -138,6 +150,7 @@ typedef struct
     uint16_t speed_rpm;
     bool edge_recovery_candidate;
     uint8_t edge_recovery_direction;
+    int16_t outer_control_0_01rpm;
     uint8_t sequence;
     PitchAxisAutomaticDisarmReason unsafe_reason;
 } PitchAxisAutomaticDecision;
@@ -187,6 +200,16 @@ typedef struct
     bool pid_debug_enabled;
     bool automatic_hold;
     uint32_t ball_escape_count;
+    bool automatic_zero_valid;
+    bool automatic_position_valid;
+    int64_t automatic_zero_position_raw;
+    int64_t automatic_position_raw;
+    int64_t automatic_target_position_raw;
+    int64_t automatic_target_offset_raw;
+    int64_t automatic_position_error_raw;
+    uint32_t automatic_position_age_ms;
+    uint32_t automatic_position_query_count;
+    uint32_t automatic_position_limit_count;
 } PitchAxisVelocityTestReport;
 
 typedef struct
@@ -216,10 +239,16 @@ typedef struct
     uint32_t automatic_budget_used_ms;
     uint32_t automatic_vision_loss_started_ms;
     uint32_t automatic_edge_recovery_started_ms;
+    uint32_t automatic_last_position_query_ms;
+    uint32_t automatic_last_position_update_ms;
     bool automatic_decision_pending;
     bool automatic_motion_segment_active;
     bool automatic_edge_recovery_available;
     uint8_t automatic_edge_recovery_direction;
+    bool automatic_position_query_pending;
+    bool automatic_position_target_dirty;
+    bool automatic_zero_capture_pending;
+    bool automatic_stop_after_position_query;
     bool automatic_start_pending;
     bool communication_result_set;
     bool initialized;
@@ -251,6 +280,10 @@ bool PitchAxisVelocityTest_SetAutomaticArmed(
 
 bool PitchAxisVelocityTest_ClearAutomaticHold(
     PitchAxisVelocityTest *test);
+
+bool PitchAxisVelocityTest_CaptureAutomaticZero(
+    PitchAxisVelocityTest *test,
+    uint32_t now_ms);
 
 bool PitchAxisVelocityTest_SetPidDebugEnabled(
     PitchAxisVelocityTest *test,

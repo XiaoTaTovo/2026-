@@ -1,0 +1,18 @@
+build
+mx.scratch
+!.settings
+
+# Keil generated build and user-state files
+MDK-ARM/**/Objects/
+MDK-ARM/**/*.crf
+MDK-ARM/**/*.o
+MDK-ARM/**/*.d
+MDK-ARM/**/*.axf
+MDK-ARM/**/*.map
+MDK-ARM/**/*.hex
+MDK-ARM/**/*.htm
+MDK-ARM/**/*.dep
+MDK-ARM/**/*.lnp
+MDK-ARM/**/*.sct
+MDK-ARM/*.uvoptx
+MDK-ARM/*.uvguix.*

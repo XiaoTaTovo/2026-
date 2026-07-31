@@ -206,6 +206,8 @@ static const char *failure_name(PitchAxisVelocityTestFailure failure)
             return "UART";
         case PITCH_VELOCITY_TEST_FAILURE_RX_OVERFLOW:
             return "RX_OVERFLOW";
+        case PITCH_VELOCITY_TEST_FAILURE_POSITION_LIMIT:
+            return "POSITION_LIMIT";
         default:
             return "NONE";
     }
@@ -263,6 +265,8 @@ static const char *event_name(PitchAxisVelocityTestEventType type)
             return "BALL_ESCAPE_HOLD";
         case PITCH_VELOCITY_TEST_EVENT_RESUME_READY:
             return "RESUME_READY";
+        case PITCH_VELOCITY_TEST_EVENT_POSITION_ZERO:
+            return "POSITION_ZERO";
         default:
             return "UNKNOWN";
     }
@@ -404,6 +408,36 @@ static bool service_boot(PitchAxisVelocityTestTelemetry *telemetry)
                 "PITCH_EDGE_RESCUE_MS=",
                 config->automatic_edge_recovery_max_ms);
             break;
+        case 22U:
+            sent = write_named_u32(
+                telemetry,
+                "PITCH_POSITION_TRACKING=",
+                config->automatic_position_tracking_enabled ? 1U : 0U);
+            break;
+        case 23U:
+            sent = write_named_u32(
+                telemetry,
+                "PITCH_POSITION_RAW_PER_MM=",
+                config->automatic_position_raw_per_mm);
+            break;
+        case 24U:
+            sent = write_named_u32(
+                telemetry,
+                "PITCH_TILT_LIMIT_UM=",
+                config->automatic_tilt_limit_um);
+            break;
+        case 25U:
+            sent = write_named_u32(
+                telemetry,
+                "PITCH_POSITION_MIN_RPM=",
+                config->automatic_position_min_speed_rpm);
+            break;
+        case 26U:
+            sent = write_named_u32(
+                telemetry,
+                "PITCH_POSITION_POLL_MS=",
+                config->automatic_position_poll_period_ms);
+            break;
         default:
             return true;
     }
@@ -412,7 +446,7 @@ static bool service_boot(PitchAxisVelocityTestTelemetry *telemetry)
     {
         telemetry->boot_line++;
     }
-    return telemetry->boot_line > 21U;
+    return telemetry->boot_line > 26U;
 }
 
 static bool write_event(

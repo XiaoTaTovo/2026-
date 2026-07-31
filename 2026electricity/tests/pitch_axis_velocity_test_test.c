@@ -352,9 +352,84 @@ static PitchAxisAutomaticDecision automatic_decision(
     decision.motion_requested = motion;
     decision.motor_direction = direction;
     decision.speed_rpm = speed_rpm;
+    decision.outer_control_0_01rpm =
+        (direction == 0U) ? -(int16_t)(speed_rpm * 100U) :
+                            (int16_t)(speed_rpm * 100U);
     decision.sequence = sequence;
     decision.unsafe_reason = PITCH_AUTOMATIC_DISARM_VISION_INVALID;
     return decision;
+}
+
+static void test_position_loop_bounds_target_and_stops_before_reversal(void)
+{
+    UART_HandleTypeDef uart;
+    X42sDriver driver;
+    PitchAxisVelocityTest test;
+    PitchAxisVelocityTestConfig config = default_config();
+    PitchAxisVelocityTestReport report;
+    PitchAxisAutomaticDecision decision;
+    uint32_t now_ms = 0U;
+
+    memset(&uart, 0, sizeof(uart));
+    g_drop_response = false;
+    g_command_status = X42S_COMMAND_STATUS_ACCEPTED;
+    g_position = 0;
+    g_velocity_write_count = 0U;
+    g_stop_write_count = 0U;
+    g_velocity_pending = false;
+    config.automatic_max_speed_rpm = 100U;
+    config.automatic_position_tracking_enabled = true;
+    config.automatic_direction0_increases_raw = true;
+    config.automatic_position_raw_per_mm = 1000U;
+    config.automatic_tilt_scale_um_per_outer_rpm = 20U;
+    config.automatic_tilt_limit_um = 500U;
+    config.automatic_position_deadband_um = 20U;
+    config.automatic_position_slow_zone_um = 200U;
+    config.automatic_position_min_speed_rpm = 10U;
+    config.automatic_position_poll_period_ms = 20U;
+    assert(X42sDriver_Init(&driver, &uart) == X42S_DRIVER_OK);
+    assert(X42sDriver_Start(&driver) == X42S_DRIVER_OK);
+    assert(PitchAxisVelocityTest_Init(&test, &driver, &config, now_ms));
+    now_ms = enable_test(&test, now_ms);
+
+    decision = automatic_decision(true, true, 0U, 100U, 1U);
+    decision.outer_control_0_01rpm = -30000;
+    PitchAxisVelocityTest_SubmitAutomaticDecision(
+        &test, &decision, now_ms + 2U);
+    service(&test, now_ms + 2U, false, false, false, false);
+    service(&test, now_ms + 3U, false, false, false, false);
+    assert(g_velocity_write_count == 1U);
+    assert(g_velocity_direction == 0U);
+    assert(g_velocity_speed_rpm == 100U);
+    service(&test, now_ms + 4U, false, false, false, false);
+    assert(PitchAxisVelocityTest_GetReport(&test, &report));
+    assert(report.automatic_target_offset_raw == 500);
+
+    g_position = 100;
+    decision = automatic_decision(true, true, 1U, 100U, 2U);
+    decision.outer_control_0_01rpm = 30000;
+    PitchAxisVelocityTest_SubmitAutomaticDecision(
+        &test, &decision, now_ms + 5U);
+    service(&test, now_ms + 5U, false, false, false, false);
+    service(&test, now_ms + 6U, false, false, false, false);
+    assert(g_stop_write_count == 1U);
+    assert(g_velocity_write_count == 1U);
+    service(&test, now_ms + 7U, false, false, false, false);
+    assert(g_velocity_write_count == 2U);
+    assert(g_velocity_direction == 1U);
+    assert(PitchAxisVelocityTest_GetReport(&test, &report));
+    assert(report.automatic_target_offset_raw == -500);
+
+    g_position = -490;
+    service(&test, now_ms + 27U, false, false, false, false);
+    service(&test, now_ms + 28U, false, false, false, false);
+    assert(g_stop_write_count == 2U);
+    service(&test, now_ms + 29U, false, false, false, false);
+    assert(PitchAxisVelocityTest_GetReport(&test, &report));
+    assert(report.state == PITCH_VELOCITY_TEST_STATE_ENABLED_STOPPED);
+    assert(!report.automatic_motion_active);
+    assert(report.automatic_position_error_raw == -10);
+    assert(!report.fault_latched);
 }
 
 static void test_automatic_clamps_speed_and_stops_on_unsafe_vision(void)
@@ -880,6 +955,7 @@ int main(void)
     test_edge_loss_stops_then_recovers_inward();
     test_first_outside_limit_frame_starts_edge_recovery();
     test_edge_recovery_timeout_stops_then_retries();
+    test_position_loop_bounds_target_and_stops_before_reversal();
     puts("PITCH_AXIS_VELOCITY_TEST_TEST=PASS");
     return 0;
 }

@@ -15,6 +15,7 @@ static size_t g_tx_length;
 static uint32_t g_arm_calls;
 static uint32_t g_disarm_calls;
 static uint32_t g_reset_calls;
+static uint32_t g_zero_calls;
 
 static void feed(const char *text)
 {
@@ -180,6 +181,20 @@ bool PitchAxisVelocityTest_ClearAutomaticHold(PitchAxisVelocityTest *test)
     return true;
 }
 
+bool PitchAxisVelocityTest_CaptureAutomaticZero(
+    PitchAxisVelocityTest *test,
+    uint32_t now_ms)
+{
+    (void)now_ms;
+    if (test->report.automatic_armed ||
+        (test->report.state != PITCH_VELOCITY_TEST_STATE_ENABLED_STOPPED))
+    {
+        return false;
+    }
+    g_zero_calls++;
+    return true;
+}
+
 bool PitchAxisVelocityTest_SetPidDebugEnabled(
     PitchAxisVelocityTest *test,
     bool enabled,
@@ -226,6 +241,13 @@ static PitchAxisVelocityTestConfig default_velocity_config(void)
     config.run_ms = 300U;
     config.debounce_ms = 30U;
     config.automatic_max_speed_rpm = 1U;
+    config.automatic_position_raw_per_mm = 27760U;
+    config.automatic_tilt_scale_um_per_outer_rpm = 67U;
+    config.automatic_tilt_limit_um = 2000U;
+    config.automatic_position_deadband_um = 30U;
+    config.automatic_position_slow_zone_um = 300U;
+    config.automatic_position_min_speed_rpm = 1U;
+    config.automatic_position_poll_period_ms = 20U;
     config.automatic_decision_timeout_ms = 200U;
     config.automatic_vision_loss_grace_ms = 0U;
     config.automatic_motion_budget_ms = 3000U;
@@ -247,6 +269,7 @@ static void initialize(
     g_arm_calls = 0U;
     g_disarm_calls = 0U;
     g_reset_calls = 0U;
+    g_zero_calls = 0U;
     clear_output();
     vision->config = default_vision_config();
     velocity->config = default_velocity_config();
@@ -303,11 +326,11 @@ static void test_live_pid_and_automatic_limit_settings(void)
     velocity.report.automatic_armed = false;
     velocity.report.automatic_motion_active = false;
     clear_output();
-    feed("SET AUTOMAX=50\r\nSET AUTOMAX=51\r\nSET LOSSMS=5000\r\nSET LOSSMS=5001\r\nSET RESCUERPM=51\r\nSET RESCUEMS=3001\r\nSET BUDGET=0\r\nSET BUDGET=600000\r\nSET BUDGET=600001\r\n");
+    feed("SET AUTOMAX=300\r\nSET AUTOMAX=301\r\nSET LOSSMS=5000\r\nSET LOSSMS=5001\r\nSET RESCUERPM=51\r\nSET RESCUEMS=3001\r\nSET BUDGET=0\r\nSET BUDGET=600000\r\nSET BUDGET=600001\r\n");
     service_until_input_drained(&debug, 20U);
-    assert(velocity.config.automatic_max_speed_rpm == 50U);
-    assert(strstr(g_tx, "PID_SET_OK,name=AUTOMAX,value=50") != NULL);
-    assert(strstr(g_tx, "PID_SET_REJECTED,name=AUTOMAX,value=51") != NULL);
+    assert(velocity.config.automatic_max_speed_rpm == 300U);
+    assert(strstr(g_tx, "PID_SET_OK,name=AUTOMAX,value=300") != NULL);
+    assert(strstr(g_tx, "PID_SET_REJECTED,name=AUTOMAX,value=301") != NULL);
     assert(velocity.config.automatic_vision_loss_grace_ms == 5000U);
     assert(strstr(g_tx, "PID_SET_OK,name=LOSSMS,value=5000") != NULL);
     assert(strstr(g_tx, "PID_SET_REJECTED,name=LOSSMS,value=5001") != NULL);
@@ -379,6 +402,30 @@ static void test_bare_arm_timeout_and_resume_reset(void)
     assert(strstr(g_tx, "PID_RESUME_READY\r\n") != NULL);
 }
 
+static void test_zero_and_position_loop_settings(void)
+{
+    PitchPidDebug debug;
+    BspBluetooth bluetooth;
+    PitchAxisVisionControl vision;
+    PitchAxisVelocityTest velocity;
+
+    initialize(&debug, &bluetooth, &vision, &velocity);
+    velocity.report.state = PITCH_VELOCITY_TEST_STATE_ENABLED_STOPPED;
+    feed("ZERO\r\nSET POSTRACK=1\r\nSET RAWSIGN=1\r\nSET RAWPMM=30000\r\nSET TILTSCALE=60\r\nSET TILTLIM=1800\r\nSET POSDB=25\r\nSET SLOWUM=250\r\nSET INNERMIN=1\r\nSET POSPOLL=15\r\n");
+    service_until_input_drained(&debug, 50U);
+
+    assert(g_zero_calls == 1U);
+    assert(velocity.config.automatic_position_tracking_enabled);
+    assert(velocity.config.automatic_direction0_increases_raw);
+    assert(velocity.config.automatic_position_raw_per_mm == 30000U);
+    assert(velocity.config.automatic_tilt_scale_um_per_outer_rpm == 60U);
+    assert(velocity.config.automatic_tilt_limit_um == 1800U);
+    assert(velocity.config.automatic_position_deadband_um == 25U);
+    assert(velocity.config.automatic_position_slow_zone_um == 250U);
+    assert(velocity.config.automatic_position_poll_period_ms == 15U);
+    assert(strstr(g_tx, "POSITION_ZERO_REQUESTED") != NULL);
+}
+
 int main(void)
 {
     test_ping_pid_on_and_status();
@@ -386,6 +433,7 @@ int main(void)
     test_runtime_ball_limits();
     test_fragmented_db_is_not_disarm();
     test_bare_arm_timeout_and_resume_reset();
+    test_zero_and_position_loop_settings();
     puts("PITCH_PID_DEBUG_TEST=PASS");
     return 0;
 }

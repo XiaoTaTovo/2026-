@@ -19,6 +19,9 @@
 #define PITCH_PID_DEBUG_MAX_AUTO_BUDGET_MS 600000U
 #define PITCH_PID_DEBUG_MAX_MANUAL_RPM 50U
 #define PITCH_PID_DEBUG_MAX_RUN_MS 1000U
+#define PITCH_PID_DEBUG_MAX_RAW_PER_MM 1000000U
+#define PITCH_PID_DEBUG_MAX_TILT_UM 10000U
+#define PITCH_PID_DEBUG_MAX_POSITION_POLL_MS 200U
 
 static bool time_elapsed(uint32_t now_ms, uint32_t start_ms, uint32_t delay_ms)
 {
@@ -97,6 +100,50 @@ static size_t append_i32(
         magnitude = (uint32_t)value;
     }
     return append_u32(message, capacity, length, magnitude);
+}
+
+static size_t append_u64(
+    char *message,
+    size_t capacity,
+    size_t length,
+    uint64_t value)
+{
+    char reversed[20];
+    size_t digits = 0U;
+
+    do
+    {
+        reversed[digits++] = (char)('0' + (value % 10U));
+        value /= 10U;
+    } while ((value != 0U) && (digits < sizeof(reversed)));
+    while ((digits > 0U) && (length < capacity))
+    {
+        message[length++] = reversed[--digits];
+    }
+    return length;
+}
+
+static size_t append_i64(
+    char *message,
+    size_t capacity,
+    size_t length,
+    int64_t value)
+{
+    uint64_t magnitude;
+
+    if (value < 0)
+    {
+        if (length < capacity)
+        {
+            message[length++] = '-';
+        }
+        magnitude = (uint64_t)(-(value + 1)) + 1U;
+    }
+    else
+    {
+        magnitude = (uint64_t)value;
+    }
+    return append_u64(message, capacity, length, magnitude);
 }
 
 static size_t append_fixed3(
@@ -486,7 +533,37 @@ static bool write_config(PitchPidDebug *debug)
                             1U : 0U);
     length = append_text(message, sizeof(message), length, ",automax=");
     length = append_u32(message, sizeof(message), length,
-                        velocity_config.automatic_max_speed_rpm);
+                         velocity_config.automatic_max_speed_rpm);
+    length = append_text(message, sizeof(message), length, ",postrack=");
+    length = append_u32(
+        message, sizeof(message), length,
+        velocity_config.automatic_position_tracking_enabled ? 1U : 0U);
+    length = append_text(message, sizeof(message), length, ",rawsign=");
+    length = append_u32(
+        message, sizeof(message), length,
+        velocity_config.automatic_direction0_increases_raw ? 1U : 0U);
+    length = append_text(message, sizeof(message), length, ",rawpmm=");
+    length = append_u32(message, sizeof(message), length,
+                        velocity_config.automatic_position_raw_per_mm);
+    length = append_text(message, sizeof(message), length, ",tiltscale=");
+    length = append_u32(
+        message, sizeof(message), length,
+        velocity_config.automatic_tilt_scale_um_per_outer_rpm);
+    length = append_text(message, sizeof(message), length, ",tiltlim=");
+    length = append_u32(message, sizeof(message), length,
+                        velocity_config.automatic_tilt_limit_um);
+    length = append_text(message, sizeof(message), length, ",posdb=");
+    length = append_u32(message, sizeof(message), length,
+                        velocity_config.automatic_position_deadband_um);
+    length = append_text(message, sizeof(message), length, ",slowum=");
+    length = append_u32(message, sizeof(message), length,
+                        velocity_config.automatic_position_slow_zone_um);
+    length = append_text(message, sizeof(message), length, ",innermin=");
+    length = append_u32(message, sizeof(message), length,
+                        velocity_config.automatic_position_min_speed_rpm);
+    length = append_text(message, sizeof(message), length, ",pospoll=");
+    length = append_u32(message, sizeof(message), length,
+                        velocity_config.automatic_position_poll_period_ms);
     length = append_text(message, sizeof(message), length, ",timeout=");
     length = append_u32(message, sizeof(message), length,
                         velocity_config.automatic_decision_timeout_ms);
@@ -615,7 +692,26 @@ static bool write_sample(PitchPidDebug *debug, uint32_t now_ms)
                         vision_report.command_speed_rpm);
     length = append_text(message, sizeof(message), length, ",dir=");
     length = append_u32(message, sizeof(message), length,
-                        vision_report.command_positive_direction ? 1U : 0U);
+                         vision_report.command_positive_direction ? 1U : 0U);
+    length = append_text(message, sizeof(message), length, ",posok=");
+    length = append_u32(
+        message, sizeof(message), length,
+        velocity_report.automatic_position_valid ? 1U : 0U);
+    length = append_text(message, sizeof(message), length, ",zraw=");
+    length = append_i64(message, sizeof(message), length,
+                        velocity_report.automatic_zero_position_raw);
+    length = append_text(message, sizeof(message), length, ",praw=");
+    length = append_i64(message, sizeof(message), length,
+                        velocity_report.automatic_position_raw);
+    length = append_text(message, sizeof(message), length, ",ptgt=");
+    length = append_i64(message, sizeof(message), length,
+                        velocity_report.automatic_target_position_raw);
+    length = append_text(message, sizeof(message), length, ",perr=");
+    length = append_i64(message, sizeof(message), length,
+                        velocity_report.automatic_position_error_raw);
+    length = append_text(message, sizeof(message), length, ",page=");
+    length = append_u32(message, sizeof(message), length,
+                        velocity_report.automatic_position_age_ms);
     length = append_text(message, sizeof(message), length, ",fresh=");
     length = append_u32(message, sizeof(message), length,
                         vision_report.observation_fresh ? 1U : 0U);
@@ -703,18 +799,18 @@ static bool service_boot(PitchPidDebug *debug)
     switch (debug->boot_line)
     {
         case 0U: text = "PID_DEBUG_READY\r\n"; break;
-        case 1U: text = "PID_DEBUG_BUILD=pid-live-r15-direct-start\r\n"; break;
+        case 1U: text = "PID_DEBUG_BUILD=pid-live-r16-position-loop\r\n"; break;
         case 2U:
-            text = "PID_COMMANDS=PING|PID ON|PID OFF|PID?|PID HELP|SET NAME=VALUE|A|D|RESUME\r\n";
+            text = "PID_COMMANDS=PING|PID ON|PID OFF|PID?|PID HELP|SET NAME=VALUE|ZERO|A|D|RESUME\r\n";
             break;
         case 3U: text = "PID_SAMPLE_DEFAULT_MS=100\r\n"; break;
         case 4U:
-            text = "PID_RUNTIME_SET=KP,KI,KD,ILIM,TARGET,BALLMIN,BALLMAX,EDGEMARGIN,DB,VDB,CONF,AGE,PERIOD,MINRPM,MAXRPM,ALPHA,SIGN,AUTOMAX,TIMEOUT,LOSSMS,RESCUE,RESCUERPM,RESCUEMS,BUDGET,ACCEL,SAMPLE\r\n";
+            text = "PID_RUNTIME_SET=KP,KI,KD,ILIM,TARGET,BALLMIN,BALLMAX,EDGEMARGIN,DB,VDB,CONF,AGE,PERIOD,MINRPM,MAXRPM,ALPHA,SIGN,AUTOMAX,POSTRACK,RAWSIGN,RAWPMM,TILTSCALE,TILTLIM,POSDB,SLOWUM,INNERMIN,POSPOLL,TIMEOUT,LOSSMS,RESCUE,RESCUERPM,RESCUEMS,BUDGET,ACCEL,SAMPLE\r\n";
             break;
         case 5U:
-            text = "PID_IDLE_ONLY_SET=MANUALRPM,RUNMS,POSDIR,NEGDIR,SYNC\r\n";
+            text = "PID_IDLE_ONLY_SET=MANUALRPM,RUNMS,POSDIR,NEGDIR,SYNC,POSTRACK,RAWSIGN,RAWPMM,ZERO\r\n";
             break;
-        case 6U: text = "PID_HARD_AUTO_MAX_RPM=50\r\n"; break;
+        case 6U: text = "PID_HARD_AUTO_MAX_RPM=300\r\n"; break;
         case 7U:
             text = "PID_HARD_POSITION_0P1MM=-1250..1250\r\n";
             break;
@@ -988,7 +1084,12 @@ static bool apply_setting(
         }
         vision_changed = true;
     }
-    else if (text_equal(name, "AUTOMAX") || text_equal(name, "TIMEOUT") ||
+    else if (text_equal(name, "AUTOMAX") || text_equal(name, "POSTRACK") ||
+              text_equal(name, "RAWSIGN") || text_equal(name, "RAWPMM") ||
+              text_equal(name, "TILTSCALE") || text_equal(name, "TILTLIM") ||
+              text_equal(name, "POSDB") || text_equal(name, "SLOWUM") ||
+              text_equal(name, "INNERMIN") || text_equal(name, "POSPOLL") ||
+              text_equal(name, "TIMEOUT") ||
              text_equal(name, "LOSSMS") || text_equal(name, "RESCUE") ||
              text_equal(name, "RESCUERPM") || text_equal(name, "RESCUEMS") ||
              text_equal(name, "BUDGET") || text_equal(name, "ACCEL") ||
@@ -1009,6 +1110,93 @@ static bool apply_setting(
             }
             velocity_config.automatic_max_speed_rpm =
                 (uint16_t)unsigned_value;
+        }
+        else if (text_equal(name, "POSTRACK"))
+        {
+            if (unsigned_value > 1U)
+            {
+                return false;
+            }
+            velocity_config.automatic_position_tracking_enabled =
+                unsigned_value != 0U;
+        }
+        else if (text_equal(name, "RAWSIGN"))
+        {
+            if (unsigned_value > 1U)
+            {
+                return false;
+            }
+            velocity_config.automatic_direction0_increases_raw =
+                unsigned_value != 0U;
+        }
+        else if (text_equal(name, "RAWPMM"))
+        {
+            if ((unsigned_value < 1000U) ||
+                (unsigned_value > PITCH_PID_DEBUG_MAX_RAW_PER_MM))
+            {
+                return false;
+            }
+            velocity_config.automatic_position_raw_per_mm = unsigned_value;
+        }
+        else if (text_equal(name, "TILTSCALE"))
+        {
+            if ((unsigned_value == 0U) ||
+                (unsigned_value > 1000U))
+            {
+                return false;
+            }
+            velocity_config.automatic_tilt_scale_um_per_outer_rpm =
+                (uint16_t)unsigned_value;
+        }
+        else if (text_equal(name, "TILTLIM"))
+        {
+            if ((unsigned_value < 100U) ||
+                (unsigned_value > PITCH_PID_DEBUG_MAX_TILT_UM))
+            {
+                return false;
+            }
+            velocity_config.automatic_tilt_limit_um =
+                (uint16_t)unsigned_value;
+        }
+        else if (text_equal(name, "POSDB"))
+        {
+            if ((unsigned_value == 0U) ||
+                (unsigned_value >= velocity_config.automatic_tilt_limit_um))
+            {
+                return false;
+            }
+            velocity_config.automatic_position_deadband_um =
+                (uint16_t)unsigned_value;
+        }
+        else if (text_equal(name, "SLOWUM"))
+        {
+            if ((unsigned_value <=
+                 velocity_config.automatic_position_deadband_um) ||
+                (unsigned_value > velocity_config.automatic_tilt_limit_um))
+            {
+                return false;
+            }
+            velocity_config.automatic_position_slow_zone_um =
+                (uint16_t)unsigned_value;
+        }
+        else if (text_equal(name, "INNERMIN"))
+        {
+            if ((unsigned_value == 0U) ||
+                (unsigned_value > velocity_config.automatic_max_speed_rpm))
+            {
+                return false;
+            }
+            velocity_config.automatic_position_min_speed_rpm =
+                (uint16_t)unsigned_value;
+        }
+        else if (text_equal(name, "POSPOLL"))
+        {
+            if ((unsigned_value < 5U) ||
+                (unsigned_value > PITCH_PID_DEBUG_MAX_POSITION_POLL_MS))
+            {
+                return false;
+            }
+            velocity_config.automatic_position_poll_period_ms = unsigned_value;
         }
         else if (text_equal(name, "TIMEOUT"))
         {
@@ -1040,7 +1228,8 @@ static bool apply_setting(
         else if (text_equal(name, "RESCUERPM"))
         {
             if ((unsigned_value == 0U) ||
-                (unsigned_value > PITCH_AXIS_VELOCITY_TEST_HARD_AUTO_MAX_RPM))
+                (unsigned_value >
+                 PITCH_AXIS_VELOCITY_TEST_HARD_EDGE_RECOVERY_MAX_RPM))
             {
                 return false;
             }
@@ -1163,7 +1352,7 @@ static void handle_command(
         debug->accepted_command_count++;
         (void)write_text(
             debug,
-            "PID_HELP=units:x/target/err/db/ballmin/ballmax=0.1mm,ballv=0.1mm/s,p/i/d/u/out=0.01rpm;A=ARM,D=DISARM\r\n");
+             "PID_HELP=outer:p/i/d/u/out=0.01virtual_rpm;position:zraw/praw/ptgt/perr=raw_counts;ZERO=recapture_zero,A=ARM,D=DISARM\r\n");
         return;
     }
     if (text_equal(line, "A"))
@@ -1174,6 +1363,22 @@ static void handle_command(
     if (text_equal(line, "D"))
     {
         handle_single_character(debug, 'D', now_ms);
+        return;
+    }
+    if (text_equal(line, "ZERO"))
+    {
+        if (PitchAxisVelocityTest_CaptureAutomaticZero(
+                debug->velocity,
+                now_ms))
+        {
+            debug->accepted_command_count++;
+            (void)write_text(debug, "POSITION_ZERO_REQUESTED\r\n");
+        }
+        else
+        {
+            debug->rejected_command_count++;
+            (void)write_text(debug, "POSITION_ZERO_REJECTED\r\n");
+        }
         return;
     }
     if (text_equal(line, "PID ON"))
