@@ -30,13 +30,16 @@
 #include "bsp_bluetooth.h"
 #include "bsp_uart_dma.h"
 #include "ball_observation_protocol.h"
-#include "pitch_axis_manual_control.h"
-#include "pitch_axis_manual_telemetry.h"
 #include "pitch_axis_self_test.h"
 #include "pitch_axis_self_test_telemetry.h"
+#include "pitch_axis_velocity_test.h"
+#include "pitch_axis_velocity_test_telemetry.h"
 #include "pitch_axis_vision_control.h"
 #include "pitch_axis_vision_telemetry.h"
+#include "pitch_pid_debug.h"
 #include "x42s_driver.h"
+
+#include <string.h>
 
 /* USER CODE END Includes */
 
@@ -78,44 +81,56 @@ static PitchAxisSelfTestResult pitch_self_test_init_result =
 static PitchAxisSelfTestResult pitch_self_test_start_result =
     PITCH_AXIS_SELF_TEST_NOT_READY;
 static PitchAxisSelfTestTelemetry pitch_self_test_telemetry;
-static PitchAxisManualControl pitch_manual_control;
-static PitchAxisManualTelemetry pitch_manual_telemetry;
-static bool pitch_manual_initialized;
-static const PitchAxisManualConfig pitch_manual_config = {
+static PitchAxisVelocityTest pitch_velocity_test;
+static PitchAxisVelocityTestTelemetry pitch_velocity_test_telemetry;
+static bool pitch_velocity_test_initialized;
+static PitchPidDebug pitch_pid_debug;
+static bool pitch_pid_debug_initialized;
+static const PitchAxisVelocityTestConfig pitch_velocity_test_config = {
     .address = X42S_DEFAULT_ADDRESS,
     .positive_direction = 0U,
     .negative_direction = 1U,
-    .speed_rpm = 60U,
-    .acceleration = 100U,
-    .step_pulses = 32U,
-    /* Mode 0 accumulates each command from the previous input target.  The
-     * installed motor firmware treated mode 2 as an absolute target during
-     * the first hardware trial, so manual button steps use the vendor
-     * example's repeatable relative mode. */
-    .motion_mode = 0U,
+    .speed_rpm = 10U,
+    /* ZDT defines acc=0 as direct start. Closed-loop braking needs the
+     * velocity reversal to reach the motor without an extra ramp. */
+    .acceleration = 0U,
+    .run_ms = 300U,
     .synchronize = false,
     .debounce_ms = 30U,
-    .settle_ms = 1200U
+    .automatic_max_speed_rpm = 30U,
+    .automatic_decision_timeout_ms = 500U,
+    /* Stop immediately on a bad frame, but keep ARM permission briefly so
+     * isolated detector misses can recover without operator intervention. */
+    .automatic_vision_loss_grace_ms = 2500U,
+    .automatic_edge_recovery_enabled = true,
+    .automatic_edge_recovery_speed_rpm = 20U,
+    /* Stop and acknowledge every pulse, then retry until vision returns. */
+    .automatic_edge_recovery_max_ms = 1500U,
+    /* The operator owns stop/escape handling during this full-auto trial. */
+    .automatic_motion_budget_ms = 0U
 };
 static const PitchAxisVisionConfig pitch_vision_config = {
-    .target_position_0_1mm = 0,
-    .deadband_0_1mm = 5,
+    /* Measured after locking the MaixCAM pipe geometry with the R control. */
+    .target_position_0_1mm = -50,
+    .minimum_safe_position_0_1mm = -1250,
+    .maximum_safe_position_0_1mm = 1250,
+    .edge_recovery_margin_0_1mm = 400,
+    .deadband_0_1mm = 50,
+    .velocity_deadband_0_1mm_s = 100,
     /* The camera must mark a detection valid, then this second gate rejects
      * weak detections before they can become an EMM command candidate. */
-    .minimum_confidence_permille = 700U,
+    .minimum_confidence_permille = 350U,
     .maximum_observation_age_ms = 150U,
     .control_period_ms = 50U,
-    /* MEASURED (single rough trial): 30 * 32 pulses produced about 1 mm.
-     * This remains a configurable estimate until repeated ruler calibration. */
-    .pulses_per_mm = 960U,
-    .minimum_command_pulses = 8U,
-    /* UNVERIFIED initial gains. The first firmware is dry-run only and will
-     * log candidates rather than transmit them to the motor. */
-    .kp_mm_per_mm = 0.10f,
-    .ki_per_s = 0.0f,
-    .kd_s = 0.0f,
-    .integral_limit_mm_s = 10.0f,
-    .output_limit_mm = 0.20f,
+    .minimum_speed_rpm = 5U,
+    .maximum_speed_rpm = 30U,
+    /* Initial centre-hold PD tune. Ki remains disabled until P/D and the
+     * direction-change dynamics have been measured on hardware. */
+    .kp_rpm_per_mm = 0.50f,
+    .ki_rpm_per_mm_s = 0.0f,
+    .kd_rpm_per_mm_s = 0.50f,
+    .integral_limit_rpm = 1.0f,
+    .velocity_filter_alpha = 0.15f,
     .positive_error_uses_positive_direction = true
 };
 
@@ -215,16 +230,16 @@ int main(void)
     pitch_x42_start_result = X42sDriver_Start(&pitch_x42);
   }
 
-  pitch_manual_initialized = PitchAxisManualControl_Init(
-      &pitch_manual_control,
+  pitch_velocity_test_initialized = PitchAxisVelocityTest_Init(
+      &pitch_velocity_test,
       &pitch_x42,
-      &pitch_manual_config,
+      &pitch_velocity_test_config,
       HAL_GetTick());
-  if (pitch_manual_initialized)
+  if (pitch_velocity_test_initialized)
   {
-    (void)PitchAxisManualTelemetry_Init(
-        &pitch_manual_telemetry,
-        &pitch_manual_control,
+    (void)PitchAxisVelocityTestTelemetry_Init(
+        &pitch_velocity_test_telemetry,
+        &pitch_velocity_test,
         &bluetooth_port,
         HAL_GetTick());
   }
@@ -257,19 +272,26 @@ int main(void)
         "PITCH_READ1000_INIT_ERROR\r\n");
   }
 
-  if (!pitch_manual_initialized)
+  if (!pitch_velocity_test_initialized)
   {
     (void)BspBluetooth_WriteString(
         &bluetooth_port,
-        "PITCH_MANUAL_INIT_ERROR\r\n");
+        "PITCH_VELOCITY_TEST_INIT_ERROR\r\n");
   }
   else if (pitch_self_test_start_result != PITCH_AXIS_SELF_TEST_OK)
   {
-    PitchAxisManualControl_SetCommunicationResult(
-        &pitch_manual_control,
+    PitchAxisVelocityTest_SetCommunicationResult(
+        &pitch_velocity_test,
         false,
-        HAL_GetTick());
+           HAL_GetTick());
   }
+
+  pitch_pid_debug_initialized = PitchPidDebug_Init(
+      &pitch_pid_debug,
+      &bluetooth_port,
+      &pitch_vision_control,
+      &pitch_velocity_test,
+      HAL_GetTick());
 
   /* USER CODE END 2 */
 
@@ -281,17 +303,15 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-    uint8_t rx_data[64];
     uint8_t vision_rx_data[64];
-    size_t available;
-    size_t read_length;
-    size_t transfer_length;
     size_t vision_read_length;
     size_t vision_index;
     uint32_t now_ms;
-    PitchAxisManualButtons buttons;
+    PitchAxisVelocityTestButtons buttons;
     PitchAxisSelfTestState self_test_state;
     BallObservation observation;
+    PitchAxisVisionReport vision_report;
+    PitchAxisAutomaticDecision automatic_decision;
 
     now_ms = HAL_GetTick();
     BspBluetooth_Service(&bluetooth_port);
@@ -304,14 +324,6 @@ int main(void)
         (HAL_GPIO_ReadPin(Key_3_GPIO_Port, Key_3_Pin) == GPIO_PIN_RESET);
     buttons.key4_pressed =
         (HAL_GPIO_ReadPin(Key_4_GPIO_Port, Key_4_Pin) == GPIO_PIN_RESET);
-
-    if (pitch_manual_initialized)
-    {
-      PitchAxisManualControl_Service(
-          &pitch_manual_control,
-          now_ms,
-          buttons);
-    }
 
     do
     {
@@ -337,56 +349,106 @@ int main(void)
     {
       PitchAxisVisionControl_Service(&pitch_vision_control, now_ms);
       PitchAxisVisionTelemetry_Service(&pitch_vision_telemetry, now_ms);
+      if (pitch_velocity_test_initialized &&
+          PitchAxisVisionControl_TakeDecision(
+              &pitch_vision_control,
+              &vision_report))
+      {
+        memset(&automatic_decision, 0, sizeof(automatic_decision));
+        automatic_decision.source_safe =
+            (vision_report.state == PITCH_VISION_STATE_TRACKING) &&
+            vision_report.observation_fresh;
+        if (vision_report.ball_position_outside_limits)
+        {
+          automatic_decision.source_safe = false;
+        }
+        automatic_decision.motion_requested = vision_report.command_ready;
+        /* This boolean is the calibrated EMM direction bit shown as dir=0/1
+         * in the dry-run logs; do not remap it through the manual key names. */
+        automatic_decision.motor_direction =
+            vision_report.command_positive_direction ? 1U : 0U;
+        automatic_decision.speed_rpm = vision_report.command_speed_rpm;
+        automatic_decision.edge_recovery_candidate =
+            vision_report.edge_recovery_candidate;
+        automatic_decision.edge_recovery_direction =
+            vision_report.edge_recovery_direction ? 1U : 0U;
+        automatic_decision.sequence = vision_report.decision_sequence;
+        if (vision_report.ball_position_outside_limits)
+        {
+          automatic_decision.unsafe_reason =
+              PITCH_AUTOMATIC_DISARM_BALL_ESCAPE;
+        }
+        else switch (vision_report.state)
+        {
+          case PITCH_VISION_STATE_REJECT_LOW_CONFIDENCE:
+            automatic_decision.unsafe_reason =
+                PITCH_AUTOMATIC_DISARM_VISION_LOW_CONFIDENCE;
+            break;
+          case PITCH_VISION_STATE_REJECT_STALE:
+            automatic_decision.unsafe_reason =
+                PITCH_AUTOMATIC_DISARM_VISION_STALE;
+            break;
+          case PITCH_VISION_STATE_REJECT_INVALID:
+            automatic_decision.unsafe_reason =
+                PITCH_AUTOMATIC_DISARM_VISION_INVALID;
+            break;
+          default:
+            automatic_decision.unsafe_reason =
+                PITCH_AUTOMATIC_DISARM_NONE;
+            break;
+        }
+        PitchAxisVelocityTest_SubmitAutomaticDecision(
+            &pitch_velocity_test,
+            &automatic_decision,
+            now_ms);
+      }
     }
 
-    if (!pitch_manual_initialized ||
-        ((PitchAxisManualControl_GetState(&pitch_manual_control) !=
-          PITCH_MANUAL_STATE_STOPPING) &&
-         (PitchAxisManualControl_GetState(&pitch_manual_control) !=
-          PITCH_MANUAL_STATE_FAULT_LATCHED)))
+    if (pitch_velocity_test_initialized)
+    {
+      PitchAxisVelocityTest_Service(
+          &pitch_velocity_test,
+          now_ms,
+          buttons);
+    }
+
+    if (!pitch_velocity_test_initialized ||
+        ((PitchAxisVelocityTest_GetState(&pitch_velocity_test) !=
+          PITCH_VELOCITY_TEST_STATE_STOPPING) &&
+         (PitchAxisVelocityTest_GetState(&pitch_velocity_test) !=
+          PITCH_VELOCITY_TEST_STATE_FAULT_LATCHED)))
     {
       PitchAxisSelfTest_Service(&pitch_self_test, now_ms);
     }
 
     self_test_state = PitchAxisSelfTest_GetState(&pitch_self_test);
-    if (pitch_manual_initialized &&
+    if (pitch_velocity_test_initialized &&
         (self_test_state == PITCH_AXIS_SELF_TEST_STATE_COMM_PASS))
     {
-      PitchAxisManualControl_SetCommunicationResult(
-          &pitch_manual_control,
+      PitchAxisVelocityTest_SetCommunicationResult(
+          &pitch_velocity_test,
           true,
           now_ms);
     }
-    else if (pitch_manual_initialized &&
+    else if (pitch_velocity_test_initialized &&
              (self_test_state == PITCH_AXIS_SELF_TEST_STATE_FAILED))
     {
-      PitchAxisManualControl_SetCommunicationResult(
-          &pitch_manual_control,
+      PitchAxisVelocityTest_SetCommunicationResult(
+          &pitch_velocity_test,
           false,
           now_ms);
     }
 
-    PitchAxisSelfTestTelemetry_Service(&pitch_self_test_telemetry);
-    if (pitch_manual_initialized)
+    PitchAxisSelfTestTelemetry_Service(&pitch_self_test_telemetry, now_ms);
+    if (pitch_velocity_test_initialized)
     {
-      PitchAxisManualTelemetry_Service(&pitch_manual_telemetry, now_ms);
+      PitchAxisVelocityTestTelemetry_Service(
+          &pitch_velocity_test_telemetry,
+          now_ms);
     }
-
-    available = BspBluetooth_Available(&bluetooth_port);
-    transfer_length = available;
-    if (transfer_length > sizeof(rx_data))
+    if (pitch_pid_debug_initialized)
     {
-      transfer_length = sizeof(rx_data);
-    }
-
-    if ((transfer_length > 0U) &&
-        (BspBluetooth_Read(
-             &bluetooth_port,
-             rx_data,
-             transfer_length,
-             &read_length) == BSP_BLUETOOTH_OK))
-    {
-      (void)read_length;
+      PitchPidDebug_Service(&pitch_pid_debug, now_ms);
     }
   }
   /* USER CODE END 3 */

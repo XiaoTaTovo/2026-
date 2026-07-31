@@ -3,6 +3,13 @@
 #include <stddef.h>
 #include <string.h>
 
+#define PITCH_SELF_TEST_FAILURE_REPEAT_MS 1000U
+
+static bool time_reached(uint32_t now_ms, uint32_t deadline_ms)
+{
+    return (int32_t)(now_ms - deadline_ms) >= 0;
+}
+
 static bool write_bytes(
     PitchAxisSelfTestTelemetry *telemetry,
     const char *message,
@@ -168,7 +175,9 @@ static const char *failure_name(PitchAxisSelfTestFailure failure)
 
 static bool write_failure(PitchAxisSelfTestTelemetry *telemetry)
 {
-    char message[64];
+    const X42sDriver *driver = telemetry->self_test->driver;
+    const BspUartDmaPort *transport = &driver->transport;
+    char message[256];
     size_t length = 0U;
 
     length = append_text(
@@ -181,6 +190,43 @@ static bool write_failure(PitchAxisSelfTestTelemetry *telemetry)
         sizeof(message),
         length,
         failure_name(PitchAxisSelfTest_GetFailure(telemetry->self_test)));
+    length = append_text(message, sizeof(message), length, "\r\n");
+
+    length = append_text(message, sizeof(message), length, "PITCH_X42_UART,tx=");
+    length = append_u32_decimal(message, sizeof(message), length, transport->tx_bytes);
+    length = append_text(message, sizeof(message), length, ",rx=");
+    length = append_u32_decimal(message, sizeof(message), length, transport->rx_bytes);
+    length = append_text(message, sizeof(message), length, ",dma_start_errors=");
+    length = append_u32_decimal(
+        message,
+        sizeof(message),
+        length,
+        transport->dma_start_error_count);
+    length = append_text(message, sizeof(message), length, ",uart_errors=");
+    length = append_u32_decimal(
+        message,
+        sizeof(message),
+        length,
+        transport->uart_error_count);
+    length = append_text(message, sizeof(message), length, ",hal=0x");
+    length = append_hex(
+        message,
+        sizeof(message),
+        length,
+        transport->last_hal_error,
+        8U);
+    length = append_text(message, sizeof(message), length, ",status_requests=");
+    length = append_u32_decimal(
+        message,
+        sizeof(message),
+        length,
+        driver->status_request_count);
+    length = append_text(message, sizeof(message), length, ",status_timeouts=");
+    length = append_u32_decimal(
+        message,
+        sizeof(message),
+        length,
+        driver->status_timeout_count);
     length = append_text(message, sizeof(message), length, "\r\n");
     return write_bytes(telemetry, message, length);
 }
@@ -298,10 +344,12 @@ bool PitchAxisSelfTestTelemetry_Init(
 }
 
 void PitchAxisSelfTestTelemetry_Service(
-    PitchAxisSelfTestTelemetry *telemetry)
+    PitchAxisSelfTestTelemetry *telemetry,
+    uint32_t now_ms)
 {
     PitchAxisSelfTestReport report;
     PitchAxisSelfTestState state;
+    bool summary_was_active;
 
     if ((telemetry == NULL) || !telemetry->initialized ||
         !PitchAxisSelfTest_GetReport(telemetry->self_test, &report))
@@ -337,5 +385,22 @@ void PitchAxisSelfTestTelemetry_Service(
         telemetry->progress_reported = report.completed_cycles;
     }
 
+    summary_was_active = telemetry->summary_active;
     service_summary(telemetry);
+
+    if (summary_was_active && !telemetry->summary_active)
+    {
+        telemetry->next_failure_repeat_ms =
+            now_ms + PITCH_SELF_TEST_FAILURE_REPEAT_MS;
+    }
+
+    if ((state == PITCH_AXIS_SELF_TEST_STATE_FAILED) &&
+        telemetry->summary_started &&
+        !telemetry->summary_active &&
+        time_reached(now_ms, telemetry->next_failure_repeat_ms) &&
+        write_failure(telemetry))
+    {
+        telemetry->next_failure_repeat_ms =
+            now_ms + PITCH_SELF_TEST_FAILURE_REPEAT_MS;
+    }
 }

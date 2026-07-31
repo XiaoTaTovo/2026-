@@ -27,6 +27,27 @@ static bool transaction_pending(const X42sDriver *driver)
            (driver->state == X42S_DRIVER_STATE_WAITING_FOR_COMMAND);
 }
 
+static bool command_response_pending(const X42sDriver *driver)
+{
+    return (driver->state == X42S_DRIVER_STATE_WAITING_FOR_COMMAND) ||
+           ((driver->state == X42S_DRIVER_STATE_COMMAND_VALID) &&
+            driver->superseded_command_pending);
+}
+
+static void expire_superseded_response(X42sDriver *driver, uint32_t now_ms)
+{
+    if (driver->superseded_command_pending &&
+        ((uint32_t)(now_ms - driver->superseded_command_started_ms) >=
+         X42S_DRIVER_COMMAND_TIMEOUT_MS))
+    {
+        driver->superseded_command_pending = false;
+        if (driver->state == X42S_DRIVER_STATE_COMMAND_VALID)
+        {
+            driver->command_response_window_length = 0U;
+        }
+    }
+}
+
 static void discard_pending_rx(X42sDriver *driver)
 {
     uint8_t ignored_byte;
@@ -170,6 +191,9 @@ static void consume_position_response_byte(X42sDriver *driver, uint8_t byte)
 static void consume_command_response_byte(X42sDriver *driver, uint8_t byte)
 {
     X42sProtocolResult result;
+    X42sCommandStatus ignored_status;
+    bool waiting_for_current =
+        driver->state == X42S_DRIVER_STATE_WAITING_FOR_COMMAND;
 
     if (driver->command_response_window_length < X42S_COMMAND_RESPONSE_SIZE)
     {
@@ -192,6 +216,35 @@ static void consume_command_response_byte(X42sDriver *driver, uint8_t byte)
         return;
     }
 
+    if (!waiting_for_current)
+    {
+        if (driver->superseded_command_pending &&
+            (X42sProtocol_ParseCommandResponse(
+                 driver->command_response_window,
+                 X42S_COMMAND_RESPONSE_SIZE,
+                 driver->command_query_address,
+                 driver->superseded_command_function,
+                 &ignored_status) == X42S_PROTOCOL_OK))
+        {
+            driver->superseded_response_count++;
+            driver->superseded_command_pending = false;
+            driver->command_response_window_length = 0U;
+            driver->last_protocol_result = X42S_PROTOCOL_OK;
+            return;
+        }
+
+        driver->protocol_error_count++;
+        driver->command_response_window[0] =
+            driver->command_response_window[1];
+        driver->command_response_window[1] =
+            driver->command_response_window[2];
+        driver->command_response_window[2] =
+            driver->command_response_window[3];
+        driver->command_response_window_length =
+            X42S_COMMAND_RESPONSE_SIZE - 1U;
+        return;
+    }
+
     result = X42sProtocol_ParseCommandResponse(
         driver->command_response_window,
         X42S_COMMAND_RESPONSE_SIZE,
@@ -203,7 +256,28 @@ static void consume_command_response_byte(X42sDriver *driver, uint8_t byte)
     if (result == X42S_PROTOCOL_OK)
     {
         driver->valid_command_response_count++;
+        driver->command_response_window_length = 0U;
         driver->state = X42S_DRIVER_STATE_COMMAND_VALID;
+        return;
+    }
+
+    /* STOP intentionally supersedes a velocity command. At 115200 baud the
+     * motor can still return the old four-byte ACK after the STOP request has
+     * been queued. It is a valid response to the superseded transaction, not
+     * a protocol fault. Consume exactly that frame and continue looking for
+     * the current STOP response. */
+    if (driver->superseded_command_pending &&
+        (X42sProtocol_ParseCommandResponse(
+             driver->command_response_window,
+             X42S_COMMAND_RESPONSE_SIZE,
+             driver->command_query_address,
+             driver->superseded_command_function,
+             &ignored_status) == X42S_PROTOCOL_OK))
+    {
+        driver->superseded_response_count++;
+        driver->superseded_command_pending = false;
+        driver->command_response_window_length = 0U;
+        driver->last_protocol_result = X42S_PROTOCOL_OK;
         return;
     }
 
@@ -226,6 +300,8 @@ static X42sDriverResult send_command(
     bool supersede_pending)
 {
     BspUartDmaResult transport_result;
+    bool superseding_command;
+    uint8_t superseded_function = 0U;
 
     if ((driver == NULL) || (request == NULL) || (request_length < 2U))
     {
@@ -235,12 +311,24 @@ static X42sDriverResult send_command(
     {
         return X42S_DRIVER_NOT_STARTED;
     }
+    expire_superseded_response(driver, now_ms);
     if (transaction_pending(driver) && !supersede_pending)
     {
         return X42S_DRIVER_BUSY;
     }
 
-    discard_pending_rx(driver);
+    superseding_command = supersede_pending &&
+        (driver->state == X42S_DRIVER_STATE_WAITING_FOR_COMMAND);
+    if (superseding_command)
+    {
+        superseded_function = driver->command_expected_function;
+    }
+    else if (!driver->superseded_command_pending)
+    {
+        discard_pending_rx(driver);
+        driver->command_response_window_length = 0U;
+    }
+
     transport_result = BspUartDma_Write(
         &driver->transport,
         request,
@@ -250,9 +338,15 @@ static X42sDriverResult send_command(
         return map_transport_result(transport_result);
     }
 
+    if (superseding_command)
+    {
+        driver->superseded_command_function = superseded_function;
+        driver->superseded_command_pending = true;
+        driver->superseded_command_started_ms = now_ms;
+    }
+
     driver->command_query_address = address;
     driver->command_expected_function = request[1];
-    driver->command_response_window_length = 0U;
     driver->command_request_started_ms = now_ms;
     driver->command_request_count++;
     driver->state = X42S_DRIVER_STATE_WAITING_FOR_COMMAND;
@@ -487,6 +581,46 @@ X42sDriverResult X42sDriver_RequestEnable(
         false);
 }
 
+X42sDriverResult X42sDriver_RequestEmmVelocity(
+    X42sDriver *driver,
+    uint8_t address,
+    uint8_t direction,
+    uint16_t speed_rpm,
+    uint8_t acceleration,
+    bool synchronize,
+    uint32_t now_ms)
+{
+    uint8_t request[X42S_EMM_VELOCITY_REQUEST_SIZE];
+    X42sProtocolResult protocol_result;
+
+    if (driver == NULL)
+    {
+        return X42S_DRIVER_INVALID_ARGUMENT;
+    }
+
+    protocol_result = X42sProtocol_BuildEmmVelocity(
+        address,
+        direction,
+        speed_rpm,
+        acceleration,
+        synchronize,
+        request,
+        sizeof(request));
+    if (protocol_result != X42S_PROTOCOL_OK)
+    {
+        driver->last_protocol_result = protocol_result;
+        return X42S_DRIVER_INVALID_ARGUMENT;
+    }
+
+    return send_command(
+        driver,
+        address,
+        request,
+        sizeof(request),
+        now_ms,
+        false);
+}
+
 X42sDriverResult X42sDriver_RequestEmmPosition(
     X42sDriver *driver,
     uint8_t address,
@@ -578,6 +712,7 @@ void X42sDriver_Service(X42sDriver *driver, uint32_t now_ms)
     }
 
     BspUartDma_Service(&driver->transport);
+    expire_superseded_response(driver, now_ms);
 
     while ((driver->state == X42S_DRIVER_STATE_WAITING_FOR_ADDRESS) &&
            (BspUartDma_Read(&driver->transport, &byte, 1U) == 1U))
@@ -597,7 +732,7 @@ void X42sDriver_Service(X42sDriver *driver, uint32_t now_ms)
         consume_position_response_byte(driver, byte);
     }
 
-    while ((driver->state == X42S_DRIVER_STATE_WAITING_FOR_COMMAND) &&
+    while (command_response_pending(driver) &&
            (BspUartDma_Read(&driver->transport, &byte, 1U) == 1U))
     {
         consume_command_response_byte(driver, byte);

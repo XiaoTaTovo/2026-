@@ -19,11 +19,18 @@ typedef struct
     uint32_t unused;
 } BspBluetooth;
 
+size_t BspBluetooth_Available(const BspBluetooth *port);
 size_t BspBluetooth_TxFree(const BspBluetooth *port);
 
 BspBluetoothResult BspBluetooth_Write(
     BspBluetooth *port,
     const uint8_t *data,
     size_t length);
+
+BspBluetoothResult BspBluetooth_Read(
+    BspBluetooth *port,
+    uint8_t *data,
+    size_t capacity,
+    size_t *read_length);
 
 #endif

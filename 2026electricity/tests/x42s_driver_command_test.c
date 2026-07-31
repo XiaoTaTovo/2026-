@@ -150,6 +150,35 @@ static void test_position_command_and_error_status(void)
            X42S_COMMAND_STATUS_PARAMETER_ERROR);
 }
 
+static void test_velocity_command_and_ack(void)
+{
+    UART_HandleTypeDef uart;
+    X42sDriver driver;
+    static const uint8_t expected[] = {
+        0x01U, 0xF6U, 0x00U, 0x00U, 0x3CU, 0x64U, 0x00U, 0x6BU
+    };
+
+    initialize(&driver, &uart);
+    assert(X42sDriver_RequestEmmVelocity(
+        &driver,
+        X42S_DEFAULT_ADDRESS,
+        0U,
+        60U,
+        100U,
+        false,
+        22U) == X42S_DRIVER_OK);
+    assert(g_last_tx_length == sizeof(expected));
+    assert(memcmp(g_last_tx, expected, sizeof(expected)) == 0);
+    assert(X42sDriver_GetState(&driver) ==
+           X42S_DRIVER_STATE_WAITING_FOR_COMMAND);
+
+    X42sDriver_Service(&driver, 23U);
+    assert(X42sDriver_GetState(&driver) == X42S_DRIVER_STATE_COMMAND_VALID);
+    assert(X42sDriver_GetCommandFunction(&driver) == 0xF6U);
+    assert(X42sDriver_GetCommandStatus(&driver) ==
+           X42S_COMMAND_STATUS_ACCEPTED);
+}
+
 static void test_stop_supersedes_pending_command(void)
 {
     UART_HandleTypeDef uart;
@@ -171,6 +200,270 @@ static void test_stop_supersedes_pending_command(void)
     X42sDriver_Service(&driver, 33U);
     assert(X42sDriver_GetState(&driver) == X42S_DRIVER_STATE_COMMAND_VALID);
     assert(X42sDriver_GetCommandFunction(&driver) == 0xFEU);
+}
+
+static void test_late_superseded_velocity_ack_is_not_protocol_fault(void)
+{
+    UART_HandleTypeDef uart;
+    X42sDriver driver;
+    uint8_t responses[8] = {
+        X42S_DEFAULT_ADDRESS, 0xF6U, X42S_COMMAND_STATUS_ACCEPTED,
+        X42S_FIXED_CHECKSUM,
+        X42S_DEFAULT_ADDRESS, 0xFEU, X42S_COMMAND_STATUS_ACCEPTED,
+        X42S_FIXED_CHECKSUM
+    };
+
+    initialize(&driver, &uart);
+    assert(X42sDriver_RequestEmmVelocity(
+        &driver,
+        X42S_DEFAULT_ADDRESS,
+        0U,
+        1U,
+        100U,
+        false,
+        40U) == X42S_DRIVER_OK);
+    /* Simulate the old ACK remaining in the receive stream while STOP
+     * replaces the command transaction. */
+    g_drop_response = true;
+    assert(X42sDriver_RequestStop(
+        &driver,
+        X42S_DEFAULT_ADDRESS,
+        false,
+        41U) == X42S_DRIVER_OK);
+    memcpy(driver.transport.rx_data, responses, sizeof(responses));
+    driver.transport.rx_length = sizeof(responses);
+    driver.transport.rx_offset = 0U;
+    X42sDriver_Service(&driver, 42U);
+
+    assert(X42sDriver_GetState(&driver) ==
+           X42S_DRIVER_STATE_COMMAND_VALID);
+    assert(X42sDriver_GetCommandFunction(&driver) == 0xFEU);
+    assert(driver.superseded_response_count == 1U);
+    assert(driver.protocol_error_count == 0U);
+}
+
+static void test_stop_ack_before_superseded_velocity_ack_is_drained(void)
+{
+    UART_HandleTypeDef uart;
+    X42sDriver driver;
+    uint8_t responses[8] = {
+        X42S_DEFAULT_ADDRESS, 0xFEU, X42S_COMMAND_STATUS_ACCEPTED,
+        X42S_FIXED_CHECKSUM,
+        X42S_DEFAULT_ADDRESS, 0xF6U, X42S_COMMAND_STATUS_ACCEPTED,
+        X42S_FIXED_CHECKSUM
+    };
+
+    initialize(&driver, &uart);
+    g_drop_response = true;
+    assert(X42sDriver_RequestEmmVelocity(
+        &driver,
+        X42S_DEFAULT_ADDRESS,
+        0U,
+        1U,
+        100U,
+        false,
+        40U) == X42S_DRIVER_OK);
+    assert(X42sDriver_RequestStop(
+        &driver,
+        X42S_DEFAULT_ADDRESS,
+        false,
+        41U) == X42S_DRIVER_OK);
+    memcpy(driver.transport.rx_data, responses, sizeof(responses));
+    driver.transport.rx_length = sizeof(responses);
+    driver.transport.rx_offset = 0U;
+    X42sDriver_Service(&driver, 42U);
+
+    assert(X42sDriver_GetState(&driver) ==
+           X42S_DRIVER_STATE_COMMAND_VALID);
+    assert(X42sDriver_GetCommandFunction(&driver) == 0xFEU);
+    assert(driver.superseded_response_count == 1U);
+    assert(!driver.superseded_command_pending);
+    assert(driver.transport.rx_length == 0U);
+    assert(driver.protocol_error_count == 0U);
+}
+
+static void test_superseded_ack_is_kept_across_next_command(void)
+{
+    UART_HandleTypeDef uart;
+    X42sDriver driver;
+    static const uint8_t stop_response[4] = {
+        X42S_DEFAULT_ADDRESS, 0xFEU, X42S_COMMAND_STATUS_ACCEPTED,
+        X42S_FIXED_CHECKSUM
+    };
+    static const uint8_t delayed_and_current_responses[8] = {
+        X42S_DEFAULT_ADDRESS, 0xF6U, X42S_COMMAND_STATUS_ACCEPTED,
+        X42S_FIXED_CHECKSUM,
+        X42S_DEFAULT_ADDRESS, 0xF3U, X42S_COMMAND_STATUS_ACCEPTED,
+        X42S_FIXED_CHECKSUM
+    };
+
+    initialize(&driver, &uart);
+    g_drop_response = true;
+    assert(X42sDriver_RequestEmmVelocity(
+        &driver,
+        X42S_DEFAULT_ADDRESS,
+        0U,
+        1U,
+        100U,
+        false,
+        40U) == X42S_DRIVER_OK);
+    assert(X42sDriver_RequestStop(
+        &driver,
+        X42S_DEFAULT_ADDRESS,
+        false,
+        41U) == X42S_DRIVER_OK);
+    memcpy(driver.transport.rx_data, stop_response, sizeof(stop_response));
+    driver.transport.rx_length = sizeof(stop_response);
+    driver.transport.rx_offset = 0U;
+    X42sDriver_Service(&driver, 42U);
+    assert(driver.superseded_command_pending);
+
+    assert(X42sDriver_RequestEnable(
+        &driver,
+        X42S_DEFAULT_ADDRESS,
+        true,
+        false,
+        43U) == X42S_DRIVER_OK);
+    memcpy(driver.transport.rx_data,
+           delayed_and_current_responses,
+           sizeof(delayed_and_current_responses));
+    driver.transport.rx_length = sizeof(delayed_and_current_responses);
+    driver.transport.rx_offset = 0U;
+    X42sDriver_Service(&driver, 44U);
+
+    assert(X42sDriver_GetState(&driver) ==
+           X42S_DRIVER_STATE_COMMAND_VALID);
+    assert(X42sDriver_GetCommandFunction(&driver) == 0xF3U);
+    assert(driver.superseded_response_count == 1U);
+    assert(!driver.superseded_command_pending);
+    assert(driver.protocol_error_count == 0U);
+}
+
+static void test_missing_superseded_ack_expires(void)
+{
+    UART_HandleTypeDef uart;
+    X42sDriver driver;
+    static const uint8_t stop_response[4] = {
+        X42S_DEFAULT_ADDRESS, 0xFEU, X42S_COMMAND_STATUS_ACCEPTED,
+        X42S_FIXED_CHECKSUM
+    };
+
+    initialize(&driver, &uart);
+    g_drop_response = true;
+    assert(X42sDriver_RequestEmmVelocity(
+        &driver,
+        X42S_DEFAULT_ADDRESS,
+        0U,
+        1U,
+        100U,
+        false,
+        40U) == X42S_DRIVER_OK);
+    assert(X42sDriver_RequestStop(
+        &driver,
+        X42S_DEFAULT_ADDRESS,
+        false,
+        41U) == X42S_DRIVER_OK);
+    memcpy(driver.transport.rx_data, stop_response, sizeof(stop_response));
+    driver.transport.rx_length = sizeof(stop_response);
+    driver.transport.rx_offset = 0U;
+    X42sDriver_Service(&driver, 42U);
+    assert(driver.superseded_command_pending);
+
+    X42sDriver_Service(
+        &driver,
+        41U + X42S_DRIVER_COMMAND_TIMEOUT_MS);
+    assert(!driver.superseded_command_pending);
+    assert(driver.protocol_error_count == 0U);
+}
+
+static void test_corrupt_superseded_ack_remains_protocol_fault(void)
+{
+    UART_HandleTypeDef uart;
+    X42sDriver driver;
+    uint8_t corrupt_response[4] = {
+        X42S_DEFAULT_ADDRESS, 0xF6U, X42S_COMMAND_STATUS_ACCEPTED, 0x00U
+    };
+
+    initialize(&driver, &uart);
+    assert(X42sDriver_RequestEmmVelocity(
+        &driver,
+        X42S_DEFAULT_ADDRESS,
+        0U,
+        1U,
+        100U,
+        false,
+        40U) == X42S_DRIVER_OK);
+    g_drop_response = true;
+    assert(X42sDriver_RequestStop(
+        &driver,
+        X42S_DEFAULT_ADDRESS,
+        false,
+        41U) == X42S_DRIVER_OK);
+    memcpy(driver.transport.rx_data,
+           corrupt_response,
+           sizeof(corrupt_response));
+    driver.transport.rx_length = sizeof(corrupt_response);
+    driver.transport.rx_offset = 0U;
+    X42sDriver_Service(&driver, 42U);
+
+    assert(X42sDriver_GetState(&driver) ==
+           X42S_DRIVER_STATE_WAITING_FOR_COMMAND);
+    assert(driver.superseded_response_count == 0U);
+    assert(driver.protocol_error_count == 1U);
+}
+
+static void test_split_superseded_velocity_ack_is_not_protocol_fault(void)
+{
+    static const uint8_t old_response[4] = {
+        X42S_DEFAULT_ADDRESS, 0xF6U, X42S_COMMAND_STATUS_ACCEPTED,
+        X42S_FIXED_CHECKSUM
+    };
+    static const uint8_t stop_response[4] = {
+        X42S_DEFAULT_ADDRESS, 0xFEU, X42S_COMMAND_STATUS_ACCEPTED,
+        X42S_FIXED_CHECKSUM
+    };
+    uint8_t response_stream[7];
+    uint8_t split;
+
+    for (split = 1U; split < X42S_COMMAND_RESPONSE_SIZE; ++split)
+    {
+        UART_HandleTypeDef uart;
+        X42sDriver driver;
+
+        initialize(&driver, &uart);
+        g_drop_response = true;
+        assert(X42sDriver_RequestEmmVelocity(
+            &driver,
+            X42S_DEFAULT_ADDRESS,
+            0U,
+            1U,
+            100U,
+            false,
+            40U) == X42S_DRIVER_OK);
+        memcpy(driver.command_response_window, old_response, split);
+        driver.command_response_window_length = split;
+        assert(X42sDriver_RequestStop(
+            &driver,
+            X42S_DEFAULT_ADDRESS,
+            false,
+            41U) == X42S_DRIVER_OK);
+        memcpy(response_stream, old_response + split,
+               X42S_COMMAND_RESPONSE_SIZE - split);
+        memcpy(response_stream + X42S_COMMAND_RESPONSE_SIZE - split,
+               stop_response,
+               sizeof(stop_response));
+        memcpy(driver.transport.rx_data, response_stream,
+               sizeof(response_stream));
+        driver.transport.rx_length = sizeof(response_stream);
+        driver.transport.rx_offset = 0U;
+        X42sDriver_Service(&driver, 42U);
+
+        assert(X42sDriver_GetState(&driver) ==
+               X42S_DRIVER_STATE_COMMAND_VALID);
+        assert(X42sDriver_GetCommandFunction(&driver) == 0xFEU);
+        assert(driver.superseded_response_count == 1U);
+        assert(driver.protocol_error_count == 0U);
+    }
 }
 
 static void test_command_timeout_handles_tick_wrap(void)
@@ -199,7 +492,14 @@ int main(void)
 {
     test_enable_ack();
     test_position_command_and_error_status();
+    test_velocity_command_and_ack();
     test_stop_supersedes_pending_command();
+    test_late_superseded_velocity_ack_is_not_protocol_fault();
+    test_stop_ack_before_superseded_velocity_ack_is_drained();
+    test_superseded_ack_is_kept_across_next_command();
+    test_missing_superseded_ack_expires();
+    test_corrupt_superseded_ack_remains_protocol_fault();
+    test_split_superseded_velocity_ack_is_not_protocol_fault();
     test_command_timeout_handles_tick_wrap();
     puts("X42S_DRIVER_COMMAND_TEST=PASS");
     return 0;

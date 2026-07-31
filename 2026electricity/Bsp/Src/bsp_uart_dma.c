@@ -15,10 +15,15 @@
  * events report the same position.
  */
 
-_Static_assert((BSP_UART_DMA_RX_RING_SIZE & (BSP_UART_DMA_RX_RING_SIZE - 1U)) == 0U,
-               "RX ring size must be a power of two");
-_Static_assert((BSP_UART_DMA_TX_RING_SIZE & (BSP_UART_DMA_TX_RING_SIZE - 1U)) == 0U,
-               "TX ring size must be a power of two");
+#if (BSP_UART_DMA_RX_RING_SIZE == 0U) || \
+    ((BSP_UART_DMA_RX_RING_SIZE & (BSP_UART_DMA_RX_RING_SIZE - 1U)) != 0U)
+#error BSP_UART_DMA_RX_RING_SIZE_must_be_a_power_of_two
+#endif
+
+#if (BSP_UART_DMA_TX_RING_SIZE == 0U) || \
+    ((BSP_UART_DMA_TX_RING_SIZE & (BSP_UART_DMA_TX_RING_SIZE - 1U)) != 0U)
+#error BSP_UART_DMA_TX_RING_SIZE_must_be_a_power_of_two
+#endif
 
 static BspUartDmaPort *registered_ports[BSP_UART_DMA_MAX_PORTS];
 

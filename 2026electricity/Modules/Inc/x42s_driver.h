@@ -66,9 +66,11 @@ typedef struct
     X42sCommandStatus command_status;
     uint8_t command_query_address;
     uint8_t command_expected_function;
+    uint8_t superseded_command_function;
     uint8_t command_response_window[X42S_COMMAND_RESPONSE_SIZE];
     uint8_t command_response_window_length;
     uint32_t command_request_started_ms;
+    uint32_t superseded_command_started_ms;
 
     uint32_t address_request_count;
     uint32_t valid_address_response_count;
@@ -83,6 +85,8 @@ typedef struct
     uint32_t command_request_count;
     uint32_t valid_command_response_count;
     uint32_t command_timeout_count;
+    uint32_t superseded_response_count;
+    bool superseded_command_pending;
     bool initialized;
     bool started;
 } X42sDriver;
@@ -111,6 +115,15 @@ X42sDriverResult X42sDriver_RequestEnable(
     X42sDriver *driver,
     uint8_t address,
     bool enable,
+    bool synchronize,
+    uint32_t now_ms);
+
+X42sDriverResult X42sDriver_RequestEmmVelocity(
+    X42sDriver *driver,
+    uint8_t address,
+    uint8_t direction,
+    uint16_t speed_rpm,
+    uint8_t acceleration,
     bool synchronize,
     uint32_t now_ms);
 

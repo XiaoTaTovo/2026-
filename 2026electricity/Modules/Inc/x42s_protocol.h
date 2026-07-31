@@ -14,6 +14,7 @@
 #define X42S_READ_POSITION_REQUEST_SIZE 3U
 #define X42S_READ_POSITION_RESPONSE_SIZE 8U
 #define X42S_EMM_ENABLE_REQUEST_SIZE 6U
+#define X42S_EMM_VELOCITY_REQUEST_SIZE 8U
 #define X42S_EMM_POSITION_REQUEST_SIZE 13U
 #define X42S_STOP_REQUEST_SIZE 5U
 #define X42S_COMMAND_RESPONSE_SIZE 4U
@@ -84,6 +85,15 @@ X42sProtocolResult X42sProtocol_ParseReadPosition(
 X42sProtocolResult X42sProtocol_BuildEmmEnable(
     uint8_t address,
     bool enable,
+    bool synchronize,
+    uint8_t *frame,
+    size_t capacity);
+
+X42sProtocolResult X42sProtocol_BuildEmmVelocity(
+    uint8_t address,
+    uint8_t direction,
+    uint16_t speed_rpm,
+    uint8_t acceleration,
     bool synchronize,
     uint8_t *frame,
     size_t capacity);

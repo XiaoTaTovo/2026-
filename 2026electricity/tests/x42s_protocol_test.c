@@ -130,12 +130,15 @@ static void test_emm_motion_command_frames(void)
 {
     uint8_t enable[X42S_EMM_ENABLE_REQUEST_SIZE] = {0U};
     uint8_t disable[X42S_EMM_ENABLE_REQUEST_SIZE] = {0U};
+    uint8_t velocity[X42S_EMM_VELOCITY_REQUEST_SIZE] = {0U};
     uint8_t position[X42S_EMM_POSITION_REQUEST_SIZE] = {0U};
     uint8_t stop[X42S_STOP_REQUEST_SIZE] = {0U};
     const uint8_t expected_enable[X42S_EMM_ENABLE_REQUEST_SIZE] =
         {0x01U, 0xF3U, 0xABU, 0x01U, 0x00U, 0x6BU};
     const uint8_t expected_disable[X42S_EMM_ENABLE_REQUEST_SIZE] =
         {0x01U, 0xF3U, 0xABU, 0x00U, 0x00U, 0x6BU};
+    const uint8_t expected_velocity[X42S_EMM_VELOCITY_REQUEST_SIZE] =
+        {0x01U, 0xF6U, 0x01U, 0x00U, 0x3CU, 0x64U, 0x00U, 0x6BU};
     const uint8_t expected_position[X42S_EMM_POSITION_REQUEST_SIZE] =
         {0x01U, 0xFDU, 0x01U, 0x05U, 0xDCU, 0x00U, 0x00U,
          0x00U, 0x7DU, 0x00U, 0x00U, 0x00U, 0x6BU};
@@ -148,6 +151,17 @@ static void test_emm_motion_command_frames(void)
     assert(X42sProtocol_BuildEmmEnable(
                1U, false, false, disable, sizeof(disable)) == X42S_PROTOCOL_OK);
     assert(memcmp(disable, expected_disable, sizeof(disable)) == 0);
+
+    assert(X42sProtocol_BuildEmmVelocity(
+               1U, 1U, 60U, 100U, false, velocity, sizeof(velocity)) ==
+           X42S_PROTOCOL_OK);
+    assert(memcmp(velocity, expected_velocity, sizeof(velocity)) == 0);
+    assert(X42sProtocol_BuildEmmVelocity(
+               1U, 2U, 60U, 100U, false, velocity, sizeof(velocity)) ==
+           X42S_PROTOCOL_VALUE_OUT_OF_RANGE);
+    assert(X42sProtocol_BuildEmmVelocity(
+               1U, 0U, X42S_EMM_MAX_SPEED_RPM + 1U, 100U, false,
+               velocity, sizeof(velocity)) == X42S_PROTOCOL_VALUE_OUT_OF_RANGE);
 
     assert(X42sProtocol_BuildEmmPosition(
                1U, 1U, 1500U, 0U, 32000U, 0U, false,

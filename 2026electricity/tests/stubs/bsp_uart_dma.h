@@ -26,7 +26,11 @@ typedef struct
     uint8_t rx_data[32];
     size_t rx_length;
     size_t rx_offset;
+    uint32_t tx_bytes;
+    uint32_t rx_bytes;
     uint32_t uart_error_count;
+    uint32_t dma_start_error_count;
+    uint32_t last_hal_error;
     uint32_t rx_overflow_count;
     bool started;
 } BspUartDmaPort;
