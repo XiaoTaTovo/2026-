@@ -1,10 +1,11 @@
-"""Frozen H-problem ball observation protocol, version 2."""
+"""Fixed 20-byte UART observation frame for the MaixCAM ball tracker."""
 
 from __future__ import annotations
 
 import struct
 from dataclasses import dataclass
 from enum import IntEnum
+
 
 SOF = b"\xa5\x5a"
 VERSION = 2
@@ -88,7 +89,7 @@ class BallObservationPacket:
         reason: BallReason,
         capture_age_ms: int = UNKNOWN_CAPTURE_AGE_MS,
         confidence_permille: int = 0,
-    ) -> BallObservationPacket:
+    ) -> "BallObservationPacket":
         return cls(
             sequence=sequence,
             tx_uptime_ms=tx_uptime_ms,
@@ -116,7 +117,7 @@ class BallObservationPacket:
         return SOF + body + struct.pack("<H", crc16_modbus(body))
 
     @classmethod
-    def decode(cls, frame: bytes | bytearray | memoryview) -> BallObservationPacket:
+    def decode(cls, frame: bytes | bytearray | memoryview) -> "BallObservationPacket":
         data = bytes(frame)
         if len(data) != FRAME_LENGTH:
             raise ValueError("ball observation frame must be 20 bytes")
