@@ -5,7 +5,29 @@
 
 static bool valid_config(const PitchAxisVelocityTestConfig *config)
 {
-    return (config != NULL) &&
+    bool position_config_valid;
+
+    if (config == NULL)
+    {
+        return false;
+    }
+    position_config_valid = !config->automatic_position_tracking_enabled ||
+        ((config->automatic_position_raw_per_mm != 0U) &&
+         (config->automatic_tilt_scale_um_per_outer_rpm != 0U) &&
+         (config->automatic_tilt_limit_um != 0U) &&
+         (config->automatic_position_deadband_um != 0U) &&
+         (config->automatic_position_deadband_um <
+          config->automatic_tilt_limit_um) &&
+         (config->automatic_position_slow_zone_um >
+          config->automatic_position_deadband_um) &&
+         (config->automatic_position_slow_zone_um <=
+          config->automatic_tilt_limit_um) &&
+         (config->automatic_position_min_speed_rpm != 0U) &&
+         (config->automatic_position_min_speed_rpm <=
+          config->automatic_max_speed_rpm) &&
+         (config->automatic_position_poll_period_ms != 0U));
+
+    return
         (config->address != 0U) &&
         (config->positive_direction <= 1U) &&
         (config->negative_direction <= 1U) &&
@@ -22,11 +44,12 @@ static bool valid_config(const PitchAxisVelocityTestConfig *config)
          PITCH_AXIS_VELOCITY_TEST_HARD_MAX_VISION_LOSS_GRACE_MS) &&
         (!config->automatic_edge_recovery_enabled ||
          ((config->automatic_edge_recovery_speed_rpm != 0U) &&
-          (config->automatic_edge_recovery_speed_rpm <=
-           PITCH_AXIS_VELOCITY_TEST_HARD_AUTO_MAX_RPM) &&
-          (config->automatic_edge_recovery_max_ms != 0U) &&
-          (config->automatic_edge_recovery_max_ms <=
-           PITCH_AXIS_VELOCITY_TEST_HARD_MAX_EDGE_RECOVERY_MS)));
+           (config->automatic_edge_recovery_speed_rpm <=
+           PITCH_AXIS_VELOCITY_TEST_HARD_EDGE_RECOVERY_MAX_RPM) &&
+           (config->automatic_edge_recovery_max_ms != 0U) &&
+           (config->automatic_edge_recovery_max_ms <=
+            PITCH_AXIS_VELOCITY_TEST_HARD_MAX_EDGE_RECOVERY_MS))) &&
+        position_config_valid;
 }
 
 static bool time_elapsed(uint32_t now_ms, uint32_t start_ms, uint32_t delay_ms)
@@ -73,6 +96,10 @@ static void latch_fault_with_stop(
     PitchAxisVelocityTestFailure failure,
     uint32_t now_ms);
 
+static void request_automatic_position(
+    PitchAxisVelocityTest *test,
+    uint32_t now_ms);
+
 static bool arm_automatic_internal(
     PitchAxisVelocityTest *test,
     uint32_t now_ms);
@@ -109,6 +136,7 @@ static void disarm_automatic(
     test->report.automatic_armed = false;
     test->automatic_decision_pending = false;
     test->report.automatic_disarm_reason = reason;
+    test->automatic_position_target_dirty = false;
     clear_automatic_vision_loss(test);
     test->automatic_edge_recovery_available = false;
     if (!test->automatic_motion_segment_active)
@@ -132,6 +160,100 @@ static int64_t raw_position_to_signed(X42sRawPosition position)
     int64_t magnitude = (int64_t)position.magnitude;
 
     return position.negative ? -magnitude : magnitude;
+}
+
+static uint64_t absolute_i64(int64_t value)
+{
+    return (value < 0) ? (uint64_t)(-(value + 1)) + 1U : (uint64_t)value;
+}
+
+static int64_t micrometers_to_raw(
+    const PitchAxisVelocityTestConfig *config,
+    uint32_t micrometers)
+{
+    uint64_t scaled =
+        (uint64_t)micrometers * config->automatic_position_raw_per_mm;
+
+    return (int64_t)((scaled + 500U) / 1000U);
+}
+
+static bool direction_increases_raw(
+    const PitchAxisVelocityTestConfig *config,
+    uint8_t direction)
+{
+    return (direction == 0U) ?
+        config->automatic_direction0_increases_raw :
+        !config->automatic_direction0_increases_raw;
+}
+
+static void update_automatic_position_target(PitchAxisVelocityTest *test)
+{
+    int32_t effort_0_01rpm = test->automatic_decision.outer_control_0_01rpm;
+    uint32_t effort_magnitude_0_01rpm;
+    uint64_t requested_lift_um;
+    int64_t target_offset_raw;
+
+    effort_magnitude_0_01rpm = (effort_0_01rpm < 0) ?
+        (uint32_t)(-effort_0_01rpm) : (uint32_t)effort_0_01rpm;
+    requested_lift_um =
+        (uint64_t)effort_magnitude_0_01rpm *
+        test->config.automatic_tilt_scale_um_per_outer_rpm;
+    requested_lift_um = (requested_lift_um + 50U) / 100U;
+    if (requested_lift_um > test->config.automatic_tilt_limit_um)
+    {
+        requested_lift_um = test->config.automatic_tilt_limit_um;
+    }
+
+    target_offset_raw = micrometers_to_raw(
+        &test->config,
+        (uint32_t)requested_lift_um);
+    if ((target_offset_raw != 0) &&
+        !direction_increases_raw(
+            &test->config,
+            test->automatic_decision.motor_direction))
+    {
+        target_offset_raw = -target_offset_raw;
+    }
+
+    test->report.automatic_target_offset_raw = target_offset_raw;
+    test->report.automatic_target_position_raw =
+        test->report.automatic_zero_position_raw + target_offset_raw;
+    test->automatic_position_target_dirty = true;
+}
+
+static uint16_t automatic_position_speed(
+    const PitchAxisVelocityTest *test,
+    uint64_t error_raw)
+{
+    const PitchAxisVelocityTestConfig *config = &test->config;
+    uint64_t error_um =
+        (error_raw * 1000U + config->automatic_position_raw_per_mm / 2U) /
+        config->automatic_position_raw_per_mm;
+    uint32_t minimum_speed = config->automatic_position_min_speed_rpm;
+    uint32_t maximum_speed = config->automatic_max_speed_rpm;
+    uint32_t span_um =
+        config->automatic_position_slow_zone_um -
+        config->automatic_position_deadband_um;
+    uint32_t speed;
+
+    if (error_um >= config->automatic_position_slow_zone_um)
+    {
+        return (uint16_t)maximum_speed;
+    }
+    if (error_um <= config->automatic_position_deadband_um)
+    {
+        return 0U;
+    }
+
+    speed = minimum_speed +
+        (uint32_t)(((error_um - config->automatic_position_deadband_um) *
+                    (maximum_speed - minimum_speed) + span_um / 2U) /
+                   span_um);
+    if (speed > maximum_speed)
+    {
+        speed = maximum_speed;
+    }
+    return (uint16_t)speed;
 }
 
 static void queue_event(
@@ -216,6 +338,10 @@ static void finalize_fault(
     clear_automatic_vision_loss(test);
     test->automatic_edge_recovery_available = false;
     test->automatic_start_pending = false;
+    test->automatic_position_query_pending = false;
+    test->automatic_position_target_dirty = false;
+    test->automatic_zero_capture_pending = false;
+    test->automatic_stop_after_position_query = false;
     test->report.automatic_disarm_reason = PITCH_AUTOMATIC_DISARM_FAULT;
     test->automatic_decision_pending = false;
     test->report.fault_latched = true;
@@ -458,6 +584,14 @@ static void request_automatic_stop(
 {
     X42sDriverResult result;
 
+    /* Let an in-flight 0x36 reply finish before switching the single-response
+     * parser to the STOP ACK. The measured query path is normally a few ms. */
+    if (test->automatic_position_query_pending)
+    {
+        test->automatic_stop_after_position_query = true;
+        return;
+    }
+
     update_automatic_budget(test, now_ms);
     result = X42sDriver_RequestStop(
         test->driver,
@@ -474,6 +608,7 @@ static void request_automatic_stop(
     }
 
     test->automatic_motion_segment_active = false;
+    test->automatic_stop_after_position_query = false;
     test->report.automatic_motion_active = false;
     test->report.automatic_speed_rpm = 0U;
     test->report.last_command =
@@ -551,6 +686,150 @@ static bool automatic_motion_state(const PitchAxisVelocityTest *test)
     return test->report.velocity_command_active ||
            (test->report.state ==
             PITCH_VELOCITY_TEST_STATE_WAIT_AUTOMATIC_VELOCITY_ACK);
+}
+
+static bool automatic_command_pending(const PitchAxisVelocityTest *test)
+{
+    return (test->report.state ==
+            PITCH_VELOCITY_TEST_STATE_WAIT_AUTOMATIC_VELOCITY_ACK) ||
+           (test->report.state ==
+            PITCH_VELOCITY_TEST_STATE_WAIT_AUTOMATIC_STOP_ACK);
+}
+
+static void request_automatic_position(
+    PitchAxisVelocityTest *test,
+    uint32_t now_ms)
+{
+    X42sDriverResult result;
+
+    if (test->automatic_position_query_pending ||
+        automatic_command_pending(test))
+    {
+        return;
+    }
+
+    result = X42sDriver_RequestReadPosition(
+        test->driver,
+        test->config.address,
+        now_ms);
+    if (result == X42S_DRIVER_BUSY)
+    {
+        return;
+    }
+    if (result != X42S_DRIVER_OK)
+    {
+        latch_fault_with_stop(
+            test,
+            PITCH_VELOCITY_TEST_FAILURE_REQUEST,
+            now_ms);
+        return;
+    }
+
+    test->automatic_position_query_pending = true;
+    test->automatic_last_position_query_ms = now_ms;
+    test->report.automatic_position_query_count++;
+}
+
+static void service_automatic_position_tracking(
+    PitchAxisVelocityTest *test,
+    uint32_t now_ms)
+{
+    int64_t position_error;
+    int64_t position_offset;
+    int64_t position_limit_raw;
+    int64_t hard_margin_raw;
+    uint64_t error_magnitude;
+    uint16_t speed_rpm;
+    uint8_t direction;
+    bool motion_active = automatic_motion_state(test);
+    bool stop_pending = test->report.state ==
+        PITCH_VELOCITY_TEST_STATE_WAIT_AUTOMATIC_STOP_ACK;
+
+    if (!test->report.automatic_zero_valid)
+    {
+        latch_fault_with_stop(
+            test,
+            PITCH_VELOCITY_TEST_FAILURE_POSITION_TIMEOUT,
+            now_ms);
+        return;
+    }
+    if (test->report.automatic_position_valid)
+    {
+        test->report.automatic_position_age_ms =
+            now_ms - test->automatic_last_position_update_ms;
+    }
+    if (test->automatic_position_query_pending ||
+        automatic_command_pending(test))
+    {
+        return;
+    }
+    if (!test->report.automatic_position_valid ||
+        test->automatic_position_target_dirty ||
+        time_elapsed(
+            now_ms,
+            test->automatic_last_position_query_ms,
+            test->config.automatic_position_poll_period_ms))
+    {
+        request_automatic_position(test, now_ms);
+        return;
+    }
+
+    position_limit_raw = micrometers_to_raw(
+        &test->config,
+        test->config.automatic_tilt_limit_um);
+    hard_margin_raw = micrometers_to_raw(
+        &test->config,
+        test->config.automatic_position_slow_zone_um);
+    position_offset = test->report.automatic_position_raw -
+        test->report.automatic_zero_position_raw;
+    if (absolute_i64(position_offset) >
+        (uint64_t)(position_limit_raw + hard_margin_raw))
+    {
+        test->report.automatic_position_limit_count++;
+        latch_fault_with_stop(
+            test,
+            PITCH_VELOCITY_TEST_FAILURE_POSITION_LIMIT,
+            now_ms);
+        return;
+    }
+
+    position_error = test->report.automatic_target_position_raw -
+        test->report.automatic_position_raw;
+    test->report.automatic_position_error_raw = position_error;
+    error_magnitude = absolute_i64(position_error);
+    speed_rpm = automatic_position_speed(test, error_magnitude);
+    if (speed_rpm == 0U)
+    {
+        if (motion_active && !stop_pending)
+        {
+            request_automatic_stop(test, now_ms);
+        }
+        return;
+    }
+
+    direction = ((position_error > 0) ==
+                 test->config.automatic_direction0_increases_raw) ? 0U : 1U;
+    test->automatic_decision.motion_requested = true;
+    test->automatic_decision.motor_direction = direction;
+    test->automatic_decision.speed_rpm = speed_rpm;
+
+    if (test->report.state == PITCH_VELOCITY_TEST_STATE_ENABLED_STOPPED)
+    {
+        request_automatic_velocity(test, now_ms);
+        return;
+    }
+    if (test->report.state != PITCH_VELOCITY_TEST_STATE_RUNNING_AUTOMATIC)
+    {
+        return;
+    }
+    if (test->report.automatic_direction != direction)
+    {
+        request_automatic_stop(test, now_ms);
+    }
+    else if (test->report.automatic_speed_rpm != speed_rpm)
+    {
+        request_automatic_velocity(test, now_ms);
+    }
 }
 
 static void request_edge_recovery(
@@ -671,7 +950,8 @@ static void service_automatic_control(
             test->automatic_decision_pending = false;
             if ((test->report.automatic_vision_loss_age_ms >=
                  test->config.automatic_vision_loss_grace_ms) &&
-                !(test->config.automatic_edge_recovery_enabled &&
+                !(!test->config.automatic_position_tracking_enabled &&
+                  test->config.automatic_edge_recovery_enabled &&
                   test->automatic_edge_recovery_available))
             {
                 disarm_automatic(test, reason);
@@ -715,7 +995,8 @@ static void service_automatic_control(
             now_ms - test->automatic_vision_loss_started_ms;
         if ((test->report.automatic_vision_loss_age_ms >=
              test->config.automatic_vision_loss_grace_ms) &&
-            !(test->config.automatic_edge_recovery_enabled &&
+            !(!test->config.automatic_position_tracking_enabled &&
+              test->config.automatic_edge_recovery_enabled &&
               test->automatic_edge_recovery_available))
         {
             disarm_automatic(test, reason);
@@ -725,7 +1006,8 @@ static void service_automatic_control(
             }
             return;
         }
-        if (service_edge_recovery(
+        if (!test->config.automatic_position_tracking_enabled &&
+            service_edge_recovery(
                 test,
                 now_ms,
                 motion_active,
@@ -734,6 +1016,14 @@ static void service_automatic_control(
             return;
         }
         return;
+    }
+
+    if (test->automatic_decision_pending &&
+        test->automatic_decision.source_safe &&
+        test->config.automatic_position_tracking_enabled)
+    {
+        update_automatic_position_target(test);
+        test->automatic_decision_pending = false;
     }
 
     if (time_elapsed(
@@ -748,6 +1038,12 @@ static void service_automatic_control(
         {
             request_automatic_stop(test, now_ms);
         }
+        return;
+    }
+
+    if (test->config.automatic_position_tracking_enabled)
+    {
+        service_automatic_position_tracking(test, now_ms);
         return;
     }
 
@@ -924,6 +1220,59 @@ static void process_position_response(
 {
     X42sDriverState driver_state = X42sDriver_GetState(test->driver);
     int64_t position;
+
+    if (test->automatic_position_query_pending)
+    {
+        if (driver_state == X42S_DRIVER_STATE_POSITION_TIMEOUT)
+        {
+            test->automatic_position_query_pending = false;
+            test->report.timeout_count++;
+            latch_fault_with_stop(
+                test,
+                PITCH_VELOCITY_TEST_FAILURE_POSITION_TIMEOUT,
+                now_ms);
+            return;
+        }
+        if (driver_state != X42S_DRIVER_STATE_POSITION_VALID)
+        {
+            return;
+        }
+
+        position = raw_position_to_signed(X42sDriver_GetPosition(test->driver));
+        test->automatic_position_query_pending = false;
+        test->automatic_last_position_update_ms = now_ms;
+        test->report.automatic_position_valid = true;
+        test->report.automatic_position_raw = position;
+        test->report.automatic_position_age_ms = 0U;
+        test->report.automatic_position_error_raw =
+            test->report.automatic_target_position_raw - position;
+        test->automatic_position_target_dirty = false;
+
+        if (test->automatic_zero_capture_pending)
+        {
+            test->automatic_zero_capture_pending = false;
+            test->report.automatic_zero_valid = true;
+            test->report.automatic_zero_position_raw = position;
+            test->report.automatic_target_position_raw = position;
+            test->report.automatic_target_offset_raw = 0;
+            test->report.automatic_position_error_raw = 0;
+            queue_event(
+                test,
+                PITCH_VELOCITY_TEST_EVENT_POSITION_ZERO,
+                0U,
+                PITCH_VELOCITY_TEST_COMMAND_NONE,
+                0U,
+                position);
+        }
+        if (test->automatic_stop_after_position_query &&
+            automatic_motion_state(test) &&
+            (test->report.state !=
+             PITCH_VELOCITY_TEST_STATE_WAIT_AUTOMATIC_STOP_ACK))
+        {
+            request_automatic_stop(test, now_ms);
+        }
+        return;
+    }
 
     if (driver_state == X42S_DRIVER_STATE_POSITION_TIMEOUT)
     {
@@ -1158,6 +1507,8 @@ bool PitchAxisVelocityTest_SetAutomaticArmed(
     }
     if (test->report.automatic_hold ||
         !test->report.enabled ||
+        (test->config.automatic_position_tracking_enabled &&
+         !test->report.automatic_zero_valid) ||
         (test->report.state != PITCH_VELOCITY_TEST_STATE_ENABLED_STOPPED))
     {
         return false;
@@ -1172,6 +1523,8 @@ static bool arm_automatic_internal(
 {
     if ((test == NULL) || test->report.automatic_armed ||
         test->report.automatic_hold || !test->report.enabled ||
+        (test->config.automatic_position_tracking_enabled &&
+         !test->report.automatic_zero_valid) ||
         (test->report.state != PITCH_VELOCITY_TEST_STATE_ENABLED_STOPPED))
     {
         return false;
@@ -1185,6 +1538,13 @@ static bool arm_automatic_internal(
     test->report.automatic_budget_used_ms = 0U;
     test->automatic_motion_segment_active = false;
     test->report.automatic_motion_active = false;
+    if (test->config.automatic_position_tracking_enabled)
+    {
+        test->report.automatic_target_offset_raw = 0;
+        test->report.automatic_target_position_raw =
+            test->report.automatic_zero_position_raw;
+        test->automatic_position_target_dirty = true;
+    }
     clear_automatic_vision_loss(test);
     test->automatic_edge_recovery_available = false;
     queue_event(
@@ -1216,6 +1576,28 @@ bool PitchAxisVelocityTest_ClearAutomaticHold(
             PITCH_VELOCITY_TEST_COMMAND_NONE,
             0U,
             0);
+    }
+    return true;
+}
+
+bool PitchAxisVelocityTest_CaptureAutomaticZero(
+    PitchAxisVelocityTest *test,
+    uint32_t now_ms)
+{
+    if ((test == NULL) || !test->initialized || test->report.fault_latched ||
+        test->report.automatic_armed || automatic_motion_state(test) ||
+        (test->report.state != PITCH_VELOCITY_TEST_STATE_ENABLED_STOPPED) ||
+        test->automatic_position_query_pending)
+    {
+        return false;
+    }
+
+    test->automatic_zero_capture_pending = true;
+    request_automatic_position(test, now_ms);
+    if (!test->automatic_position_query_pending)
+    {
+        test->automatic_zero_capture_pending = false;
+        return false;
     }
     return true;
 }
@@ -1274,7 +1656,13 @@ bool PitchAxisVelocityTest_UpdateConfig(
         (config->speed_rpm != test->config.speed_rpm) ||
         (config->run_ms != test->config.run_ms) ||
         (config->synchronize != test->config.synchronize) ||
-        (config->debounce_ms != test->config.debounce_ms);
+        (config->debounce_ms != test->config.debounce_ms) ||
+        (config->automatic_position_tracking_enabled !=
+         test->config.automatic_position_tracking_enabled) ||
+        (config->automatic_direction0_increases_raw !=
+         test->config.automatic_direction0_increases_raw) ||
+        (config->automatic_position_raw_per_mm !=
+         test->config.automatic_position_raw_per_mm);
     busy = test->report.automatic_armed || automatic_motion_state(test) ||
         ((test->report.state != PITCH_VELOCITY_TEST_STATE_DISABLED_READY) &&
          (test->report.state != PITCH_VELOCITY_TEST_STATE_ENABLED_STOPPED) &&
@@ -1285,6 +1673,10 @@ bool PitchAxisVelocityTest_UpdateConfig(
     }
 
     test->config = *config;
+    if (config->automatic_position_tracking_enabled)
+    {
+        test->automatic_position_target_dirty = true;
+    }
     return true;
 }
 
@@ -1365,6 +1757,21 @@ void PitchAxisVelocityTest_SetCommunicationResult(
     test->rx_overflow_baseline = test->driver->transport.rx_overflow_count;
     test->report.communication_ready = true;
     test->report.state = PITCH_VELOCITY_TEST_STATE_DISABLED_READY;
+    if (test->config.automatic_position_tracking_enabled)
+    {
+        int64_t position = raw_position_to_signed(
+            X42sDriver_GetPosition(test->driver));
+
+        test->report.automatic_zero_valid = true;
+        test->report.automatic_position_valid = true;
+        test->report.automatic_zero_position_raw = position;
+        test->report.automatic_position_raw = position;
+        test->report.automatic_target_position_raw = position;
+        test->report.automatic_target_offset_raw = 0;
+        test->report.automatic_position_error_raw = 0;
+        test->automatic_last_position_query_ms = now_ms;
+        test->automatic_last_position_update_ms = now_ms;
+    }
     queue_event(
         test,
         PITCH_VELOCITY_TEST_EVENT_READY,
@@ -1474,10 +1881,11 @@ void PitchAxisVelocityTest_Service(
     {
         process_command_response(test, now_ms);
     }
-    else if ((test->report.state ==
-              PITCH_VELOCITY_TEST_STATE_WAIT_POSITION_BEFORE) ||
+    else if (test->automatic_position_query_pending ||
              (test->report.state ==
-              PITCH_VELOCITY_TEST_STATE_WAIT_POSITION_AFTER))
+               PITCH_VELOCITY_TEST_STATE_WAIT_POSITION_BEFORE) ||
+             (test->report.state ==
+               PITCH_VELOCITY_TEST_STATE_WAIT_POSITION_AFTER))
     {
         process_position_response(test, now_ms);
     }
