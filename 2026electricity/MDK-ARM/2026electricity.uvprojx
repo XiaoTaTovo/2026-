@@ -525,6 +525,11 @@
               <FilePath>../Modules/Src/ball_observation_protocol.c</FilePath>
             </File>
             <File>
+              <FileName>chassis_feedforward_protocol.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Modules/Src/chassis_feedforward_protocol.c</FilePath>
+            </File>
+            <File>
               <FileName>as5600.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Modules/Src/as5600.c</FilePath>
