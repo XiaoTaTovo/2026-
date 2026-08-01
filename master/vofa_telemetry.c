@@ -1,5 +1,6 @@
 #include "vofa_telemetry.h"
 
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -299,6 +300,32 @@ static bool VofaTelemetry_IsStopped(const CarFirmware *firmware)
            !firmware->drive_active && !firmware->output.motor.enable;
 }
 
+typedef struct {
+    const char *name;
+    size_t car_config_offset;
+    float minimum;
+    float maximum;
+    bool reset_line_controller;
+} VofaLineParameter;
+
+static const VofaLineParameter g_line_parameters[] = {
+    {"LINEKP", offsetof(CarConfig, line_kp), 0.0f, 0.5f, true},
+    {"LINEKD", offsetof(CarConfig, line_kd), 0.0f, 0.05f, true},
+    {"LINETAU", offsetof(CarConfig, line_derivative_filter_tau_s),
+     0.0f, 0.3f, true},
+    {"ARCTRKMM", offsetof(CarConfig, arc_effective_track_width_mm),
+     80.0f, 220.0f, false},
+    {"ARCLIM", offsetof(CarConfig, arc_line_max_correction_mm_s),
+     0.0f, 150.0f, true},
+    {"ARCSPD", offsetof(CarConfig, arc_speed_mm_s), 80.0f, 350.0f, false},
+    {"STRSPD", offsetof(CarConfig, straight_speed_mm_s), 80.0f, 350.0f,
+     false},
+    {"ACCEL", offsetof(CarConfig, track_wheel_accel_limit_mm_s2),
+     100.0f, 3000.0f, false},
+    {"SEARCHMM", offsetof(CarConfig, required_line_search_mm),
+     10.0f, 500.0f, false}
+};
+
 static void VofaTelemetry_SendError(const char *reason)
 {
     char line[96];
@@ -327,7 +354,7 @@ static void VofaTelemetry_SendOk(const char *name)
 static void VofaTelemetry_SendParams(const CarFirmware *firmware)
 {
     TB6612SpeedLoopConfig speed = {0};
-    char line[192];
+    char line[384];
     VofaTelemetryWriter writer = VofaTelemetry_BeginWrite(
         line, (uint16_t)sizeof(line));
 
@@ -348,6 +375,38 @@ static void VofaTelemetry_SendParams(const CarFirmware *firmware)
     VofaTelemetry_AppendSigned(
         &writer, VofaTelemetry_RoundFloat(
                      firmware->app.config.line_kp * 1000000.0f));
+    VofaTelemetry_AppendText(&writer, " LINEKD_X1E6=");
+    VofaTelemetry_AppendSigned(
+        &writer, VofaTelemetry_RoundFloat(
+                     firmware->app.config.line_kd * 1000000.0f));
+    VofaTelemetry_AppendText(&writer, " LINETAU_MS=");
+    VofaTelemetry_AppendSigned(
+        &writer, VofaTelemetry_RoundFloat(
+                     firmware->app.config.line_derivative_filter_tau_s *
+                     1000.0f));
+    VofaTelemetry_AppendText(&writer, " ARCTRKMM_X10=");
+    VofaTelemetry_AppendSigned(
+        &writer, VofaTelemetry_RoundFloat(
+                     firmware->app.config.arc_effective_track_width_mm *
+                     10.0f));
+    VofaTelemetry_AppendText(&writer, " ARCLIM_X10=");
+    VofaTelemetry_AppendSigned(
+        &writer, VofaTelemetry_RoundFloat(
+                     firmware->app.config.arc_line_max_correction_mm_s *
+                     10.0f));
+    VofaTelemetry_AppendText(&writer, " ARCSPD_X10=");
+    VofaTelemetry_AppendSigned(
+        &writer, VofaTelemetry_RoundFloat(
+                     firmware->app.config.arc_speed_mm_s * 10.0f));
+    VofaTelemetry_AppendText(&writer, " STRSPD_X10=");
+    VofaTelemetry_AppendSigned(
+        &writer, VofaTelemetry_RoundFloat(
+                     firmware->app.config.straight_speed_mm_s * 10.0f));
+    VofaTelemetry_AppendText(&writer, " ACCEL_X10=");
+    VofaTelemetry_AppendSigned(
+        &writer, VofaTelemetry_RoundFloat(
+                     firmware->app.config.track_wheel_accel_limit_mm_s2 *
+                     10.0f));
     VofaTelemetry_AppendText(&writer, " SEARCHMM_X10=");
     VofaTelemetry_AppendSigned(
         &writer, VofaTelemetry_RoundFloat(
@@ -362,8 +421,46 @@ static void VofaTelemetry_ResetLineController(CarFirmware *firmware,
 {
     firmware->app.executor.line_integral = 0.0f;
     firmware->app.executor.line_previous_error = 0.0f;
+    firmware->app.executor.line_derivative_filtered = 0.0f;
     firmware->app.executor.line_previous_ms = now_ms;
+    firmware->app.executor.line_derivative_initialized = false;
     firmware->app.executor.line_correction_mm_s = 0.0f;
+}
+
+static bool VofaTelemetry_UpdateLineParameter(CarFirmware *firmware,
+                                              const char *command,
+                                              const char *argument,
+                                              uint32_t now_ms)
+{
+    const VofaLineParameter *parameter = 0;
+    float value;
+    size_t index;
+
+    for (index = 0U;
+         index < (sizeof(g_line_parameters) / sizeof(g_line_parameters[0]));
+         index++) {
+        if (strcmp(command, g_line_parameters[index].name) == 0) {
+            parameter = &g_line_parameters[index];
+            break;
+        }
+    }
+    if (parameter == 0) {
+        return false;
+    }
+    if (!VofaTelemetry_ParseFloat(argument, parameter->minimum,
+                                  parameter->maximum, &value)) {
+        VofaTelemetry_SendError("PARAMETER_RANGE");
+        return true;
+    }
+    *(float *)((uint8_t *)&firmware->config.car +
+               parameter->car_config_offset) = value;
+    *(float *)((uint8_t *)&firmware->app.config +
+               parameter->car_config_offset) = value;
+    if (parameter->reset_line_controller) {
+        VofaTelemetry_ResetLineController(firmware, now_ms);
+    }
+    VofaTelemetry_SendOk(command);
+    return true;
 }
 
 static bool VofaTelemetry_UpdateSpeedParameter(CarFirmware *firmware,
@@ -413,7 +510,6 @@ static bool VofaTelemetry_ExecuteCommand(CarFirmware *firmware,
 {
     char *command = g_command;
     char *argument;
-    float value;
 
     while ((*command == ' ') || (*command == '\t')) {
         command++;
@@ -434,8 +530,8 @@ static bool VofaTelemetry_ExecuteCommand(CarFirmware *firmware,
     }
     if (strcmp(command, "HELP") == 0) {
         VofaTelemetry_SendText(
-            "#HELP STOP PARAMS SPDKP SPDKI SPDKD SPDLIMIT LINEKP "
-            "SEARCHMM HELP\r\n");
+            "#HELP STOP PARAMS SPDKP SPDKI SPDKD SPDLIMIT LINEKP LINEKD "
+            "LINETAU ARCTRKMM ARCLIM ARCSPD STRSPD ACCEL SEARCHMM HELP\r\n");
         return true;
     }
     if (!VofaTelemetry_IsStopped(firmware)) {
@@ -449,25 +545,8 @@ static bool VofaTelemetry_ExecuteCommand(CarFirmware *firmware,
         return VofaTelemetry_UpdateSpeedParameter(firmware, command,
                                                   argument);
     }
-    if (strcmp(command, "LINEKP") == 0) {
-        if (!VofaTelemetry_ParseFloat(argument, 0.0f, 0.5f, &value)) {
-            VofaTelemetry_SendError("LINEKP_RANGE_0_TO_0.5");
-            return true;
-        }
-        firmware->config.car.line_kp = value;
-        firmware->app.config.line_kp = value;
-        VofaTelemetry_ResetLineController(firmware, now_ms);
-        VofaTelemetry_SendOk("LINEKP");
-        return true;
-    }
-    if (strcmp(command, "SEARCHMM") == 0) {
-        if (!VofaTelemetry_ParseFloat(argument, 10.0f, 500.0f, &value)) {
-            VofaTelemetry_SendError("SEARCHMM_RANGE_10_TO_500");
-            return true;
-        }
-        firmware->config.car.required_line_search_mm = value;
-        firmware->app.config.required_line_search_mm = value;
-        VofaTelemetry_SendOk("SEARCHMM_NEXT_ARM");
+    if (VofaTelemetry_UpdateLineParameter(firmware, command, argument,
+                                          now_ms)) {
         return true;
     }
 
@@ -626,6 +705,60 @@ void VofaTelemetry_SendSpeedLoopDone(uint32_t trial_id,
     VofaTelemetry_AppendUnsigned(&writer, faults);
     VofaTelemetry_AppendChar(&writer, '\r');
     VofaTelemetry_AppendChar(&writer, '\n');
+    (void)VofaTelemetry_EnqueueWriter(&writer);
+}
+
+void VofaTelemetry_SendLineTrialArm(uint32_t trial_id,
+                                    uint32_t uptime_ms)
+{
+    char line[96];
+    VofaTelemetryWriter writer = VofaTelemetry_BeginWrite(
+        line, (uint16_t)sizeof(line));
+
+    VofaTelemetry_AppendText(&writer, "#EVT ARM ");
+    VofaTelemetry_AppendUnsigned(&writer, trial_id);
+    VofaTelemetry_AppendText(&writer, " LINE B2 ");
+    VofaTelemetry_AppendUnsigned(&writer, uptime_ms);
+    VofaTelemetry_AppendText(&writer, "\r\n");
+    (void)VofaTelemetry_EnqueueWriter(&writer);
+}
+
+void VofaTelemetry_SendLineTrialDone(uint32_t trial_id,
+                                     uint32_t duration_ms,
+                                     uint32_t faults,
+                                     uint32_t exit_reason)
+{
+    char line[112];
+    VofaTelemetryWriter writer = VofaTelemetry_BeginWrite(
+        line, (uint16_t)sizeof(line));
+
+    VofaTelemetry_AppendText(&writer, "#EVT DONE ");
+    VofaTelemetry_AppendUnsigned(&writer, trial_id);
+    VofaTelemetry_AppendText(&writer, " LINE ");
+    VofaTelemetry_AppendUnsigned(&writer, duration_ms);
+    VofaTelemetry_AppendChar(&writer, ' ');
+    VofaTelemetry_AppendUnsigned(&writer, exit_reason);
+    VofaTelemetry_AppendChar(&writer, ' ');
+    VofaTelemetry_AppendUnsigned(&writer, faults);
+    VofaTelemetry_AppendText(&writer, "\r\n");
+    (void)VofaTelemetry_EnqueueWriter(&writer);
+}
+
+void VofaTelemetry_SendLineTrialReject(uint32_t action,
+                                       int32_t status,
+                                       uint32_t uptime_ms)
+{
+    char line[96];
+    VofaTelemetryWriter writer = VofaTelemetry_BeginWrite(
+        line, (uint16_t)sizeof(line));
+
+    VofaTelemetry_AppendText(&writer, "#EVT REJECT ");
+    VofaTelemetry_AppendUnsigned(&writer, action);
+    VofaTelemetry_AppendChar(&writer, ' ');
+    VofaTelemetry_AppendSigned(&writer, status);
+    VofaTelemetry_AppendChar(&writer, ' ');
+    VofaTelemetry_AppendUnsigned(&writer, uptime_ms);
+    VofaTelemetry_AppendText(&writer, "\r\n");
     (void)VofaTelemetry_EnqueueWriter(&writer);
 }
 

@@ -3,14 +3,14 @@
 
 /* Select exactly one eight-channel line sensor implementation per build. */
 #ifndef H2026_TRACK_SENSOR_SOURCE
-#define H2026_TRACK_SENSOR_SOURCE CAR_TRACK_SENSOR_RED_ARRAY
+#define H2026_TRACK_SENSOR_SOURCE CAR_TRACK_SENSOR_GRAY_ARRAY
 #endif
 
 /* Chassis measurements. Re-measure after changing wheels or encoders. */
 #define H2026_WHEEL_DIAMETER_MM (65.0f)
 #define H2026_TRACK_WIDTH_MM (120.0f)
 #define H2026_ENCODER_COUNTS_PER_WHEEL_REV (724.0f)
-#define H2026_ARC_EFFECTIVE_TRACK_WIDTH_MM (160.0f)
+#define H2026_ARC_EFFECTIVE_TRACK_WIDTH_MM (140.0f)
 
 /* TB6612 inner wheel-speed loop, 50 ms. */
 #define H2026_SPEED_LOOP_PERIOD_MS (50U)
