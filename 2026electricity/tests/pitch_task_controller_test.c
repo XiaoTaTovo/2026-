@@ -8,6 +8,7 @@
 
 static PitchAxisVisionConfig g_vision_config;
 static PitchAxisVisionReport g_vision_report;
+static PitchAxisVelocityTestConfig g_velocity_config;
 static PitchAxisVelocityTestReport g_velocity_report;
 static uint32_t g_reset_count;
 static uint32_t g_arm_count;
@@ -59,6 +60,24 @@ bool PitchAxisVelocityTest_GetReport(
     return true;
 }
 
+bool PitchAxisVelocityTest_GetConfig(
+    const PitchAxisVelocityTest *test,
+    PitchAxisVelocityTestConfig *config)
+{
+    (void)test;
+    *config = g_velocity_config;
+    return true;
+}
+
+bool PitchAxisVelocityTest_UpdateConfig(
+    PitchAxisVelocityTest *test,
+    const PitchAxisVelocityTestConfig *config)
+{
+    (void)test;
+    g_velocity_config = *config;
+    return true;
+}
+
 bool PitchAxisVelocityTest_SetAutomaticArmed(
     PitchAxisVelocityTest *test,
     bool armed,
@@ -85,6 +104,8 @@ static void reset_fakes(void)
     g_vision_config.maximum_safe_position_0_1mm = 1250;
     memset(&g_vision_report, 0, sizeof(g_vision_report));
     memset(&g_velocity_report, 0, sizeof(g_velocity_report));
+    memset(&g_velocity_config, 0, sizeof(g_velocity_config));
+    g_velocity_config.automatic_tilt_limit_um = 3900U;
     g_velocity_report.enabled = true;
     g_velocity_report.communication_ready = true;
     g_velocity_report.state = PITCH_VELOCITY_TEST_STATE_ENABLED_STOPPED;
@@ -120,7 +141,7 @@ static void test_task3_and_switch_safely(void)
 {
     PitchTaskController controller;
     PitchTaskControllerConfig config = {
-        -50, 500U, 100U, 100U, 100U, 30U
+        -50, 500U, 100U, 100U, 100U, 3900U, 4000U, 30U
     };
     PitchTaskControllerReport report;
     PitchAxisVisionControl vision;
@@ -134,6 +155,7 @@ static void test_task3_and_switch_safely(void)
     press_key(&controller, 1U, 2U);
     assert(PitchTaskController_GetReport(&controller, &report));
     assert(report.selected_task == PITCH_TASK_3);
+    assert(g_velocity_config.automatic_tilt_limit_um == 4000U);
 
     press_key(&controller, 120U, 1U);
     assert(PitchTaskController_GetReport(&controller, &report));
@@ -171,13 +193,47 @@ static void test_task3_and_switch_safely(void)
     assert(report.selected_task == PITCH_TASK_4);
     assert(!g_velocity_report.automatic_armed);
     assert(g_reset_count > 0U);
+    assert(g_velocity_config.automatic_tilt_limit_um == 3900U);
+}
+
+static void test_start_waits_for_task_switch_stop(void)
+{
+    PitchTaskController controller;
+    PitchTaskControllerConfig config = {
+        -50, 500U, 100U, 100U, 100U, 3900U, 4000U, 30U
+    };
+    PitchTaskControllerReport report;
+    PitchAxisVisionControl vision;
+    PitchAxisVelocityTest velocity;
+
+    reset_fakes();
+    assert(PitchTaskController_Init(
+        &controller, &vision, &velocity, &config, 0U));
+    g_velocity_report.automatic_armed = true;
+    g_velocity_report.state = PITCH_VELOCITY_TEST_STATE_RUNNING_AUTOMATIC;
+
+    press_key(&controller, 1U, 2U);
+    assert(PitchTaskController_GetReport(&controller, &report));
+    assert(report.selected_task == PITCH_TASK_3);
+
+    press_key(&controller, 100U, 1U);
+    assert(PitchTaskController_GetReport(&controller, &report));
+    assert(report.state == PITCH_TASK_STATE_IDLE);
+
+    g_velocity_report.automatic_armed = false;
+    g_velocity_report.state = PITCH_VELOCITY_TEST_STATE_ENABLED_STOPPED;
+    service(&controller, 220U, false, false, false);
+    assert(PitchTaskController_GetReport(&controller, &report));
+    assert(report.state == PITCH_TASK_STATE_STARTING);
+    assert(g_velocity_report.automatic_armed);
+    assert(g_vision_config.target_position_0_1mm == 450);
 }
 
 static void test_task6_captures_latest_coordinate(void)
 {
     PitchTaskController controller;
     PitchTaskControllerConfig config = {
-        -50, 500U, 100U, 100U, 100U, 30U
+        -50, 500U, 100U, 100U, 100U, 3900U, 4000U, 30U
     };
     PitchTaskControllerReport report;
     PitchAxisVisionControl vision;
@@ -214,6 +270,7 @@ static void test_task6_captures_latest_coordinate(void)
 int main(void)
 {
     test_task3_and_switch_safely();
+    test_start_waits_for_task_switch_stop();
     test_task6_captures_latest_coordinate();
     puts("PITCH_TASK_CONTROLLER_TEST=PASS");
     return 0;

@@ -131,6 +131,13 @@ static void test_failure_reason_is_reported(void)
     driver.transport.tx_bytes = 3U;
     driver.status_request_count = 1U;
     driver.status_timeout_count = 1U;
+    driver.state = X42S_DRIVER_STATE_WAITING_FOR_STATUS;
+    driver.last_protocol_result = X42S_PROTOCOL_INVALID_CHECKSUM;
+    driver.status_response_window_length = X42S_READ_STATUS_RESPONSE_SIZE;
+    driver.status_response_window[0] = 0x01U;
+    driver.status_response_window[1] = 0x3AU;
+    driver.status_response_window[2] = 0x03U;
+    driver.status_response_window[3] = 0x00U;
 
     reset_output();
     assert(PitchAxisSelfTestTelemetry_Init(
@@ -145,6 +152,10 @@ static void test_failure_reason_is_reported(void)
         g_output,
         "PITCH_X42_UART,tx=3,rx=0,dma_start_errors=0,uart_errors=0,"
         "hal=0x00000000,status_requests=1,status_timeouts=1\r\n") != NULL);
+    assert(strstr(
+        g_output,
+        "PITCH_X42_WINDOW,state=5,last_proto=10,status_len=4,status=013A0300,"
+        "position_len=0,position=0000000000000000\r\n") != NULL);
     assert(strstr(g_output, "PITCH_COMMUNICATION_GATE=FAIL\r\n") != NULL);
 }
 

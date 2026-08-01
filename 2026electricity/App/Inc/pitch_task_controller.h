@@ -35,6 +35,8 @@ typedef struct
     uint16_t task3_tolerance_0_1mm;
     uint16_t task3_velocity_limit_0_1mm_s;
     uint32_t task3_turnaround_dwell_ms;
+    uint16_t position_hold_tilt_limit_um;
+    uint16_t task3_tilt_limit_um;
     uint32_t button_debounce_ms;
 } PitchTaskControllerConfig;
 
@@ -71,6 +73,7 @@ typedef struct
     PitchTaskButtonDebouncer buttons[3];
     uint32_t state_since_ms;
     uint32_t target_window_since_ms;
+    bool start_pending;
     bool initialized;
 } PitchTaskController;
 

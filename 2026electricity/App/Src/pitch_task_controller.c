@@ -21,6 +21,8 @@ static bool valid_config(const PitchTaskControllerConfig *config)
         (config->task3_tolerance_0_1mm <= config->task3_offset_0_1mm) &&
         (config->task3_velocity_limit_0_1mm_s > 0U) &&
         (config->task3_turnaround_dwell_ms <= 5000U) &&
+        (config->position_hold_tilt_limit_um > 0U) &&
+        (config->task3_tilt_limit_um > 0U) &&
         (config->button_debounce_ms <= 500U);
 }
 
@@ -151,6 +153,26 @@ static bool disarm_and_reset(
     return ok;
 }
 
+static bool apply_selected_task_velocity_config(
+    PitchTaskController *controller)
+{
+    PitchAxisVelocityTestConfig velocity_config;
+
+    if (!PitchAxisVelocityTest_GetConfig(
+            controller->velocity,
+            &velocity_config))
+    {
+        return false;
+    }
+    velocity_config.automatic_tilt_limit_um =
+        (controller->report.selected_task == PITCH_TASK_3) ?
+        controller->config.task3_tilt_limit_um :
+        controller->config.position_hold_tilt_limit_um;
+    return PitchAxisVelocityTest_UpdateConfig(
+        controller->velocity,
+        &velocity_config);
+}
+
 static bool task_is_center_hold(PitchTaskId task)
 {
     return (task == PITCH_TASK_2) ||
@@ -169,6 +191,7 @@ static void select_next_task(
         PITCH_TASK_2 :
         (PitchTaskId)((uint8_t)controller->report.selected_task + 1U);
     controller->report.selected_task = next_task;
+    controller->start_pending = false;
     controller->report.captured_position_valid = false;
     controller->report.captured_position_0_1mm = 0;
     if (next_task == PITCH_TASK_6)
@@ -180,6 +203,10 @@ static void select_next_task(
     {
         (void)set_target(controller, center_target(controller), now_ms);
         enter_state(controller, PITCH_TASK_STATE_IDLE, now_ms);
+    }
+    if (!apply_selected_task_velocity_config(controller))
+    {
+        enter_state(controller, PITCH_TASK_STATE_FAULT, now_ms);
     }
 }
 
@@ -208,7 +235,7 @@ static void capture_task6_target(
     enter_state(controller, PITCH_TASK_STATE_IDLE, now_ms);
 }
 
-static void start_selected_task(
+static bool start_selected_task(
     PitchTaskController *controller,
     uint32_t now_ms)
 {
@@ -218,14 +245,12 @@ static void start_selected_task(
     if ((controller->report.state != PITCH_TASK_STATE_IDLE) ||
         controller->report.automatic_armed)
     {
-        controller->report.rejected_key_count++;
-        return;
+        return false;
     }
     if ((controller->report.selected_task == PITCH_TASK_6) &&
         !controller->report.captured_position_valid)
     {
-        controller->report.rejected_key_count++;
-        return;
+        return false;
     }
 
     if (controller->report.selected_task == PITCH_TASK_3)
@@ -242,13 +267,15 @@ static void start_selected_task(
     }
     else
     {
-        controller->report.rejected_key_count++;
-        return;
+        return false;
+    }
+    if (!apply_selected_task_velocity_config(controller))
+    {
+        return false;
     }
     if (!set_target(controller, target, now_ms))
     {
-        controller->report.rejected_key_count++;
-        return;
+        return false;
     }
     PitchAxisVisionControl_ResetController(controller->vision, now_ms);
     (void)PitchAxisVelocityTest_ClearAutomaticHold(controller->velocity);
@@ -258,10 +285,36 @@ static void start_selected_task(
         now_ms);
     if (!armed)
     {
-        controller->report.rejected_key_count++;
-        return;
+        return false;
     }
     enter_state(controller, PITCH_TASK_STATE_STARTING, now_ms);
+    return true;
+}
+
+static void service_pending_start(
+    PitchTaskController *controller,
+    const PitchAxisVelocityTestReport *velocity,
+    uint32_t now_ms)
+{
+    if (!controller->start_pending || velocity->fault_latched ||
+        velocity->automatic_armed)
+    {
+        return;
+    }
+    if ((velocity->state != PITCH_VELOCITY_TEST_STATE_DISABLED_READY) &&
+        (velocity->state != PITCH_VELOCITY_TEST_STATE_ENABLED_STOPPED))
+    {
+        return;
+    }
+    if (start_selected_task(controller, now_ms))
+    {
+        controller->start_pending = false;
+    }
+    else
+    {
+        controller->start_pending = false;
+        controller->report.rejected_key_count++;
+    }
 }
 
 static uint8_t update_buttons(
@@ -398,6 +451,11 @@ bool PitchTaskController_Init(
         controller->buttons[index].candidate_since_ms = now_ms;
     }
     controller->initialized = true;
+    if (!apply_selected_task_velocity_config(controller))
+    {
+        controller->initialized = false;
+        return false;
+    }
     if (!set_target(controller, center_target(controller), now_ms))
     {
         controller->initialized = false;
@@ -440,7 +498,15 @@ void PitchTaskController_Service(
         else if ((edges & 0x01U) != 0U)
         {
             controller->report.last_key = 1U;
-            start_selected_task(controller, now_ms);
+            if ((controller->report.state == PITCH_TASK_STATE_IDLE) &&
+                !controller->start_pending)
+            {
+                controller->start_pending = true;
+            }
+            else
+            {
+                controller->report.rejected_key_count++;
+            }
         }
         else if ((edges & 0x04U) != 0U)
         {
@@ -462,6 +528,7 @@ void PitchTaskController_Service(
         return;
     }
     sync_report(controller, &velocity, now_ms);
+    service_pending_start(controller, &velocity, now_ms);
     service_trajectory(controller, &vision, now_ms);
 }
 
@@ -506,6 +573,10 @@ bool PitchTaskController_UpdateConfig(
         return false;
     }
     controller->config = *config;
+    if (!apply_selected_task_velocity_config(controller))
+    {
+        return false;
+    }
     if (controller->report.selected_task != PITCH_TASK_6)
     {
         return set_target(controller, center_target(controller), now_ms);

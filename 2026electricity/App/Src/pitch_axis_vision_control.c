@@ -61,10 +61,16 @@ static bool valid_config(const PitchAxisVisionConfig *config)
         (config->integral_separation_band_0_1mm >= 0) &&
         (config->approach_band_0_1mm >= 0) &&
         ((config->approach_band_0_1mm == 0) ||
-         ((config->approach_speed_limit_rpm >= config->minimum_speed_rpm) &&
-          (config->approach_speed_limit_rpm <= config->maximum_speed_rpm))) &&
+        ((config->approach_speed_limit_rpm >= config->minimum_speed_rpm) &&
+         (config->approach_speed_limit_rpm <= config->maximum_speed_rpm))) &&
         (config->velocity_filter_alpha > 0.0f) &&
-        (config->velocity_filter_alpha <= 1.0f);
+        (config->velocity_filter_alpha <= 1.0f) &&
+        (!config->feedforward_enabled ||
+         (((config->feedforward_sign == 1) ||
+           (config->feedforward_sign == -1)) &&
+          (config->feedforward_gain_rpm_per_mm_s2 >= 0.0f) &&
+          (config->feedforward_limit_rpm >= 0.0f) &&
+          (config->feedforward_deadband_mm_s2 >= 0.0f)));
 }
 
 static uint32_t observation_age_ms(
@@ -99,6 +105,10 @@ static void suspend_control_state(
     control->report.d_term_0_01rpm = 0;
     control->report.unsaturated_output_0_01rpm = 0;
     control->report.control_output_0_01rpm = 0;
+    control->report.feedforward_0_01rpm = 0;
+    control->report.feedforward_input_mm_s2 = 0;
+    control->report.feedforward_valid = false;
+    control->report.feedforward_saturated = false;
     control->report.integral_active = false;
     control->report.approach_limited = false;
     control->report.output_saturated = false;
@@ -185,6 +195,19 @@ void PitchAxisVisionControl_ResetController(
     clear_control_state(control);
 }
 
+void PitchAxisVisionControl_SetFeedforwardInput(
+    PitchAxisVisionControl *control,
+    float acceleration_mm_s2,
+    bool valid)
+{
+    if ((control == NULL) || !control->initialized)
+    {
+        return;
+    }
+    control->feedforward_input_mm_s2 = acceleration_mm_s2;
+    control->feedforward_input_valid = valid;
+}
+
 void PitchAxisVisionControl_OnObservation(
     PitchAxisVisionControl *control,
     const BallObservation *observation)
@@ -245,6 +268,7 @@ void PitchAxisVisionControl_Service(
     float p_output_rpm;
     float i_output_rpm;
     float d_output_rpm;
+    float feedforward_output_rpm;
     float unsaturated_output_rpm;
     float output_rpm;
     float integral_candidate_mm_s;
@@ -348,6 +372,11 @@ void PitchAxisVisionControl_Service(
 
     control->report.observation_fresh = true;
     control->report.state = PITCH_VISION_STATE_TRACKING;
+    control->report.feedforward_input_mm_s2 = round_to_i16(
+        control->feedforward_input_mm_s2);
+    control->report.feedforward_valid =
+        control->feedforward_input_valid && config->feedforward_enabled;
+    control->report.feedforward_saturated = false;
     error_mm = ((float)config->target_position_0_1mm -
                 (float)observation->x_0_1mm) / 10.0f;
     control->report.error_0_1mm = round_to_i16(error_mm * 10.0f);
@@ -434,7 +463,30 @@ void PitchAxisVisionControl_Service(
 
     p_output_rpm = config->kp_rpm_per_mm * error_mm;
     d_output_rpm = config->kd_rpm_per_mm_s * error_velocity_mm_s;
-    unsaturated_output_rpm = p_output_rpm + i_output_rpm + d_output_rpm;
+    feedforward_output_rpm = 0.0f;
+    if (control->report.feedforward_valid &&
+        (fabsf(control->feedforward_input_mm_s2) >=
+         config->feedforward_deadband_mm_s2))
+    {
+        feedforward_output_rpm =
+            (float)config->feedforward_sign *
+            config->feedforward_gain_rpm_per_mm_s2 *
+            control->feedforward_input_mm_s2;
+        if (feedforward_output_rpm > config->feedforward_limit_rpm)
+        {
+            feedforward_output_rpm = config->feedforward_limit_rpm;
+            control->report.feedforward_saturated = true;
+        }
+        else if (feedforward_output_rpm < -config->feedforward_limit_rpm)
+        {
+            feedforward_output_rpm = -config->feedforward_limit_rpm;
+            control->report.feedforward_saturated = true;
+        }
+    }
+    control->report.feedforward_0_01rpm = round_to_i16(
+        feedforward_output_rpm * 100.0f);
+    unsaturated_output_rpm = p_output_rpm + i_output_rpm + d_output_rpm +
+        feedforward_output_rpm;
     control->report.p_term_0_01rpm = round_to_i16(p_output_rpm * 100.0f);
     control->report.i_term_0_01rpm = round_to_i16(i_output_rpm * 100.0f);
     control->report.d_term_0_01rpm = round_to_i16(d_output_rpm * 100.0f);
@@ -446,7 +498,7 @@ void PitchAxisVisionControl_Service(
          ((float)config->velocity_deadband_0_1mm_s / 10.0f)))
     {
         output_rpm = clamp_float(
-            i_output_rpm,
+            i_output_rpm + feedforward_output_rpm,
             -(float)config->maximum_speed_rpm,
             (float)config->maximum_speed_rpm);
         control->report.control_output_0_01rpm =

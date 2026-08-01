@@ -218,7 +218,10 @@ static void update_automatic_position_target(PitchAxisVelocityTest *test)
     test->report.automatic_target_offset_raw = target_offset_raw;
     test->report.automatic_target_position_raw =
         test->report.automatic_zero_position_raw + target_offset_raw;
-    test->automatic_position_target_dirty = true;
+    if (!test->report.automatic_position_valid)
+    {
+        test->automatic_position_target_dirty = true;
+    }
 }
 
 static uint16_t automatic_position_speed(

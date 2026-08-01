@@ -12,6 +12,8 @@ static size_t g_rx_length;
 static size_t g_rx_offset;
 static char g_tx[4096];
 static size_t g_tx_length;
+static size_t g_tx_free_limit;
+static size_t g_max_write_length;
 static uint32_t g_arm_calls;
 static uint32_t g_disarm_calls;
 static uint32_t g_reset_calls;
@@ -31,6 +33,8 @@ static void clear_output(void)
 {
     memset(g_tx, 0, sizeof(g_tx));
     g_tx_length = 0U;
+    g_tx_free_limit = 511U;
+    g_max_write_length = 0U;
 }
 
 static void service_until_input_drained(
@@ -48,6 +52,20 @@ static void service_until_input_drained(
     assert(BspBluetooth_Available(debug->bluetooth) == 0U);
 }
 
+static void service_until_config_drained(
+    PitchPidDebug *debug,
+    uint32_t now_ms)
+{
+    uint32_t iteration = 0U;
+
+    while (debug->config_response_pending && (iteration < 16U))
+    {
+        PitchPidDebug_Service(debug, now_ms + iteration);
+        iteration++;
+    }
+    assert(!debug->config_response_pending);
+}
+
 size_t BspBluetooth_Available(const BspBluetooth *port)
 {
     (void)port;
@@ -57,7 +75,7 @@ size_t BspBluetooth_Available(const BspBluetooth *port)
 size_t BspBluetooth_TxFree(const BspBluetooth *port)
 {
     (void)port;
-    return sizeof(g_tx) - g_tx_length;
+    return g_tx_free_limit;
 }
 
 BspBluetoothResult BspBluetooth_Write(
@@ -66,7 +84,12 @@ BspBluetoothResult BspBluetooth_Write(
     size_t length)
 {
     (void)port;
+    assert(length <= g_tx_free_limit);
     assert(g_tx_length + length < sizeof(g_tx));
+    if (length > g_max_write_length)
+    {
+        g_max_write_length = length;
+    }
     memcpy(&g_tx[g_tx_length], data, length);
     g_tx_length += length;
     g_tx[g_tx_length] = '\0';
@@ -291,9 +314,13 @@ static void test_ping_pid_on_and_status(void)
     initialize(&debug, &bluetooth, &vision, &velocity);
     feed("PING\r\nPID ON\r\nPID?\r\n");
     service_until_input_drained(&debug, 10U);
+    service_until_config_drained(&debug, 20U);
     assert(strstr(g_tx, "PONG\r\n") != NULL);
     assert(strstr(g_tx, "PID_ON_OK\r\n") != NULL);
     assert(strstr(g_tx, "PID_CONFIG,") != NULL);
+    assert(strstr(g_tx, ",pid_debug=1\r\n") != NULL);
+    assert(!debug.config_response_pending);
+    assert(g_max_write_length <= PITCH_PID_DEBUG_TX_CHUNK_SIZE);
     assert(debug.enabled);
     assert(velocity.report.pid_debug_enabled);
 }
@@ -370,6 +397,33 @@ static void test_runtime_ball_limits(void)
     assert(strstr(g_tx, "PID_SET_REJECTED,name=BALLMAX,value=-1100") != NULL);
 }
 
+static void test_feedforward_settings(void)
+{
+    PitchPidDebug debug;
+    BspBluetooth bluetooth;
+    PitchAxisVisionControl vision;
+    PitchAxisVelocityTest velocity;
+
+    initialize(&debug, &bluetooth, &vision, &velocity);
+    feed("SET FF=0.006\r\nSET FFSIGN=-1\r\nSET FFLIM=4.000\r\nSET FFDB=75\r\nSET FFEN=1\r\nSET FFSIGN=0\r\nSET FF=0.501\r\n");
+    service_until_input_drained(&debug, 10U);
+    assert(vision.config.feedforward_enabled);
+    assert(vision.config.feedforward_sign == -1);
+    assert(vision.config.feedforward_gain_rpm_per_mm_s2 > 0.005f);
+    assert(vision.config.feedforward_gain_rpm_per_mm_s2 < 0.007f);
+    assert(vision.config.feedforward_limit_rpm > 3.999f);
+    assert(vision.config.feedforward_limit_rpm < 4.001f);
+    assert(vision.config.feedforward_deadband_mm_s2 > 74.999f);
+    assert(vision.config.feedforward_deadband_mm_s2 < 75.001f);
+    assert(strstr(g_tx, "PID_SET_OK,name=FF,value=0.006") != NULL);
+    assert(strstr(g_tx, "PID_SET_OK,name=FFSIGN,value=-1") != NULL);
+    assert(strstr(g_tx, "PID_SET_OK,name=FFLIM,value=4.000") != NULL);
+    assert(strstr(g_tx, "PID_SET_OK,name=FFDB,value=75") != NULL);
+    assert(strstr(g_tx, "PID_SET_OK,name=FFEN,value=1") != NULL);
+    assert(strstr(g_tx, "PID_SET_REJECTED,name=FFSIGN,value=0") != NULL);
+    assert(strstr(g_tx, "PID_SET_REJECTED,name=FF,value=0.501") != NULL);
+}
+
 static void test_fragmented_db_is_not_disarm(void)
 {
     PitchPidDebug debug;
@@ -444,7 +498,7 @@ static void test_task_parameters_and_status(void)
     PitchAxisVelocityTest velocity;
     PitchTaskController tasks;
     PitchTaskControllerConfig task_config = {
-        -50, 500U, 100U, 100U, 100U, 30U
+        -50, 500U, 100U, 100U, 100U, 3900U, 4000U, 30U
     };
     PitchTaskControllerConfig readback;
 
@@ -452,8 +506,9 @@ static void test_task_parameters_and_status(void)
     assert(PitchTaskController_Init(
         &tasks, &vision, &velocity, &task_config, 0U));
     debug.tasks = &tasks;
-    feed("SET CENTER=-40\r\nSET T3OFFSET=480\r\nSET T3TOL=80\r\nSET T3VMAX=90\r\nSET T3DWELL=120\r\nPID?\r\n");
+    feed("SET CENTER=-40\r\nSET T3OFFSET=480\r\nSET T3TOL=80\r\nSET T3VMAX=90\r\nSET T3DWELL=120\r\nSET HOLDTILT=3900\r\nSET T3TILT=4000\r\nPID?\r\n");
     service_until_input_drained(&debug, 10U);
+    service_until_config_drained(&debug, 20U);
 
     assert(PitchTaskController_GetConfig(&tasks, &readback));
     assert(readback.center_position_0_1mm == -40);
@@ -461,12 +516,38 @@ static void test_task_parameters_and_status(void)
     assert(readback.task3_tolerance_0_1mm == 80U);
     assert(readback.task3_velocity_limit_0_1mm_s == 90U);
     assert(readback.task3_turnaround_dwell_ms == 120U);
+    assert(readback.position_hold_tilt_limit_um == 3900U);
+    assert(readback.task3_tilt_limit_um == 4000U);
     assert(strstr(g_tx, "PID_SET_OK,name=CENTER,value=-40") != NULL);
     assert(strstr(g_tx, "PITCH_TASK,task=2,state=IDLE") != NULL);
     assert(strstr(g_tx, ",task=2,task_state=IDLE") != NULL);
     assert(strstr(
         g_tx,
-        ",center=-40,t3offset=480,t3tol=80,t3vmax=90,t3dwell=120") != NULL);
+        ",center=-40,t3offset=480,t3tol=80,t3vmax=90,t3dwell=120,holdtilt=3900,t3tilt=4000") != NULL);
+}
+
+static void test_task_mode_rejects_bluetooth_arm_and_disarm(void)
+{
+    PitchPidDebug debug;
+    BspBluetooth bluetooth;
+    PitchAxisVisionControl vision;
+    PitchAxisVelocityTest velocity;
+    PitchTaskController tasks;
+    PitchTaskControllerConfig task_config = {
+        -50, 500U, 100U, 100U, 100U, 3900U, 4000U, 30U
+    };
+
+    initialize(&debug, &bluetooth, &vision, &velocity);
+    assert(PitchTaskController_Init(
+        &tasks, &vision, &velocity, &task_config, 0U));
+    debug.tasks = &tasks;
+    feed("A\r\nD\r\n");
+    service_until_input_drained(&debug, 10U);
+
+    assert(g_arm_calls == 0U);
+    assert(g_disarm_calls == 0U);
+    assert(strstr(g_tx, "AUTO_ARM_REJECTED_USE_KEY1\r\n") != NULL);
+    assert(strstr(g_tx, "AUTO_DISARM_REJECTED_USE_KEY4\r\n") != NULL);
 }
 
 int main(void)
@@ -474,10 +555,12 @@ int main(void)
     test_ping_pid_on_and_status();
     test_live_pid_and_automatic_limit_settings();
     test_runtime_ball_limits();
+    test_feedforward_settings();
     test_fragmented_db_is_not_disarm();
     test_bare_arm_timeout_and_resume_reset();
     test_zero_and_position_loop_settings();
     test_task_parameters_and_status();
+    test_task_mode_rejects_bluetooth_arm_and_disarm();
     puts("PITCH_PID_DEBUG_TEST=PASS");
     return 0;
 }

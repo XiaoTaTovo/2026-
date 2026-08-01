@@ -61,6 +61,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Bsp/Src/bsp_i2c.c
     Bsp/Src/bsp_uart_dma.c
     Modules/Src/ball_observation_protocol.c
+    Modules/Src/chassis_feedforward_protocol.c
     Modules/Src/as5600.c
     Modules/Src/x42s_driver.c
     Modules/Src/x42s_protocol.c

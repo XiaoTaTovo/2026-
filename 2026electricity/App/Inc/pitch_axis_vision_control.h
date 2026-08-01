@@ -38,6 +38,11 @@ typedef struct
     uint16_t approach_speed_limit_rpm;
     float velocity_filter_alpha;
     bool positive_error_uses_positive_direction;
+    bool feedforward_enabled;
+    int8_t feedforward_sign;
+    float feedforward_gain_rpm_per_mm_s2;
+    float feedforward_limit_rpm;
+    float feedforward_deadband_mm_s2;
 } PitchAxisVisionConfig;
 
 typedef struct
@@ -59,6 +64,10 @@ typedef struct
     int16_t d_term_0_01rpm;
     int16_t unsaturated_output_0_01rpm;
     int16_t control_output_0_01rpm;
+    int16_t feedforward_0_01rpm;
+    int16_t feedforward_input_mm_s2;
+    bool feedforward_valid;
+    bool feedforward_saturated;
     bool integral_active;
     bool approach_limited;
     bool output_saturated;
@@ -82,6 +91,7 @@ typedef struct
     float previous_error_mm;
     float integral_error_mm_s;
     float filtered_error_velocity_mm_s;
+    float feedforward_input_mm_s2;
     uint32_t previous_sample_ms;
     uint32_t last_trusted_observation_rx_ms;
     uint32_t last_control_ms;
@@ -93,6 +103,7 @@ typedef struct
     bool have_last_received_sequence;
     bool have_previous_sample;
     bool have_trusted_observation;
+    bool feedforward_input_valid;
     bool pending_observation_present;
     bool initialized;
 } PitchAxisVisionControl;
@@ -114,6 +125,11 @@ bool PitchAxisVisionControl_UpdateConfig(
 void PitchAxisVisionControl_ResetController(
     PitchAxisVisionControl *control,
     uint32_t now_ms);
+
+void PitchAxisVisionControl_SetFeedforwardInput(
+    PitchAxisVisionControl *control,
+    float acceleration_mm_s2,
+    bool valid);
 
 /* The caller supplies only complete frames returned by BallObservationParser. */
 void PitchAxisVisionControl_OnObservation(

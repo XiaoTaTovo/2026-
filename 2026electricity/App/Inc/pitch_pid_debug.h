@@ -15,6 +15,11 @@
 #define PITCH_PID_DEBUG_MIN_SAMPLE_PERIOD_MS 50U
 #define PITCH_PID_DEBUG_MAX_SAMPLE_PERIOD_MS 1000U
 #define PITCH_PID_DEBUG_SINGLE_COMMAND_TIMEOUT_MS 30U
+#define PITCH_PID_DEBUG_DEFAULT_PLOT_PERIOD_MS 50U
+#define PITCH_PID_DEBUG_MIN_PLOT_PERIOD_MS 20U
+#define PITCH_PID_DEBUG_MAX_PLOT_PERIOD_MS 1000U
+#define PITCH_PID_DEBUG_CONFIG_RESPONSE_SIZE 896U
+#define PITCH_PID_DEBUG_TX_CHUNK_SIZE 192U
 
 typedef struct
 {
@@ -35,6 +40,16 @@ typedef struct
     char pending_single_command;
     bool pending_single_active;
     bool enabled;
+    /* FireWater plot stream for VOFA+. Independent of the key=value sample
+     * stream so a plot session does not lose the diagnostic text. */
+    bool plot_enabled;
+    bool plot_header_pending;
+    uint32_t next_plot_ms;
+    uint32_t plot_period_ms;
+    char config_response[PITCH_PID_DEBUG_CONFIG_RESPONSE_SIZE];
+    size_t config_response_length;
+    size_t config_response_offset;
+    bool config_response_pending;
     bool initialized;
 } PitchPidDebug;
 

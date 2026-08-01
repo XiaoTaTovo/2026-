@@ -22,6 +22,9 @@
 #define PITCH_PID_DEBUG_MAX_RAW_PER_MM 1000000U
 #define PITCH_PID_DEBUG_MAX_TILT_UM 10000U
 #define PITCH_PID_DEBUG_MAX_POSITION_POLL_MS 200U
+#define PITCH_PID_DEBUG_MAX_FF_MILLI 500U
+#define PITCH_PID_DEBUG_MAX_FF_LIMIT_MILLI 50000U
+#define PITCH_PID_DEBUG_MAX_FF_DEADBAND_MM_S2 5000U
 
 static bool time_elapsed(uint32_t now_ms, uint32_t start_ms, uint32_t delay_ms)
 {
@@ -179,6 +182,60 @@ static size_t append_fixed3(
     return length;
 }
 
+/* Signed fixed-point for the plot stream. append_fixed3 clamps negatives to
+ * zero, which would hide the sign of err, ballv and the PID terms. */
+static size_t append_scaled(
+    char *message,
+    size_t capacity,
+    size_t length,
+    int32_t value,
+    uint32_t divisor,
+    uint8_t decimals)
+{
+    uint32_t magnitude;
+    uint32_t fraction;
+    uint32_t scale = 1U;
+    uint8_t index;
+
+    if (value < 0)
+    {
+        if (length < capacity)
+        {
+            message[length++] = '-';
+        }
+        magnitude = (uint32_t)(-(value + 1)) + 1U;
+    }
+    else
+    {
+        magnitude = (uint32_t)value;
+    }
+
+    length = append_u32(message, capacity, length, magnitude / divisor);
+    if (decimals == 0U)
+    {
+        return length;
+    }
+    if (length < capacity)
+    {
+        message[length++] = '.';
+    }
+    fraction = magnitude % divisor;
+    for (index = 0U; index < decimals; ++index)
+    {
+        scale *= 10U;
+    }
+    fraction = (fraction * scale) / divisor;
+    while (scale > 1U)
+    {
+        scale /= 10U;
+        if (length < capacity)
+        {
+            message[length++] = (char)('0' + ((fraction / scale) % 10U));
+        }
+    }
+    return length;
+}
+
 static bool write_bytes(
     PitchPidDebug *debug,
     const char *message,
@@ -197,6 +254,46 @@ static bool write_bytes(
 static bool write_text(PitchPidDebug *debug, const char *text)
 {
     return write_bytes(debug, text, strlen(text));
+}
+
+static void service_config_response(PitchPidDebug *debug)
+{
+    size_t remaining;
+    size_t available;
+    size_t chunk_length;
+
+    if (!debug->config_response_pending)
+    {
+        return;
+    }
+
+    remaining = debug->config_response_length - debug->config_response_offset;
+    available = BspBluetooth_TxFree(debug->bluetooth);
+    chunk_length = remaining;
+    if (chunk_length > PITCH_PID_DEBUG_TX_CHUNK_SIZE)
+    {
+        chunk_length = PITCH_PID_DEBUG_TX_CHUNK_SIZE;
+    }
+    if (chunk_length > available)
+    {
+        chunk_length = available;
+    }
+    if ((chunk_length == 0U) ||
+        !write_bytes(
+            debug,
+            &debug->config_response[debug->config_response_offset],
+            chunk_length))
+    {
+        return;
+    }
+
+    debug->config_response_offset += chunk_length;
+    if (debug->config_response_offset >= debug->config_response_length)
+    {
+        debug->config_response_length = 0U;
+        debug->config_response_offset = 0U;
+        debug->config_response_pending = false;
+    }
 }
 
 static bool text_equal(const char *left, const char *right)
@@ -474,6 +571,11 @@ static bool write_config(PitchPidDebug *debug)
     char message[896];
     size_t length = 0U;
 
+    if (debug->config_response_pending)
+    {
+        return false;
+    }
+
     if (!PitchAxisVisionControl_GetConfig(debug->vision, &vision_config) ||
         !PitchAxisVelocityTest_GetConfig(debug->velocity, &velocity_config) ||
         !PitchAxisVelocityTest_GetReport(debug->velocity, &velocity_report) ||
@@ -545,6 +647,21 @@ static bool write_config(PitchPidDebug *debug)
     length = append_u32(message, sizeof(message), length,
                         vision_config.positive_error_uses_positive_direction ?
                             1U : 0U);
+    length = append_text(message, sizeof(message), length, ",ffen=");
+    length = append_u32(message, sizeof(message), length,
+                        vision_config.feedforward_enabled ? 1U : 0U);
+    length = append_text(message, sizeof(message), length, ",ff=");
+    length = append_fixed3(message, sizeof(message), length,
+                           vision_config.feedforward_gain_rpm_per_mm_s2);
+    length = append_text(message, sizeof(message), length, ",ffsign=");
+    length = append_i32(message, sizeof(message), length,
+                        vision_config.feedforward_sign);
+    length = append_text(message, sizeof(message), length, ",fflim=");
+    length = append_fixed3(message, sizeof(message), length,
+                           vision_config.feedforward_limit_rpm);
+    length = append_text(message, sizeof(message), length, ",ffdb=");
+    length = append_fixed3(message, sizeof(message), length,
+                           vision_config.feedforward_deadband_mm_s2);
     length = append_text(message, sizeof(message), length, ",automax=");
     length = append_u32(message, sizeof(message), length,
                          velocity_config.automatic_max_speed_rpm);
@@ -659,9 +776,25 @@ static bool write_config(PitchPidDebug *debug)
         length = append_text(message, sizeof(message), length, ",t3dwell=");
         length = append_u32(message, sizeof(message), length,
                             task_config.task3_turnaround_dwell_ms);
+        length = append_text(message, sizeof(message), length, ",holdtilt=");
+        length = append_u32(
+            message, sizeof(message), length,
+            task_config.position_hold_tilt_limit_um);
+        length = append_text(message, sizeof(message), length, ",t3tilt=");
+        length = append_u32(
+            message, sizeof(message), length,
+            task_config.task3_tilt_limit_um);
     }
     length = append_text(message, sizeof(message), length, "\r\n");
-    return write_bytes(debug, message, length);
+    if (length > sizeof(debug->config_response))
+    {
+        return false;
+    }
+    memcpy(debug->config_response, message, length);
+    debug->config_response_length = length;
+    debug->config_response_offset = 0U;
+    debug->config_response_pending = true;
+    return true;
 }
 
 static bool write_sample(PitchPidDebug *debug, uint32_t now_ms)
@@ -749,6 +882,18 @@ static bool write_sample(PitchPidDebug *debug, uint32_t now_ms)
     length = append_text(message, sizeof(message), length, ",d=");
     length = append_i32(message, sizeof(message), length,
                         vision_report.d_term_0_01rpm);
+    length = append_text(message, sizeof(message), length, ",ff=");
+    length = append_i32(message, sizeof(message), length,
+                        vision_report.feedforward_0_01rpm);
+    length = append_text(message, sizeof(message), length, ",ff_in=");
+    length = append_i32(message, sizeof(message), length,
+                        vision_report.feedforward_input_mm_s2);
+    length = append_text(message, sizeof(message), length, ",ff_valid=");
+    length = append_u32(message, sizeof(message), length,
+                        vision_report.feedforward_valid ? 1U : 0U);
+    length = append_text(message, sizeof(message), length, ",ff_sat=");
+    length = append_u32(message, sizeof(message), length,
+                        vision_report.feedforward_saturated ? 1U : 0U);
     length = append_text(message, sizeof(message), length, ",u=");
     length = append_i32(message, sizeof(message), length,
                         vision_report.unsaturated_output_0_01rpm);
@@ -859,6 +1004,94 @@ static bool write_sample(PitchPidDebug *debug, uint32_t now_ms)
     return write_bytes(debug, message, length);
 }
 
+/* VOFA+ FireWater: "name1:value1,name2:value2\n". The header line names the
+ * channels once so the plot legend is readable after a fresh connect. */
+static bool write_plot_header(PitchPidDebug *debug)
+{
+    return write_text(
+        debug,
+        "x:0,target:0,err:0,ballv:0,p:0,i:0,d:0,out:0,"
+        "perr_um:0,cmd:0,conf:0,track:0\n");
+}
+
+/* Scaled to millimetres so every position channel shares one Y axis:
+ * 0.1 mm fields are divided by 10, raw counts by RAWPMM. */
+static bool write_plot_sample(PitchPidDebug *debug)
+{
+    PitchAxisVisionConfig vision_config;
+    PitchAxisVisionReport vision_report;
+    PitchAxisVelocityTestConfig velocity_config;
+    PitchAxisVelocityTestReport velocity_report;
+    char message[256];
+    size_t length = 0U;
+    int32_t position_error_um = 0;
+
+    if (!PitchAxisVisionControl_GetConfig(debug->vision, &vision_config) ||
+        !PitchAxisVisionControl_GetReport(debug->vision, &vision_report) ||
+        !PitchAxisVelocityTest_GetConfig(debug->velocity, &velocity_config) ||
+        !PitchAxisVelocityTest_GetReport(debug->velocity, &velocity_report))
+    {
+        return false;
+    }
+
+    if (velocity_config.automatic_position_raw_per_mm != 0U)
+    {
+        int64_t error_raw = velocity_report.automatic_position_error_raw;
+        int64_t scaled = (error_raw * 1000) /
+            (int64_t)velocity_config.automatic_position_raw_per_mm;
+
+        if (scaled > INT32_MAX)
+        {
+            scaled = INT32_MAX;
+        }
+        else if (scaled < INT32_MIN)
+        {
+            scaled = INT32_MIN;
+        }
+        position_error_um = (int32_t)scaled;
+    }
+
+    length = append_text(message, sizeof(message), length, "x:");
+    length = append_scaled(message, sizeof(message), length,
+                           vision_report.observation.x_0_1mm, 10U, 1U);
+    length = append_text(message, sizeof(message), length, ",target:");
+    length = append_scaled(message, sizeof(message), length,
+                           vision_config.target_position_0_1mm, 10U, 1U);
+    length = append_text(message, sizeof(message), length, ",err:");
+    length = append_scaled(message, sizeof(message), length,
+                           vision_report.error_0_1mm, 10U, 1U);
+    length = append_text(message, sizeof(message), length, ",ballv:");
+    length = append_scaled(message, sizeof(message), length,
+                           vision_report.ball_velocity_0_1mm_s, 10U, 1U);
+    length = append_text(message, sizeof(message), length, ",p:");
+    length = append_scaled(message, sizeof(message), length,
+                           vision_report.p_term_0_01rpm, 100U, 2U);
+    length = append_text(message, sizeof(message), length, ",i:");
+    length = append_scaled(message, sizeof(message), length,
+                           vision_report.i_term_0_01rpm, 100U, 2U);
+    length = append_text(message, sizeof(message), length, ",d:");
+    length = append_scaled(message, sizeof(message), length,
+                           vision_report.d_term_0_01rpm, 100U, 2U);
+    length = append_text(message, sizeof(message), length, ",out:");
+    length = append_scaled(message, sizeof(message), length,
+                           vision_report.control_output_0_01rpm, 100U, 2U);
+    length = append_text(message, sizeof(message), length, ",perr_um:");
+    length = append_i32(message, sizeof(message), length, position_error_um);
+    length = append_text(message, sizeof(message), length, ",cmd:");
+    length = append_u32(message, sizeof(message), length,
+                        vision_report.command_speed_rpm);
+    length = append_text(message, sizeof(message), length, ",conf:");
+    length = append_u32(message, sizeof(message), length,
+                        vision_report.observation.confidence_permille);
+    /* Plot-friendly state flag: 1 while tracking, 0 on any reject path. */
+    length = append_text(message, sizeof(message), length, ",track:");
+    length = append_u32(
+        message, sizeof(message), length,
+        (vision_report.state == PITCH_VISION_STATE_TRACKING) ? 1U : 0U);
+    length = append_text(message, sizeof(message), length, "\n");
+    return write_bytes(debug, message, length);
+}
+
 static bool write_task_status(PitchPidDebug *debug)
 {
     PitchTaskControllerReport report;
@@ -910,11 +1143,13 @@ static bool service_boot(PitchPidDebug *debug)
         case 0U: text = "PID_DEBUG_READY\r\n"; break;
         case 1U: text = "PID_DEBUG_BUILD=pid-live-r20-control-continuity\r\n"; break;
         case 2U:
-            text = "PID_COMMANDS=PING|PID ON|PID OFF|PID?|PID HELP|SET NAME=VALUE|ZERO|A|D|RESUME\r\n";
+            text = (debug->tasks != NULL) ?
+                "PID_COMMANDS=PING|PID ON|PID OFF|PID?|PID HELP|PLOT ON|PLOT OFF|SET NAME=VALUE|ZERO|RESUME\r\n" :
+                "PID_COMMANDS=PING|PID ON|PID OFF|PID?|PID HELP|PLOT ON|PLOT OFF|SET NAME=VALUE|ZERO|A|D|RESUME\r\n";
             break;
         case 3U: text = "PID_SAMPLE_DEFAULT_MS=100\r\n"; break;
         case 4U:
-            text = "PID_RUNTIME_SET=KP,KI,KD,ILIM,IBAND,APPBAND,APPMAX,TARGET,BALLMIN,BALLMAX,EDGEMARGIN,DB,VDB,CONF,AGE,PERIOD,MINRPM,MAXRPM,ALPHA,SIGN,AUTOMAX,POSTRACK,RAWSIGN,RAWPMM,TILTSCALE,TILTLIM,POSDB,SLOWUM,INNERMIN,POSPOLL,TIMEOUT,LOSSMS,RESCUE,RESCUERPM,RESCUEMS,BUDGET,ACCEL,CENTER,T3OFFSET,T3TOL,T3VMAX,T3DWELL,SAMPLE\r\n";
+            text = "PID_RUNTIME_SET=KP,KI,KD,ILIM,IBAND,APPBAND,APPMAX,TARGET,BALLMIN,BALLMAX,EDGEMARGIN,DB,VDB,CONF,AGE,PERIOD,MINRPM,MAXRPM,ALPHA,SIGN,AUTOMAX,POSTRACK,RAWSIGN,RAWPMM,TILTSCALE,TILTLIM,POSDB,SLOWUM,INNERMIN,POSPOLL,TIMEOUT,LOSSMS,RESCUE,RESCUERPM,RESCUEMS,BUDGET,ACCEL,CENTER,T3OFFSET,T3TOL,T3VMAX,T3DWELL,HOLDTILT,T3TILT,SAMPLE\r\n";
             break;
         case 5U:
             text = "PID_IDLE_ONLY_SET=MANUALRPM,RUNMS,POSDIR,NEGDIR,SYNC,POSTRACK,RAWSIGN,RAWPMM,ZERO\r\n";
@@ -923,10 +1158,26 @@ static bool service_boot(PitchPidDebug *debug)
         case 7U:
             text = "PID_HARD_POSITION_0P1MM=-1250..1250\r\n";
             break;
-        case 8U: text = "PID_AUTO_START=AFTER_COMM_ENABLE_ACK\r\n"; break;
-        case 9U: text = "PID_KEY1=IGNORED_AUTO_START\r\n"; break;
-        case 10U: text = "PID_KEY2=BALL_ESCAPE_HOLD\r\n"; break;
-        case 11U: text = "PID_KEY3=RESUME_PERMISSION\r\n"; break;
+        case 8U:
+            text = (debug->tasks != NULL) ?
+                "PID_TASK_CONTROL=KEYS_ONLY_BLUETOOTH_A_D_REJECTED\r\n" :
+                "PID_AUTO_START=AFTER_COMM_ENABLE_ACK\r\n";
+            break;
+        case 9U:
+            text = (debug->tasks != NULL) ?
+                "PID_KEY1=START_SELECTED_TASK\r\n" :
+                "PID_KEY1=IGNORED_AUTO_START\r\n";
+            break;
+        case 10U:
+            text = (debug->tasks != NULL) ?
+                "PID_KEY2=NEXT_TASK\r\n" :
+                "PID_KEY2=BALL_ESCAPE_HOLD\r\n";
+            break;
+        case 11U:
+            text = (debug->tasks != NULL) ?
+                "PID_KEY3=TASK6_CAPTURE\r\n" :
+                "PID_KEY3=RESUME_PERMISSION\r\n";
+            break;
         case 12U: text = "PID_KEY4=STOP_AND_LATCH\r\n"; break;
         default:
             debug->boot_report_pending = false;
@@ -988,6 +1239,19 @@ static bool apply_setting(
         }
         debug->sample_period_ms = unsigned_value;
         debug->next_sample_ms = now_ms + debug->sample_period_ms;
+        return true;
+    }
+
+    if (text_equal(name, "PLOT"))
+    {
+        if (!parse_u32(value, &unsigned_value) ||
+            (unsigned_value < PITCH_PID_DEBUG_MIN_PLOT_PERIOD_MS) ||
+            (unsigned_value > PITCH_PID_DEBUG_MAX_PLOT_PERIOD_MS))
+        {
+            return false;
+        }
+        debug->plot_period_ms = unsigned_value;
+        debug->next_plot_ms = now_ms + debug->plot_period_ms;
         return true;
     }
 
@@ -1055,6 +1319,62 @@ static bool apply_setting(
             vision_config.velocity_filter_alpha =
                 (float)signed_value / 1000.0f;
         }
+        vision_changed = true;
+    }
+    else if (text_equal(name, "FF") || text_equal(name, "FFLIM") ||
+             text_equal(name, "FFDB"))
+    {
+        if (!parse_decimal_milli(value, &signed_value) || (signed_value < 0))
+        {
+            return false;
+        }
+        if (text_equal(name, "FF"))
+        {
+            if ((uint32_t)signed_value > PITCH_PID_DEBUG_MAX_FF_MILLI)
+            {
+                return false;
+            }
+            vision_config.feedforward_gain_rpm_per_mm_s2 =
+                (float)signed_value / 1000.0f;
+        }
+        else if (text_equal(name, "FFLIM"))
+        {
+            if ((uint32_t)signed_value > PITCH_PID_DEBUG_MAX_FF_LIMIT_MILLI)
+            {
+                return false;
+            }
+            vision_config.feedforward_limit_rpm =
+                (float)signed_value / 1000.0f;
+        }
+        else
+        {
+            if ((uint32_t)signed_value >
+                (PITCH_PID_DEBUG_MAX_FF_DEADBAND_MM_S2 * 1000U))
+            {
+                return false;
+            }
+            vision_config.feedforward_deadband_mm_s2 =
+                (float)signed_value / 1000.0f;
+        }
+        vision_changed = true;
+    }
+    else if (text_equal(name, "FFSIGN"))
+    {
+        if (!parse_i32(value, &signed_value) ||
+            ((signed_value != -1) && (signed_value != 1)))
+        {
+            return false;
+        }
+        vision_config.feedforward_sign = (int8_t)signed_value;
+        vision_changed = true;
+    }
+    else if (text_equal(name, "FFEN"))
+    {
+        if (!parse_u32(value, &unsigned_value) || (unsigned_value > 1U))
+        {
+            return false;
+        }
+        vision_config.feedforward_enabled = unsigned_value != 0U;
         vision_changed = true;
     }
     else if (text_equal(name, "IBAND"))
@@ -1241,7 +1561,9 @@ static bool apply_setting(
              text_equal(name, "T3OFFSET") ||
              text_equal(name, "T3TOL") ||
              text_equal(name, "T3VMAX") ||
-             text_equal(name, "T3DWELL"))
+             text_equal(name, "T3DWELL") ||
+             text_equal(name, "HOLDTILT") ||
+             text_equal(name, "T3TILT"))
     {
         if (debug->tasks == NULL)
         {
@@ -1289,13 +1611,32 @@ static bool apply_setting(
                 task_config.task3_velocity_limit_0_1mm_s =
                     (uint16_t)unsigned_value;
             }
-            else
+            else if (text_equal(name, "T3DWELL"))
             {
                 if (unsigned_value > 5000U)
                 {
                     return false;
                 }
                 task_config.task3_turnaround_dwell_ms = unsigned_value;
+            }
+            else if (text_equal(name, "HOLDTILT"))
+            {
+                if ((unsigned_value < 100U) ||
+                    (unsigned_value > PITCH_PID_DEBUG_MAX_TILT_UM))
+                {
+                    return false;
+                }
+                task_config.position_hold_tilt_limit_um =
+                    (uint16_t)unsigned_value;
+            }
+            else
+            {
+                if ((unsigned_value < 100U) ||
+                    (unsigned_value > PITCH_PID_DEBUG_MAX_TILT_UM))
+                {
+                    return false;
+                }
+                task_config.task3_tilt_limit_um = (uint16_t)unsigned_value;
             }
         }
         task_changed = true;
@@ -1633,6 +1974,22 @@ static void handle_command(
         }
         return;
     }
+    if (text_equal(line, "PLOT ON"))
+    {
+        debug->accepted_command_count++;
+        debug->plot_enabled = true;
+        debug->plot_header_pending = true;
+        debug->next_plot_ms = now_ms;
+        (void)write_text(debug, "PLOT_ON_OK\r\n");
+        return;
+    }
+    if (text_equal(line, "PLOT OFF"))
+    {
+        debug->accepted_command_count++;
+        debug->plot_enabled = false;
+        (void)write_text(debug, "PLOT_OFF_OK\r\n");
+        return;
+    }
     if (text_equal(line, "PID?") || text_equal(line, "PID STATUS"))
     {
         (void)write_config(debug);
@@ -1683,6 +2040,12 @@ static void handle_single_character(
 {
     if ((value == 'A') || (value == 'a'))
     {
+        if (debug->tasks != NULL)
+        {
+            debug->rejected_command_count++;
+            (void)write_text(debug, "AUTO_ARM_REJECTED_USE_KEY1\r\n");
+            return;
+        }
         PitchAxisVisionControl_ResetController(debug->vision, now_ms);
         if (PitchAxisVelocityTest_SetAutomaticArmed(
                 debug->velocity, true, now_ms))
@@ -1698,6 +2061,12 @@ static void handle_single_character(
     }
     else if ((value == 'D') || (value == 'd'))
     {
+        if (debug->tasks != NULL)
+        {
+            debug->rejected_command_count++;
+            (void)write_text(debug, "AUTO_DISARM_REJECTED_USE_KEY4\r\n");
+            return;
+        }
         if (PitchAxisVelocityTest_SetAutomaticArmed(
                 debug->velocity, false, now_ms))
         {
@@ -1832,6 +2201,8 @@ bool PitchPidDebug_Init(
     debug->tasks = tasks;
     debug->sample_period_ms = PITCH_PID_DEBUG_DEFAULT_SAMPLE_PERIOD_MS;
     debug->next_sample_ms = now_ms + debug->sample_period_ms;
+    debug->plot_period_ms = PITCH_PID_DEBUG_DEFAULT_PLOT_PERIOD_MS;
+    debug->next_plot_ms = now_ms + debug->plot_period_ms;
     debug->last_task_transition_count = UINT32_MAX;
     debug->boot_report_pending = true;
     debug->initialized = true;
@@ -1847,7 +2218,18 @@ void PitchPidDebug_Service(
         return;
     }
 
+    if (debug->config_response_pending)
+    {
+        service_config_response(debug);
+        return;
+    }
+
     read_commands(debug, now_ms);
+    if (debug->config_response_pending)
+    {
+        service_config_response(debug);
+        return;
+    }
     if (!service_boot(debug))
     {
         return;
@@ -1871,6 +2253,21 @@ void PitchPidDebug_Service(
         if (write_sample(debug, now_ms))
         {
             debug->next_sample_ms = now_ms + debug->sample_period_ms;
+        }
+    }
+    if (debug->plot_enabled &&
+        ((int32_t)(now_ms - debug->next_plot_ms) >= 0))
+    {
+        if (debug->plot_header_pending)
+        {
+            if (write_plot_header(debug))
+            {
+                debug->plot_header_pending = false;
+            }
+        }
+        else if (write_plot_sample(debug))
+        {
+            debug->next_plot_ms = now_ms + debug->plot_period_ms;
         }
     }
 }

@@ -177,8 +177,9 @@ static bool write_failure(PitchAxisSelfTestTelemetry *telemetry)
 {
     const X42sDriver *driver = telemetry->self_test->driver;
     const BspUartDmaPort *transport = &driver->transport;
-    char message[256];
+    char message[384];
     size_t length = 0U;
+    uint8_t index;
 
     length = append_text(
         message,
@@ -227,6 +228,47 @@ static bool write_failure(PitchAxisSelfTestTelemetry *telemetry)
         sizeof(message),
         length,
         driver->status_timeout_count);
+    length = append_text(message, sizeof(message), length, "\r\n");
+    length = append_text(message, sizeof(message), length, "PITCH_X42_WINDOW,state=");
+    length = append_u32_decimal(message, sizeof(message), length, (uint32_t)driver->state);
+    length = append_text(message, sizeof(message), length, ",last_proto=");
+    length = append_u32_decimal(
+        message,
+        sizeof(message),
+        length,
+        (uint32_t)driver->last_protocol_result);
+    length = append_text(message, sizeof(message), length, ",status_len=");
+    length = append_u32_decimal(
+        message,
+        sizeof(message),
+        length,
+        driver->status_response_window_length);
+    length = append_text(message, sizeof(message), length, ",status=");
+    for (index = 0U; index < X42S_READ_STATUS_RESPONSE_SIZE; ++index)
+    {
+        length = append_hex(
+            message,
+            sizeof(message),
+            length,
+            driver->status_response_window[index],
+            2U);
+    }
+    length = append_text(message, sizeof(message), length, ",position_len=");
+    length = append_u32_decimal(
+        message,
+        sizeof(message),
+        length,
+        driver->position_response_window_length);
+    length = append_text(message, sizeof(message), length, ",position=");
+    for (index = 0U; index < X42S_READ_POSITION_RESPONSE_SIZE; ++index)
+    {
+        length = append_hex(
+            message,
+            sizeof(message),
+            length,
+            driver->position_response_window[index],
+            2U);
+    }
     length = append_text(message, sizeof(message), length, "\r\n");
     return write_bytes(telemetry, message, length);
 }

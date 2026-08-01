@@ -22,6 +22,8 @@ typedef enum
     PITCH_STATUS_DISPLAY_STATE_START_CURSOR,
     PITCH_STATUS_DISPLAY_STATE_WAIT_CURSOR,
     PITCH_STATUS_DISPLAY_STATE_WAIT_PAGE,
+    PITCH_STATUS_DISPLAY_STATE_START_DISPLAY_ON,
+    PITCH_STATUS_DISPLAY_STATE_WAIT_DISPLAY_ON,
     PITCH_STATUS_DISPLAY_STATE_RETRY_WAIT
 } PitchStatusDisplayState;
 
@@ -31,15 +33,19 @@ typedef struct
     PitchTaskController *task_controller;
     PitchAxisSelfTest *self_test;
     PitchAxisVisionControl *vision;
+    PitchAxisVelocityTest *velocity;
     uint8_t address_7bit;
     uint8_t framebuffer[PITCH_STATUS_DISPLAY_PAGE_COUNT]
                        [PITCH_STATUS_DISPLAY_WIDTH];
     uint8_t tx_buffer[PITCH_STATUS_DISPLAY_WIDTH + 1U];
+    PitchAxisVelocityTestButtons buttons;
     PitchStatusDisplayState state;
     uint8_t tx_page;
     uint32_t last_render_ms;
     uint32_t retry_since_ms;
     uint32_t error_count;
+    bool render_pending;
+    bool first_frame_written;
     bool initialized;
 } PitchStatusDisplay;
 
@@ -50,11 +56,13 @@ bool PitchStatusDisplay_Init(
     PitchTaskController *task_controller,
     PitchAxisSelfTest *self_test,
     PitchAxisVisionControl *vision,
+    PitchAxisVelocityTest *velocity,
     uint32_t now_ms);
 
 /* Cooperative entry point. Every I2C transfer is interrupt driven. */
 void PitchStatusDisplay_Service(
     PitchStatusDisplay *display,
+    PitchAxisVelocityTestButtons buttons,
     uint32_t now_ms);
 
 #endif

@@ -5,6 +5,7 @@
 
 #define DISPLAY_RENDER_PERIOD_MS 250U
 #define DISPLAY_RETRY_PERIOD_MS 1000U
+#define DISPLAY_COLUMN_OFFSET 2U
 #define DISPLAY_FONT_WIDTH 5U
 #define DISPLAY_FONT_STRIDE 6U
 
@@ -140,27 +141,17 @@ static void append_u8(char *line, size_t capacity, size_t *length,
     line[*length] = '\0';
 }
 
-static void append_position(char *line, size_t capacity, size_t *length,
-                            int16_t position_0_1mm)
+static void append_u32(char *line, size_t capacity, size_t *length,
+                       uint32_t value)
 {
-    uint16_t magnitude;
-    char reversed[5];
+    char reversed[10];
     uint8_t count = 0U;
 
-    if (position_0_1mm < 0)
-    {
-        append_text(line, capacity, length, "-");
-        magnitude = (uint16_t)(-(int32_t)position_0_1mm);
-    }
-    else
-    {
-        magnitude = (uint16_t)position_0_1mm;
-    }
     do
     {
-        reversed[count++] = (char)('0' + ((magnitude / 10U) % 10U));
-        magnitude = (uint16_t)(magnitude / 10U);
-    } while ((magnitude != 0U) && (count < sizeof(reversed)));
+        reversed[count++] = (char)('0' + (value % 10U));
+        value /= 10U;
+    } while ((value != 0U) && (count < sizeof(reversed)));
     while (count > 0U)
     {
         if ((*length + 1U) < capacity)
@@ -172,12 +163,39 @@ static void append_position(char *line, size_t capacity, size_t *length,
             break;
         }
     }
-    append_text(line, capacity, length, ".");
-    if ((*length + 1U) < capacity)
+    line[*length] = '\0';
+}
+
+static void append_pid_value(char *line, size_t capacity, size_t *length,
+                             float value)
+{
+    int32_t milli = (int32_t)(value * 1000.0f +
+        ((value >= 0.0f) ? 0.5f : -0.5f));
+    uint32_t magnitude;
+    uint32_t integer;
+    uint32_t fraction;
+
+    if (milli < 0)
     {
-        uint16_t absolute = (uint16_t)(position_0_1mm < 0 ?
-            -(int32_t)position_0_1mm : position_0_1mm);
-        line[(*length)++] = (char)('0' + (absolute % 10U));
+        append_text(line, capacity, length, "-");
+        magnitude = (uint32_t)(-(milli + 1)) + 1U;
+    }
+    else
+    {
+        magnitude = (uint32_t)milli;
+    }
+    integer = magnitude / 1000U;
+    fraction = magnitude % 1000U;
+    if (integer != 0U)
+    {
+        append_u32(line, capacity, length, integer);
+    }
+    append_text(line, capacity, length, ".");
+    if ((*length + 3U) < capacity)
+    {
+        line[(*length)++] = (char)('0' + ((fraction / 100U) % 10U));
+        line[(*length)++] = (char)('0' + ((fraction / 10U) % 10U));
+        line[(*length)++] = (char)('0' + (fraction % 10U));
         line[*length] = '\0';
     }
 }
@@ -187,56 +205,38 @@ static const char *task_state_text(PitchTaskState state)
     switch (state)
     {
         case PITCH_TASK_STATE_IDLE: return "IDLE";
-        case PITCH_TASK_STATE_WAIT_CAPTURE: return "CAPTURE";
+        case PITCH_TASK_STATE_WAIT_CAPTURE: return "CAP";
         case PITCH_TASK_STATE_STARTING: return "START";
-        case PITCH_TASK_STATE_RUNNING_POSITIVE: return "TO POS";
-        case PITCH_TASK_STATE_RUNNING_NEGATIVE: return "TO NEG";
+        case PITCH_TASK_STATE_RUNNING_POSITIVE: return "POS";
+        case PITCH_TASK_STATE_RUNNING_NEGATIVE: return "NEG";
         case PITCH_TASK_STATE_HOLDING: return "HOLD";
         case PITCH_TASK_STATE_FAULT: return "FAULT";
-        default: return "UNKNOWN";
-    }
-}
-
-static const char *vision_state_text(const PitchAxisVisionReport *report)
-{
-    if ((report == NULL) || !report->observation_present)
-    {
-        return "WAIT";
-    }
-    if ((report->state == PITCH_VISION_STATE_TRACKING) &&
-        report->observation_fresh)
-    {
-        return "OK";
-    }
-    switch (report->state)
-    {
-        case PITCH_VISION_STATE_REJECT_LOW_CONFIDENCE: return "LOW";
-        case PITCH_VISION_STATE_REJECT_STALE: return "OLD";
-        case PITCH_VISION_STATE_REJECT_INVALID: return "BAD";
-        default: return "WAIT";
+        default: return "?";
     }
 }
 
 static void render(PitchStatusDisplay *display)
 {
     PitchTaskControllerReport task_report;
-    PitchAxisVisionReport vision_report;
-    PitchAxisSelfTestState self_test_state;
+    PitchAxisVisionConfig vision_config;
+    PitchAxisVelocityTestConfig velocity_config;
     bool task_valid;
-    bool vision_valid;
+    bool vision_config_valid;
+    bool velocity_config_valid;
     char line[22];
     size_t length;
 
     memset(display->framebuffer, 0, sizeof(display->framebuffer));
     memset(&task_report, 0, sizeof(task_report));
-    memset(&vision_report, 0, sizeof(vision_report));
     task_valid = PitchTaskController_GetReport(
         display->task_controller,
         &task_report);
-    vision_valid = PitchAxisVisionControl_GetReport(
+    vision_config_valid = PitchAxisVisionControl_GetConfig(
         display->vision,
-        &vision_report);
-    self_test_state = PitchAxisSelfTest_GetState(display->self_test);
+        &vision_config);
+    velocity_config_valid = PitchAxisVelocityTest_GetConfig(
+        display->velocity,
+        &velocity_config);
 
     length = 0U;
     line[0] = '\0';
@@ -257,55 +257,62 @@ static void render(PitchStatusDisplay *display)
 
     length = 0U;
     line[0] = '\0';
-    append_text(line, sizeof(line), &length, "MOTOR1000:");
-    if (self_test_state == PITCH_AXIS_SELF_TEST_STATE_COMM_PASS)
-    {
-        append_text(line, sizeof(line), &length, "PASS");
-    }
-    else if (self_test_state == PITCH_AXIS_SELF_TEST_STATE_FAILED)
-    {
-        append_text(line, sizeof(line), &length, "FAIL");
-    }
-    else
-    {
-        append_text(line, sizeof(line), &length, "RUN");
-    }
-    show_string(display, 1U, line);
-
-    length = 0U;
-    line[0] = '\0';
-    append_text(line, sizeof(line), &length, "X:");
-    if (vision_valid && vision_report.observation_present)
-    {
-        append_position(line, sizeof(line), &length,
-                        vision_report.observation.x_0_1mm);
-    }
-    else
-    {
-        append_text(line, sizeof(line), &length, "---");
-    }
-    append_text(line, sizeof(line), &length, " A:");
+    append_text(line, sizeof(line), &length, "KEY:");
     append_text(line, sizeof(line), &length,
-                task_valid && task_report.automatic_armed ? "ON" : "OFF");
-    append_text(line, sizeof(line), &length, " V:");
+                display->buttons.key1_pressed ? "0" : "1");
     append_text(line, sizeof(line), &length,
-                vision_valid ? vision_state_text(&vision_report) : "WAIT");
+                display->buttons.key2_pressed ? "0" : "1");
+    append_text(line, sizeof(line), &length,
+                display->buttons.key3_pressed ? "0" : "1");
+    append_text(line, sizeof(line), &length,
+                display->buttons.key4_pressed ? "0" : "1");
     show_string(display, 2U, line);
 
     length = 0U;
     line[0] = '\0';
-    append_text(line, sizeof(line), &length, "T6 FIXED:");
-    if (task_valid && task_report.captured_position_valid)
+    append_text(line, sizeof(line), &length, "P:");
+    if (vision_config_valid)
     {
-        append_text(line, sizeof(line), &length, "YES ");
-        append_position(line, sizeof(line), &length,
-                        task_report.captured_position_0_1mm);
+        append_pid_value(line, sizeof(line), &length,
+                         vision_config.kp_rpm_per_mm);
+        append_text(line, sizeof(line), &length, " I:");
+        append_pid_value(line, sizeof(line), &length,
+                         vision_config.ki_rpm_per_mm_s);
+        append_text(line, sizeof(line), &length, " D:");
+        append_pid_value(line, sizeof(line), &length,
+                         vision_config.kd_rpm_per_mm_s);
     }
     else
     {
-        append_text(line, sizeof(line), &length, "NO");
+        append_text(line, sizeof(line), &length, "? I:? D:?");
     }
-    show_string(display, 3U, line);
+    show_string(display, 4U, line);
+
+    length = 0U;
+    line[0] = '\0';
+    append_text(line, sizeof(line), &length, "S:");
+    if (velocity_config_valid)
+    {
+        append_u32(line, sizeof(line), &length,
+                   velocity_config.automatic_tilt_scale_um_per_outer_rpm);
+        append_text(line, sizeof(line), &length, " L:");
+        append_u32(line, sizeof(line), &length,
+                   velocity_config.automatic_tilt_limit_um);
+    }
+    else
+    {
+        append_text(line, sizeof(line), &length, "? L:?");
+    }
+    show_string(display, 6U, line);
+}
+
+static bool buttons_equal(PitchAxisVelocityTestButtons left,
+                          PitchAxisVelocityTestButtons right)
+{
+    return (left.key1_pressed == right.key1_pressed) &&
+        (left.key2_pressed == right.key2_pressed) &&
+        (left.key3_pressed == right.key3_pressed) &&
+        (left.key4_pressed == right.key4_pressed);
 }
 
 static bool transfer_finished(const PitchStatusDisplay *display)
@@ -330,7 +337,13 @@ static bool start_transfer(PitchStatusDisplay *display, uint16_t length)
 
 static void enter_retry(PitchStatusDisplay *display, uint32_t now_ms)
 {
+    if ((HAL_I2C_GetError(display->i2c) & HAL_I2C_ERROR_AF) != 0U)
+    {
+        display->address_7bit =
+            (display->address_7bit == 0x3CU) ? 0x3DU : 0x3CU;
+    }
     display->initialized = false;
+    display->first_frame_written = false;
     display->retry_since_ms = now_ms;
     display->error_count++;
     display->state = PITCH_STATUS_DISPLAY_STATE_RETRY_WAIT;
@@ -343,11 +356,13 @@ bool PitchStatusDisplay_Init(
     PitchTaskController *task_controller,
     PitchAxisSelfTest *self_test,
     PitchAxisVisionControl *vision,
+    PitchAxisVelocityTest *velocity,
     uint32_t now_ms)
 {
     if ((display == NULL) || (i2c == NULL) ||
         (task_controller == NULL) || (self_test == NULL) ||
-        (vision == NULL) || (address_7bit < 0x08U) ||
+        (vision == NULL) || (velocity == NULL) ||
+        (address_7bit < 0x08U) ||
         (address_7bit > 0x77U))
     {
         return false;
@@ -357,27 +372,35 @@ bool PitchStatusDisplay_Init(
     display->task_controller = task_controller;
     display->self_test = self_test;
     display->vision = vision;
+    display->velocity = velocity;
     display->address_7bit = address_7bit;
     display->last_render_ms = now_ms - DISPLAY_RENDER_PERIOD_MS;
-    display->state = PITCH_STATUS_DISPLAY_STATE_START_INIT;
+    display->retry_since_ms = now_ms;
+    display->render_pending = true;
+    display->state = PITCH_STATUS_DISPLAY_STATE_RETRY_WAIT;
     return true;
 }
 
 void PitchStatusDisplay_Service(
     PitchStatusDisplay *display,
+    PitchAxisVelocityTestButtons buttons,
     uint32_t now_ms)
 {
     static const uint8_t init_commands[] = {
         0xAEU, 0xD5U, 0x80U, 0xA8U, 0x3FU, 0xD3U, 0x00U, 0x40U,
         0xA1U, 0xC8U, 0xDAU, 0x12U, 0x81U, 0xCFU, 0xD9U, 0xF1U,
-        0xDBU, 0x30U, 0xA4U, 0xA6U, 0x8DU, 0x14U, 0x20U, 0x02U,
-        0xAFU
+        0xDBU, 0x30U, 0xA4U, 0xA6U, 0x8DU, 0x14U
     };
 
     if ((display == NULL) ||
         (display->state == PITCH_STATUS_DISPLAY_STATE_UNINITIALIZED))
     {
         return;
+    }
+    if (!buttons_equal(display->buttons, buttons))
+    {
+        display->buttons = buttons;
+        display->render_pending = true;
     }
 
     switch (display->state)
@@ -408,19 +431,21 @@ void PitchStatusDisplay_Service(
                 enter_retry(display, now_ms);
                 return;
             }
-            display->initialized = true;
             render(display);
             display->last_render_ms = now_ms;
+            display->render_pending = false;
             display->tx_page = 0U;
             display->state = PITCH_STATUS_DISPLAY_STATE_START_CURSOR;
             break;
 
         case PITCH_STATUS_DISPLAY_STATE_READY:
-            if (elapsed(now_ms, display->last_render_ms,
+            if (display->render_pending ||
+                elapsed(now_ms, display->last_render_ms,
                         DISPLAY_RENDER_PERIOD_MS))
             {
                 render(display);
                 display->last_render_ms = now_ms;
+                display->render_pending = false;
                 display->tx_page = 0U;
                 display->state = PITCH_STATUS_DISPLAY_STATE_START_CURSOR;
             }
@@ -429,7 +454,16 @@ void PitchStatusDisplay_Service(
         case PITCH_STATUS_DISPLAY_STATE_START_CURSOR:
             if (display->tx_page >= PITCH_STATUS_DISPLAY_PAGE_COUNT)
             {
-                display->state = PITCH_STATUS_DISPLAY_STATE_READY;
+                if (!display->first_frame_written)
+                {
+                    display->first_frame_written = true;
+                    display->state =
+                        PITCH_STATUS_DISPLAY_STATE_START_DISPLAY_ON;
+                }
+                else
+                {
+                    display->state = PITCH_STATUS_DISPLAY_STATE_READY;
+                }
                 return;
             }
             if (HAL_I2C_GetState(display->i2c) != HAL_I2C_STATE_READY)
@@ -438,8 +472,10 @@ void PitchStatusDisplay_Service(
             }
             display->tx_buffer[0] = 0x00U;
             display->tx_buffer[1] = (uint8_t)(0xB0U | display->tx_page);
-            display->tx_buffer[2] = 0x00U;
-            display->tx_buffer[3] = 0x10U;
+            display->tx_buffer[2] =
+                (uint8_t)(DISPLAY_COLUMN_OFFSET & 0x0FU);
+            display->tx_buffer[3] =
+                (uint8_t)(0x10U | (DISPLAY_COLUMN_OFFSET >> 4U));
             if (start_transfer(display, 4U))
             {
                 display->state = PITCH_STATUS_DISPLAY_STATE_WAIT_CURSOR;
@@ -480,6 +516,34 @@ void PitchStatusDisplay_Service(
             }
             display->tx_page++;
             display->state = PITCH_STATUS_DISPLAY_STATE_START_CURSOR;
+            break;
+
+        case PITCH_STATUS_DISPLAY_STATE_START_DISPLAY_ON:
+            if (HAL_I2C_GetState(display->i2c) != HAL_I2C_STATE_READY)
+            {
+                return;
+            }
+            display->tx_buffer[0] = 0x00U;
+            display->tx_buffer[1] = 0xAFU;
+            if (start_transfer(display, 2U))
+            {
+                display->state =
+                    PITCH_STATUS_DISPLAY_STATE_WAIT_DISPLAY_ON;
+            }
+            break;
+
+        case PITCH_STATUS_DISPLAY_STATE_WAIT_DISPLAY_ON:
+            if (!transfer_finished(display))
+            {
+                return;
+            }
+            if (!transfer_ok(display))
+            {
+                enter_retry(display, now_ms);
+                return;
+            }
+            display->initialized = true;
+            display->state = PITCH_STATUS_DISPLAY_STATE_READY;
             break;
 
         case PITCH_STATUS_DISPLAY_STATE_RETRY_WAIT:
