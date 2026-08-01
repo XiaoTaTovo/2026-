@@ -248,6 +248,8 @@ static void render(PitchStatusDisplay *display)
         append_text(line, sizeof(line), &length, " ");
         append_text(line, sizeof(line), &length,
                     task_state_text(task_report.state));
+        append_text(line, sizeof(line), &length, " G");
+        append_u8(line, sizeof(line), &length, task_report.pid_profile);
     }
     else
     {
@@ -389,7 +391,7 @@ void PitchStatusDisplay_Service(
     static const uint8_t init_commands[] = {
         0xAEU, 0xD5U, 0x80U, 0xA8U, 0x3FU, 0xD3U, 0x00U, 0x40U,
         0xA1U, 0xC8U, 0xDAU, 0x12U, 0x81U, 0xCFU, 0xD9U, 0xF1U,
-        0xDBU, 0x30U, 0xA4U, 0xA6U, 0x8DU, 0x14U
+        0xDBU, 0x30U, 0xA4U, 0xA6U, 0x2EU, 0x20U, 0x02U, 0x8DU, 0x14U
     };
 
     if ((display == NULL) ||

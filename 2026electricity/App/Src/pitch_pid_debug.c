@@ -758,6 +758,9 @@ static bool write_config(PitchPidDebug *debug)
         length = append_text(
             message, sizeof(message), length,
             PitchTaskController_StateName(task_report.state));
+        length = append_text(message, sizeof(message), length, ",pid_profile=");
+        length = append_u32(message, sizeof(message), length,
+                            task_report.pid_profile);
         length = append_text(message, sizeof(message), length, ",center=");
         length = append_i32(message, sizeof(message), length,
                             task_config.center_position_0_1mm);
@@ -1110,6 +1113,9 @@ static bool write_task_status(PitchPidDebug *debug)
     length = append_text(
         message, sizeof(message), length,
         PitchTaskController_StateName(report.state));
+    length = append_text(message, sizeof(message), length, ",pid_profile=");
+    length = append_u32(message, sizeof(message), length,
+                        report.pid_profile);
     length = append_text(message, sizeof(message), length, ",target=");
     length = append_i32(message, sizeof(message), length,
                         report.target_position_0_1mm);
@@ -1175,7 +1181,7 @@ static bool service_boot(PitchPidDebug *debug)
             break;
         case 11U:
             text = (debug->tasks != NULL) ?
-                "PID_KEY3=TASK6_CAPTURE\r\n" :
+                "PID_KEY3=NEXT_PID_PROFILE_OR_TASK6_CAPTURE\r\n" :
                 "PID_KEY3=RESUME_PERMISSION\r\n";
             break;
         case 12U: text = "PID_KEY4=STOP_AND_LATCH\r\n"; break;
@@ -1872,8 +1878,11 @@ static bool apply_setting(
     /* PID and automatic safety settings are live. The velocity layer permits
      * those fields while running and still rejects manual transport changes. */
     if (vision_changed &&
-        !PitchAxisVisionControl_UpdateConfig(
-            debug->vision, &vision_config, now_ms))
+        ((debug->tasks != NULL) ?
+         !PitchTaskController_UpdateActivePidConfig(
+             debug->tasks, &vision_config, now_ms) :
+         !PitchAxisVisionControl_UpdateConfig(
+             debug->vision, &vision_config, now_ms)))
     {
         return false;
     }

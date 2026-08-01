@@ -141,7 +141,14 @@ static void test_task3_and_switch_safely(void)
 {
     PitchTaskController controller;
     PitchTaskControllerConfig config = {
-        -50, 500U, 100U, 100U, 100U, 3900U, 4000U, 30U
+        .center_position_0_1mm = -50,
+        .task3_offset_0_1mm = 500U,
+        .task3_tolerance_0_1mm = 100U,
+        .task3_velocity_limit_0_1mm_s = 100U,
+        .task3_turnaround_dwell_ms = 100U,
+        .position_hold_tilt_limit_um = 3900U,
+        .task3_tilt_limit_um = 4000U,
+        .button_debounce_ms = 30U
     };
     PitchTaskControllerReport report;
     PitchAxisVisionControl vision;
@@ -176,13 +183,13 @@ static void test_task3_and_switch_safely(void)
     assert(PitchTaskController_GetReport(&controller, &report));
     assert(report.state == PITCH_TASK_STATE_RUNNING_POSITIVE);
 
-    g_vision_report.ball_velocity_0_1mm_s = 50;
+    g_vision_report.observation.x_0_1mm = 450;
     service(&controller, 400U, false, false, false);
-    service(&controller, 500U, false, false, false);
     assert(PitchTaskController_GetReport(&controller, &report));
     assert(report.state == PITCH_TASK_STATE_RUNNING_NEGATIVE);
     assert(g_vision_config.target_position_0_1mm == -550);
 
+    g_vision_report.ball_velocity_0_1mm_s = 50;
     service(&controller, 600U, false, false, false);
     service(&controller, 700U, false, false, false);
     assert(PitchTaskController_GetReport(&controller, &report));
@@ -200,7 +207,14 @@ static void test_start_waits_for_task_switch_stop(void)
 {
     PitchTaskController controller;
     PitchTaskControllerConfig config = {
-        -50, 500U, 100U, 100U, 100U, 3900U, 4000U, 30U
+        .center_position_0_1mm = -50,
+        .task3_offset_0_1mm = 500U,
+        .task3_tolerance_0_1mm = 100U,
+        .task3_velocity_limit_0_1mm_s = 100U,
+        .task3_turnaround_dwell_ms = 100U,
+        .position_hold_tilt_limit_um = 3900U,
+        .task3_tilt_limit_um = 4000U,
+        .button_debounce_ms = 30U
     };
     PitchTaskControllerReport report;
     PitchAxisVisionControl vision;
@@ -233,7 +247,14 @@ static void test_task6_captures_latest_coordinate(void)
 {
     PitchTaskController controller;
     PitchTaskControllerConfig config = {
-        -50, 500U, 100U, 100U, 100U, 3900U, 4000U, 30U
+        .center_position_0_1mm = -50,
+        .task3_offset_0_1mm = 500U,
+        .task3_tolerance_0_1mm = 100U,
+        .task3_velocity_limit_0_1mm_s = 100U,
+        .task3_turnaround_dwell_ms = 100U,
+        .position_hold_tilt_limit_um = 3900U,
+        .task3_tilt_limit_um = 4000U,
+        .button_debounce_ms = 30U
     };
     PitchTaskControllerReport report;
     PitchAxisVisionControl vision;
@@ -260,11 +281,109 @@ static void test_task6_captures_latest_coordinate(void)
     assert(report.captured_position_0_1mm == 321);
     assert(report.target_position_0_1mm == 321);
     assert(report.state == PITCH_TASK_STATE_IDLE);
+    assert(report.pid_profile == 1U);
 
-    press_key(&controller, 500U, 1U);
+    press_key(&controller, 500U, 3U);
+    assert(PitchTaskController_GetReport(&controller, &report));
+    assert(report.captured_position_0_1mm == 321);
+    assert(report.pid_profile == 2U);
+
+    press_key(&controller, 650U, 1U);
     assert(PitchTaskController_GetReport(&controller, &report));
     assert(report.state == PITCH_TASK_STATE_HOLDING);
     assert(g_velocity_report.automatic_armed);
+}
+
+static void test_task_pid_profiles_are_isolated(void)
+{
+    PitchTaskController controller;
+    PitchTaskControllerConfig config = {
+        .center_position_0_1mm = -50,
+        .task3_offset_0_1mm = 500U,
+        .task3_tolerance_0_1mm = 100U,
+        .task3_velocity_limit_0_1mm_s = 100U,
+        .task3_turnaround_dwell_ms = 100U,
+        .position_hold_tilt_limit_um = 3900U,
+        .task3_tilt_limit_um = 4000U,
+        .button_debounce_ms = 30U
+    };
+    PitchAxisVisionControl vision;
+    PitchAxisVelocityTest velocity;
+    PitchAxisVisionConfig pid_config;
+
+    reset_fakes();
+    g_vision_config.kp_rpm_per_mm = 0.40f;
+    assert(PitchTaskController_Init(
+        &controller, &vision, &velocity, &config, 0U));
+
+    press_key(&controller, 100U, 2U);
+    assert(g_vision_config.kp_rpm_per_mm == 0.40f);
+    pid_config = g_vision_config;
+    pid_config.kp_rpm_per_mm = 0.65f;
+    assert(PitchTaskController_UpdateActivePidConfig(
+        &controller, &pid_config, 200U));
+
+    press_key(&controller, 250U, 3U);
+    assert(g_vision_config.kp_rpm_per_mm == 0.40f);
+    pid_config = g_vision_config;
+    pid_config.kp_rpm_per_mm = 0.75f;
+    assert(PitchTaskController_UpdateActivePidConfig(
+        &controller, &pid_config, 350U));
+    press_key(&controller, 400U, 3U);
+    press_key(&controller, 500U, 3U);
+    assert(g_vision_config.kp_rpm_per_mm == 0.65f);
+
+    press_key(&controller, 600U, 2U);
+    assert(g_vision_config.kp_rpm_per_mm == 0.40f);
+    pid_config = g_vision_config;
+    pid_config.kp_rpm_per_mm = 0.25f;
+    assert(PitchTaskController_UpdateActivePidConfig(
+        &controller, &pid_config, 700U));
+    press_key(&controller, 750U, 3U);
+    assert(g_vision_config.kp_rpm_per_mm == 0.40f);
+    press_key(&controller, 850U, 2U);
+    press_key(&controller, 950U, 2U);
+    press_key(&controller, 1050U, 2U);
+    press_key(&controller, 1150U, 2U);
+    assert(g_vision_config.kp_rpm_per_mm == 0.65f);
+}
+
+static void test_task3_profile_switches_plant_limits(void)
+{
+    PitchTaskController controller;
+    PitchTaskControllerConfig config = {
+        -50, 450U, 100U, 100U, 100U, 3900U, 4200U, 30U,
+        {
+            { 0.30f, 0.010f, 0.080f, 2.0f, 250, 0.20f,
+              800, 8U, 16U, 4000U },
+            { 0.35f, 0.020f, 0.120f, 3.0f, 300, 0.25f,
+              600, 10U, 18U, 4200U },
+            { 0.40f, 0.015f, 0.100f, 2.5f, 350, 0.30f,
+              450, 12U, 20U, 4400U }
+        }
+    };
+    PitchTaskControllerReport report;
+    PitchAxisVisionControl vision;
+    PitchAxisVelocityTest velocity;
+
+    reset_fakes();
+    assert(PitchTaskController_Init(
+        &controller, &vision, &velocity, &config, 0U));
+    press_key(&controller, 100U, 2U);
+    assert(PitchTaskController_GetReport(&controller, &report));
+    assert(report.pid_profile == 2U);
+    assert(g_vision_config.maximum_speed_rpm == 18U);
+    assert(g_vision_config.approach_band_0_1mm == 600);
+    assert(g_vision_config.approach_speed_limit_rpm == 10U);
+    assert(g_velocity_config.automatic_tilt_limit_um == 4200U);
+
+    press_key(&controller, 200U, 3U);
+    assert(PitchTaskController_GetReport(&controller, &report));
+    assert(report.pid_profile == 3U);
+    assert(g_vision_config.maximum_speed_rpm == 20U);
+    assert(g_vision_config.approach_band_0_1mm == 450);
+    assert(g_vision_config.approach_speed_limit_rpm == 12U);
+    assert(g_velocity_config.automatic_tilt_limit_um == 4400U);
 }
 
 int main(void)
@@ -272,6 +391,8 @@ int main(void)
     test_task3_and_switch_safely();
     test_start_waits_for_task_switch_stop();
     test_task6_captures_latest_coordinate();
+    test_task_pid_profiles_are_isolated();
+    test_task3_profile_switches_plant_limits();
     puts("PITCH_TASK_CONTROLLER_TEST=PASS");
     return 0;
 }

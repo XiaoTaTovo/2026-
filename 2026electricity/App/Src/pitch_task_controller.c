@@ -153,10 +153,14 @@ static bool disarm_and_reset(
     return ok;
 }
 
+static PitchTaskPidProfile *selected_pid_profile_config(
+    PitchTaskController *controller);
+
 static bool apply_selected_task_velocity_config(
     PitchTaskController *controller)
 {
     PitchAxisVelocityTestConfig velocity_config;
+    uint16_t tilt_limit_um;
 
     if (!PitchAxisVelocityTest_GetConfig(
             controller->velocity,
@@ -164,13 +168,121 @@ static bool apply_selected_task_velocity_config(
     {
         return false;
     }
-    velocity_config.automatic_tilt_limit_um =
-        (controller->report.selected_task == PITCH_TASK_3) ?
-        controller->config.task3_tilt_limit_um :
-        controller->config.position_hold_tilt_limit_um;
+    if (controller->report.selected_task == PITCH_TASK_3)
+    {
+        tilt_limit_um = selected_pid_profile_config(controller)
+            ->task3_tilt_limit_um;
+        controller->config.task3_tilt_limit_um = tilt_limit_um;
+    }
+    else
+    {
+        tilt_limit_um = controller->config.position_hold_tilt_limit_um;
+    }
+    velocity_config.automatic_tilt_limit_um = tilt_limit_um;
     return PitchAxisVelocityTest_UpdateConfig(
         controller->velocity,
         &velocity_config);
+}
+
+static PitchTaskPidProfile *selected_pid_profile_config(
+    PitchTaskController *controller)
+{
+    return (controller->report.selected_task == PITCH_TASK_3) ?
+        &controller->task3_pid_profiles[controller->task3_pid_profile] :
+        &controller->position_hold_pid_profiles
+            [controller->position_hold_pid_profile];
+}
+
+static uint8_t selected_pid_profile(const PitchTaskController *controller)
+{
+    return (controller->report.selected_task == PITCH_TASK_3) ?
+        controller->task3_pid_profile :
+        controller->position_hold_pid_profile;
+}
+
+static void copy_pid_to_profile(
+    PitchTaskPidProfile *profile,
+    const PitchAxisVisionConfig *config)
+{
+    profile->kp_rpm_per_mm = config->kp_rpm_per_mm;
+    profile->ki_rpm_per_mm_s = config->ki_rpm_per_mm_s;
+    profile->kd_rpm_per_mm_s = config->kd_rpm_per_mm_s;
+    profile->integral_limit_rpm = config->integral_limit_rpm;
+    profile->integral_separation_band_0_1mm =
+        config->integral_separation_band_0_1mm;
+    profile->velocity_filter_alpha = config->velocity_filter_alpha;
+    profile->approach_band_0_1mm = config->approach_band_0_1mm;
+    profile->approach_speed_limit_rpm = config->approach_speed_limit_rpm;
+    profile->maximum_speed_rpm = config->maximum_speed_rpm;
+}
+
+static void copy_profile_to_pid(
+    PitchAxisVisionConfig *config,
+    const PitchTaskPidProfile *profile)
+{
+    config->kp_rpm_per_mm = profile->kp_rpm_per_mm;
+    config->ki_rpm_per_mm_s = profile->ki_rpm_per_mm_s;
+    config->kd_rpm_per_mm_s = profile->kd_rpm_per_mm_s;
+    config->integral_limit_rpm = profile->integral_limit_rpm;
+    config->integral_separation_band_0_1mm =
+        profile->integral_separation_band_0_1mm;
+    config->velocity_filter_alpha = profile->velocity_filter_alpha;
+    config->approach_band_0_1mm = profile->approach_band_0_1mm;
+    config->approach_speed_limit_rpm = profile->approach_speed_limit_rpm;
+    config->maximum_speed_rpm = profile->maximum_speed_rpm;
+}
+
+static bool valid_task3_pid_profile(const PitchTaskPidProfile *profile)
+{
+    return (profile->kp_rpm_per_mm >= 0.0f) &&
+        (profile->ki_rpm_per_mm_s >= 0.0f) &&
+        (profile->kd_rpm_per_mm_s >= 0.0f) &&
+        (profile->integral_limit_rpm >= 0.0f) &&
+        (profile->integral_separation_band_0_1mm >= 0) &&
+        (profile->velocity_filter_alpha >= 0.0f) &&
+        (profile->velocity_filter_alpha <= 1.0f) &&
+        (profile->approach_band_0_1mm >= 0) &&
+        (profile->approach_speed_limit_rpm > 0U) &&
+        (profile->maximum_speed_rpm > 0U) &&
+        (profile->task3_tilt_limit_um >= 100U);
+}
+
+static bool apply_selected_task_pid_config(
+    PitchTaskController *controller,
+    uint32_t now_ms)
+{
+    PitchAxisVisionConfig live_config;
+    PitchTaskPidProfile *selected_profile;
+
+    if (!PitchAxisVisionControl_GetConfig(
+            controller->vision, &live_config))
+    {
+        return false;
+    }
+    selected_profile = selected_pid_profile_config(controller);
+    copy_profile_to_pid(&live_config, selected_profile);
+    return PitchAxisVisionControl_UpdateConfig(
+        controller->vision, &live_config, now_ms);
+}
+
+static bool cycle_selected_pid_profile(
+    PitchTaskController *controller,
+    uint32_t now_ms)
+{
+    uint8_t *profile =
+        (controller->report.selected_task == PITCH_TASK_3) ?
+        &controller->task3_pid_profile :
+        &controller->position_hold_pid_profile;
+
+    *profile = (uint8_t)((*profile + 1U) % PITCH_TASK_PID_PROFILE_COUNT);
+    controller->report.pid_profile = (uint8_t)(*profile + 1U);
+    if (!apply_selected_task_pid_config(controller, now_ms) ||
+        !apply_selected_task_velocity_config(controller))
+    {
+        return false;
+    }
+    controller->report.transition_count++;
+    return true;
 }
 
 static bool task_is_center_hold(PitchTaskId task)
@@ -191,22 +303,34 @@ static void select_next_task(
         PITCH_TASK_2 :
         (PitchTaskId)((uint8_t)controller->report.selected_task + 1U);
     controller->report.selected_task = next_task;
+    controller->report.pid_profile =
+        (uint8_t)(selected_pid_profile(controller) + 1U);
     controller->start_pending = false;
     controller->report.captured_position_valid = false;
     controller->report.captured_position_0_1mm = 0;
+    if (!apply_selected_task_pid_config(controller, now_ms) ||
+        !apply_selected_task_velocity_config(controller))
+    {
+        enter_state(controller, PITCH_TASK_STATE_FAULT, now_ms);
+        return;
+    }
     if (next_task == PITCH_TASK_6)
     {
-        (void)set_target(controller, center_target(controller), now_ms);
+        if (!set_target(controller, center_target(controller), now_ms))
+        {
+            enter_state(controller, PITCH_TASK_STATE_FAULT, now_ms);
+            return;
+        }
         enter_state(controller, PITCH_TASK_STATE_WAIT_CAPTURE, now_ms);
     }
     else
     {
-        (void)set_target(controller, center_target(controller), now_ms);
+        if (!set_target(controller, center_target(controller), now_ms))
+        {
+            enter_state(controller, PITCH_TASK_STATE_FAULT, now_ms);
+            return;
+        }
         enter_state(controller, PITCH_TASK_STATE_IDLE, now_ms);
-    }
-    if (!apply_selected_task_velocity_config(controller))
-    {
-        enter_state(controller, PITCH_TASK_STATE_FAULT, now_ms);
     }
 }
 
@@ -269,7 +393,8 @@ static bool start_selected_task(
     {
         return false;
     }
-    if (!apply_selected_task_velocity_config(controller))
+    if (!apply_selected_task_pid_config(controller, now_ms) ||
+        !apply_selected_task_velocity_config(controller))
     {
         return false;
     }
@@ -386,6 +511,23 @@ static void service_trajectory(
     {
         return;
     }
+    if (controller->report.state == PITCH_TASK_STATE_RUNNING_POSITIVE)
+    {
+        if (vision->observation.x_0_1mm < positive_target(controller))
+        {
+            return;
+        }
+        controller->report.target_reached_count++;
+        if (set_target(controller, negative_target(controller), now_ms))
+        {
+            enter_state(
+                controller,
+                PITCH_TASK_STATE_RUNNING_NEGATIVE,
+                now_ms);
+        }
+        return;
+    }
+
     settled_at_target =
         (abs_i16(vision->error_0_1mm) <=
          controller->config.task3_tolerance_0_1mm) &&
@@ -409,20 +551,7 @@ static void service_trajectory(
         return;
     }
     controller->report.target_reached_count++;
-    if (controller->report.state == PITCH_TASK_STATE_RUNNING_POSITIVE)
-    {
-        if (set_target(controller, negative_target(controller), now_ms))
-        {
-            enter_state(
-                controller,
-                PITCH_TASK_STATE_RUNNING_NEGATIVE,
-                now_ms);
-        }
-    }
-    else
-    {
-        enter_state(controller, PITCH_TASK_STATE_HOLDING, now_ms);
-    }
+    enter_state(controller, PITCH_TASK_STATE_HOLDING, now_ms);
 }
 
 bool PitchTaskController_Init(
@@ -433,6 +562,7 @@ bool PitchTaskController_Init(
     uint32_t now_ms)
 {
     uint8_t index;
+    PitchAxisVisionConfig initial_pid_config;
 
     if ((controller == NULL) || (vision == NULL) || (velocity == NULL) ||
         !valid_config(config) || !task_targets_fit(vision, config))
@@ -443,7 +573,32 @@ bool PitchTaskController_Init(
     controller->vision = vision;
     controller->velocity = velocity;
     controller->config = *config;
+    if (!PitchAxisVisionControl_GetConfig(vision, &initial_pid_config))
+    {
+        return false;
+    }
+    for (index = 0U; index < PITCH_TASK_PID_PROFILE_COUNT; ++index)
+    {
+        copy_pid_to_profile(
+            &controller->position_hold_pid_profiles[index],
+            &initial_pid_config);
+        if (valid_task3_pid_profile(&config->task3_pid_profiles[index]))
+        {
+            controller->task3_pid_profiles[index] =
+                config->task3_pid_profiles[index];
+        }
+        else
+        {
+            copy_pid_to_profile(
+                &controller->task3_pid_profiles[index],
+                &initial_pid_config);
+            controller->task3_pid_profiles[index].task3_tilt_limit_um =
+                config->task3_tilt_limit_um;
+        }
+    }
     controller->report.selected_task = PITCH_TASK_2;
+    controller->task3_pid_profile = 1U;
+    controller->report.pid_profile = 1U;
     controller->report.state = PITCH_TASK_STATE_IDLE;
     controller->state_since_ms = now_ms;
     for (index = 0U; index < 3U; ++index)
@@ -451,7 +606,8 @@ bool PitchTaskController_Init(
         controller->buttons[index].candidate_since_ms = now_ms;
     }
     controller->initialized = true;
-    if (!apply_selected_task_velocity_config(controller))
+    if (!apply_selected_task_pid_config(controller, now_ms) ||
+        !apply_selected_task_velocity_config(controller))
     {
         controller->initialized = false;
         return false;
@@ -512,14 +668,20 @@ void PitchTaskController_Service(
         {
             controller->report.last_key = 3U;
             if (controller->report.selected_task == PITCH_TASK_6 &&
+                !controller->report.captured_position_valid &&
                 (controller->report.state == PITCH_TASK_STATE_WAIT_CAPTURE ||
                  controller->report.state == PITCH_TASK_STATE_IDLE))
             {
                 capture_task6_target(controller, now_ms);
             }
+            else if (!cycle_selected_pid_profile(controller, now_ms))
+            {
+                enter_state(controller, PITCH_TASK_STATE_FAULT, now_ms);
+            }
             else
             {
-                controller->report.rejected_key_count++;
+                PitchAxisVisionControl_ResetController(
+                    controller->vision, now_ms);
             }
         }
     }
@@ -573,6 +735,11 @@ bool PitchTaskController_UpdateConfig(
         return false;
     }
     controller->config = *config;
+    if (controller->report.selected_task == PITCH_TASK_3)
+    {
+        controller->task3_pid_profiles[controller->task3_pid_profile]
+            .task3_tilt_limit_um = config->task3_tilt_limit_um;
+    }
     if (!apply_selected_task_velocity_config(controller))
     {
         return false;
@@ -581,6 +748,25 @@ bool PitchTaskController_UpdateConfig(
     {
         return set_target(controller, center_target(controller), now_ms);
     }
+    return true;
+}
+
+bool PitchTaskController_UpdateActivePidConfig(
+    PitchTaskController *controller,
+    const PitchAxisVisionConfig *config,
+    uint32_t now_ms)
+{
+    PitchTaskPidProfile *stored_config;
+
+    if ((controller == NULL) || (config == NULL) ||
+        !controller->initialized ||
+        !PitchAxisVisionControl_UpdateConfig(
+            controller->vision, config, now_ms))
+    {
+        return false;
+    }
+    stored_config = selected_pid_profile_config(controller);
+    copy_pid_to_profile(stored_config, config);
     return true;
 }
 

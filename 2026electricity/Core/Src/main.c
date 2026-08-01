@@ -111,7 +111,7 @@ static const PitchAxisVelocityTestConfig pitch_velocity_test_config = {
     .acceleration = 0U,
     .run_ms = 300U,
     .synchronize = false,
-    .debounce_ms = 30U,
+    .debounce_ms = 20U,
     .automatic_max_speed_rpm = 120U,
     /* The final self-test position is the relative mechanical zero. Direction
      * 0 increased the raw position in the measured key test. */
@@ -175,14 +175,52 @@ static const PitchTaskControllerConfig pitch_task_config = {
     /* MaixCAM reports the measured pipe centre at about -5.0 mm. */
     .center_position_0_1mm = -50,
     /* Requirement 3: O -> +5 cm -> -5 cm. */
-    .task3_offset_0_1mm = 500U,
+    .task3_offset_0_1mm = 450U,
     .task3_tolerance_0_1mm = 100U,
     /* Do not reverse while the ball is merely crossing the target window. */
     .task3_velocity_limit_0_1mm_s = 100U,
     .task3_turnaround_dwell_ms = 100U,
     .position_hold_tilt_limit_um = 3900U,
-    .task3_tilt_limit_um = 4000U,
-    .button_debounce_ms = 30U
+    .task3_tilt_limit_um = 4200U,
+    .button_debounce_ms = 20U,
+    .task3_pid_profiles = {
+        {
+            .kp_rpm_per_mm = 0.35f,
+            .ki_rpm_per_mm_s = 0.020f,
+            .kd_rpm_per_mm_s = 0.120f,
+            .integral_limit_rpm = 3.0f,
+            .integral_separation_band_0_1mm = 300,
+            .velocity_filter_alpha = 0.25f,
+            .approach_band_0_1mm = 800,
+            .approach_speed_limit_rpm = 8U,
+            .maximum_speed_rpm = 16U,
+            .task3_tilt_limit_um = 4000U
+        },
+        {
+            .kp_rpm_per_mm = 0.35f,
+            .ki_rpm_per_mm_s = 0.020f,
+            .kd_rpm_per_mm_s = 0.120f,
+            .integral_limit_rpm = 3.0f,
+            .integral_separation_band_0_1mm = 300,
+            .velocity_filter_alpha = 0.25f,
+            .approach_band_0_1mm = 600,
+            .approach_speed_limit_rpm = 10U,
+            .maximum_speed_rpm = 18U,
+            .task3_tilt_limit_um = 4200U
+        },
+        {
+            .kp_rpm_per_mm = 0.40f,
+            .ki_rpm_per_mm_s = 0.015f,
+            .kd_rpm_per_mm_s = 0.100f,
+            .integral_limit_rpm = 2.5f,
+            .integral_separation_band_0_1mm = 350,
+            .velocity_filter_alpha = 0.30f,
+            .approach_band_0_1mm = 450,
+            .approach_speed_limit_rpm = 12U,
+            .maximum_speed_rpm = 20U,
+            .task3_tilt_limit_um = 4400U
+        }
+    }
 };
 
 static bool PitchFeedforwardTaskEnabled(PitchTaskId task)

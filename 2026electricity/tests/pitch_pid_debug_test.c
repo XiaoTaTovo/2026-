@@ -498,7 +498,14 @@ static void test_task_parameters_and_status(void)
     PitchAxisVelocityTest velocity;
     PitchTaskController tasks;
     PitchTaskControllerConfig task_config = {
-        -50, 500U, 100U, 100U, 100U, 3900U, 4000U, 30U
+        .center_position_0_1mm = -50,
+        .task3_offset_0_1mm = 500U,
+        .task3_tolerance_0_1mm = 100U,
+        .task3_velocity_limit_0_1mm_s = 100U,
+        .task3_turnaround_dwell_ms = 100U,
+        .position_hold_tilt_limit_um = 3900U,
+        .task3_tilt_limit_um = 4000U,
+        .button_debounce_ms = 30U
     };
     PitchTaskControllerConfig readback;
 
@@ -534,7 +541,14 @@ static void test_task_mode_rejects_bluetooth_arm_and_disarm(void)
     PitchAxisVelocityTest velocity;
     PitchTaskController tasks;
     PitchTaskControllerConfig task_config = {
-        -50, 500U, 100U, 100U, 100U, 3900U, 4000U, 30U
+        .center_position_0_1mm = -50,
+        .task3_offset_0_1mm = 500U,
+        .task3_tolerance_0_1mm = 100U,
+        .task3_velocity_limit_0_1mm_s = 100U,
+        .task3_turnaround_dwell_ms = 100U,
+        .position_hold_tilt_limit_um = 3900U,
+        .task3_tilt_limit_um = 4000U,
+        .button_debounce_ms = 30U
     };
 
     initialize(&debug, &bluetooth, &vision, &velocity);
